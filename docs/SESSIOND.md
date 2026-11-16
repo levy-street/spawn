@@ -622,7 +622,7 @@ of the history readable at that moment.
 
 When even one byte reaches a missing segment, that viewer gets an empty
 replay at the live stream's current offset and the terminal opens on what
-the session prints next. Nothing is remembered: the next request asks the
+the session prints next, which spawnd makes it print at once (below). Nothing is remembered: the next request asks the
 worker again, because a line committed into an empty newest segment, or a
 `clear` that starts a fresh one, makes history readable again. Only a worker
 that says its log is disabled ("worker replay is unavailable for this …") is
@@ -633,6 +633,60 @@ as constants (`scrollback::SEGMENT_READ_CONTEXT`, `worker::REPLAY_UNAVAILABLE`)
 and pinned by a test, because running workers keep the binary they started
 with. Authentication, sequence, and framing failures are returned unchanged:
 tampered history still fails the replay closed.
+
+An empty replay carries no screen either (`WorkerReplay::has_screen`), so a
+program that is not printing — a full-screen one waiting for a key, or Claude
+Code at its prompt — would leave that viewer's pane blank until something
+made it draw. Once such a replay has been sent for a `history` or `snapshot`
+request, spawnd makes the program repaint
+(`SessionHandle::repaint_after_empty_replay`). Workers already running ignore
+`T_REDRAW`, and spawnd never types on a person's behalf, so the lever is the
+PTY size. The steps:
+
+1. The nudge waits 150 ms after the empty replay that asked for it, so the
+   viewer's live stream is flowing and its own size message has arrived.
+   Empty replays handed out meanwhile join it.
+2. If a viewer's size changed after the latest of those replays (its
+   `take_control` or `resize`), the program repaints anyway, past the
+   anchor, and the nudge stops there. The size in the `history` request
+   itself is applied before the replay is captured; it counts only if
+   nothing reached spawnd between that change and the replay's anchor, so
+   the program's repaint for it is certain to lie past the anchor
+   (`replay_needs_repaint` in `rtc.rs`). Otherwise the repaint may land
+   before the anchor, where the client drops it, and the nudge goes ahead.
+3. Otherwise the PTY goes one column narrower. The kernel signals
+   `SIGWINCH` only for a real change. Width is what every renderer lays out
+   against, so inline programs redraw as well as full-screen ones; a height
+   change alone can leave an inline program's output unchanged, and it then
+   draws nothing.
+4. The narrower size stands until the program's first output after it, no
+   less than 50 ms and no more than 300 ms. Then it is put back, retried
+   while the worker connection lives. An empty replay handed out while the
+   narrower size stands joins the nudge, because the restore's repaint
+   comes after its anchor.
+
+A viewer's own size always wins. Only the controlling viewer's size reaches
+the PTY, and any resize applied meanwhile, even to the narrower size itself,
+takes the size over from the nudge, and the restore stands down. The nudge
+never touches display control: followers keep the controller's geometry.
+
+The bounds:
+- each attach asks once, via a flag on its `spawn.ctl` channel;
+- a session is nudged at most once every two seconds — a viewer whose empty
+  replay comes after a nudge was restored gets its own, deferred to that
+  point;
+- never for a replay with a screen, and never once the worker connection is
+  gone.
+
+The nudge does not depend on the viewer that asked, so it still restores
+when that viewer leaves first. It holds the worker connection only for each
+send. If spawnd itself goes in the fraction of a second between the two
+steps, the program is left one column narrower, but the daemon that adopts
+the worker reads the PTY's real size from its hello, so the next viewer's
+size message (every client sends one on opening a session) is a real change
+and puts it right. Other viewers see the program redraw twice. Narrowing can
+commit the full-width rows of a primary screen to history, as any narrowing
+resize does.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
