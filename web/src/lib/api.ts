@@ -1107,8 +1107,11 @@ export const trust = {
       method: "GET",
       schema: HostPinsResponseSchema,
     }),
-  /** Browser device IDs the host can actually admit. An undelivered approval
-   * is displayable in hostPinStatus but must not count as trust here. */
+  /** Browser device IDs whose pin this host has confirmed: what it admits
+   * today, for per-host questions (which hosts an approval signed here can
+   * reach). Whether the ACCOUNT approved a device is a different question that
+   * also counts pins a host has not confirmed — see `pinStanding` in
+   * lib/trust-roster.ts (#138). */
   hostPins: async (hostId: string) => {
     const response = await api(`/api/trust/hosts/${hostId}/pins`, {
       method: "GET",

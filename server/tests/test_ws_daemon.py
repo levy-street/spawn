@@ -919,6 +919,93 @@ async def test_pin_adoption_failure_is_validated_persisted_published_and_cleared
         assert pin.undelivered_reason is None
 
 
+async def test_a_failed_reconcile_never_relabels_a_rejected_pin(client, monkeypatch):
+    """#138: `other` (sent for every proposed pin when the daemon's whole
+    reconcile could not run) must not overwrite `invalid_chain`. The frontends
+    count `other` as the account's approval and `invalid_chain` as nothing, so
+    the relabel would make a device approved only through a rejected pin read
+    as approved while the daemon still refuses it. A real verdict clears it."""
+
+    from spawn_server.ws import daemon as daemon_module
+
+    user_id, _ = await _signup(client, "ws-daemon-pin-rejection@example.com")
+    host_id = await _create_host(user_id)
+    async with get_sessionmaker()() as session:
+        device = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key="R" * 43,
+        )
+        session.add(device)
+        await session.flush()
+        session.add(
+            HostBrowserPin(
+                host_id=host_id,
+                browser_device_id=device.id,
+                browser_key_algorithm="ed25519",
+                browser_public_key=device.public_key,
+                browser_key_fingerprint="SHA256:" + "r" * 16,
+            )
+        )
+        await session.commit()
+        device_id = device.id
+
+    events: list[dict[str, object]] = []
+
+    async def capture_event(_owner_id: str, payload: dict[str, object]) -> None:
+        events.append(payload)
+
+    monkeypatch.setattr(daemon_module, "publish_trust_event", capture_event)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text({"type": "register"})
+    task = asyncio.create_task(
+        daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: any(frame.get("type") == "registered" for frame in _sent_json(ws)))
+
+    async def stored() -> tuple[str | None, bool]:
+        async with get_sessionmaker()() as session:
+            pin = await session.get(HostBrowserPin, (host_id, device_id))
+            assert pin is not None
+            return pin.undelivered_reason, pin.delivered_at is not None
+
+    async def nack(reason: str) -> str | None:
+        before = len(events)
+        ws.queue_text(
+            {"type": "host.pin_adopt_failed", "browser_device_id": device_id, "reason": reason}
+        )
+        await _wait_until(lambda: len(events) == before + 1)
+        # The event names what the row now carries, never the raw nack.
+        assert events[-1]["reason"] == (await stored())[0]
+        return (await stored())[0]
+
+    async def ack() -> None:
+        ws.queue_text({"type": "host.pin_adopted", "browser_device_id": device_id})
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while (await stored()) != (None, True):
+            assert asyncio.get_running_loop().time() < deadline, "ack was not recorded"
+            await asyncio.sleep(0.01)
+
+    # A rejection survives a failed reconcile, however often it repeats.
+    assert await nack("invalid_chain") == "invalid_chain"
+    assert await nack("other") == "invalid_chain"
+    assert await nack("other") == "invalid_chain"
+    assert (await stored())[1] is False
+    # A later ack (the daemon now holds the pin) clears it.
+    await ack()
+    # `other` over a confirmed pin is still recorded as before...
+    assert await nack("other") == "other"
+    # ...and a rejection after it is recorded as a rejection.
+    assert await nack("invalid_chain") == "invalid_chain"
+    # `pin_limit` is sent only after the signature verified: it clears the
+    # rejection, and a failed reconcile may then relabel it as before.
+    assert await nack("pin_limit") == "pin_limit"
+    assert await nack("other") == "other"
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 @pytest.mark.parametrize(
     ("stage", "error", "humanized"),
     [

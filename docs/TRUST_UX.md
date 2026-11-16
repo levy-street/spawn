@@ -181,6 +181,28 @@ terminal state precisely so the residual is a chosen, contained trade.
   in without another one."* The phone's waiting sheet does not: the app cannot use a
   passkey (below, §6), so the line would be untrue there. Nor does the desktop app,
   where passkeys are unproven in its webview.
+- **approved is the account's word, not one host's** *(2026-11-16, #138)*: the card
+  and the phone's waiting sheet, and the ask they send, go up only when the account's own
+  records approve no way to the device: nothing approved it, it was removed, or it was
+  approved only through an approval a host rejected as unverifiable. The browser asks
+  that across the account; the phone asks it per host, of the approvals recorded on
+  the host it is about to use. Whether a particular host has confirmed an approval is
+  that host's state, not the device's. A host that has not confirmed one for a reason
+  that says nothing against it (it could not save it, or it is full) shows *Not
+  delivered* against that device on the host's page, and the device itself sees only
+  the terminal's own connection states (connecting, taking longer than usual, the host
+  offline — the same ones any slow or unreachable host gets, in each app's existing
+  words), never the waiting card: approving again would change nothing, since the
+  approval is already recorded. No new screen copy was added for this, and the toast
+  for a host that could not save an approval no longer suggests approving again. A host
+  that checked an approval and could not verify it has rejected it: that approval
+  counts for nothing anywhere, and a later failure on the same host to save anything
+  at all does not turn the rejection back into "not yet confirmed" (only the host
+  taking the approval in, or verifying it and finding itself full, clears it). The
+  screens decide only what they say: the host still checks every connection against
+  what it holds, so this admits no one. Before this, one host failing to take in one
+  device's approval put every device approved through it back on the card at once,
+  and approving them again from the phone did nothing.
 - existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
   (enter side). The roster's waiting row is the pull path to the same place. *(The
   desktop corner toast that offered "Enter its number" for every unapproved sign-in
@@ -325,8 +347,10 @@ build that would not help.
   ceremony. The disaster flow is the ordinary flow.
 - **not approved yet** — "One step left — approve from a device you already use, or sign
   in with your passkey." → *Use passkey*. As built, this state materializes where the
-  refusal actually bites: the `SessionApprovalGate` card over an agent session (§3),
-  which carries the same sentence and both escapes.
+  refusal would bite: the `SessionApprovalGate` card over an agent session (§3), which
+  carries the same sentence and both escapes. It is decided from the account's records,
+  not from a host's answer, so a host that has not yet confirmed an approval never
+  raises it; one that rejected the approval as unverifiable does (§3, #138).
 
 ### 8. History — `TrustHistory`
 - Plain sentences, newest first: "MacBook Pro approved iPhone", "Your passkey approved

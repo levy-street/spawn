@@ -6,13 +6,17 @@ import { qk } from "@/data/queryKeys";
 import {
   type DeviceHostTrust,
   invalidateDeviceHostTrust,
-  probeDeviceHostTrust,
+  probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
 import { APPROVAL_WATCH_INTERVAL_MS } from "@/data/trust/use-host-approval-watch";
 
 export interface HostApproval {
   host: HostOut;
+  /** The account's verdict: "trusted" includes a host that has not yet
+   * confirmed the approval (#138). */
   trust: DeviceHostTrust;
+  /** The host's own state: it has confirmed every approval on the way here. */
+  confirmed: boolean;
 }
 
 async function probeAll(hosts: readonly HostOut[]): Promise<HostApproval[]> {
@@ -20,7 +24,10 @@ async function probeAll(hosts: readonly HostOut[]): Promise<HostApproval[]> {
   // caller watching for one must not be given.
   invalidateDeviceHostTrust();
   return Promise.all(
-    hosts.map(async (host) => ({ host, trust: await probeDeviceHostTrust(host.id) })),
+    hosts.map(async (host) => {
+      const result = await probeDeviceHostTrustResult(host.id);
+      return { host, trust: result.status, confirmed: result.confirmed };
+    }),
   );
 }
 

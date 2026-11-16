@@ -177,7 +177,8 @@ describe("AlertPresenter", () => {
     });
 
     expect(mockToastError).toHaveBeenCalledWith("The approval didn't reach office-mac.", {
-      detail: "Try approving again; if it keeps failing, run spawnd doctor on office-mac.",
+      detail:
+        "office-mac could not save it and tries again the next time it connects, so there is no need to approve again. If this keeps happening, run spawnd doctor on office-mac.",
     });
     await view.unmount();
   });

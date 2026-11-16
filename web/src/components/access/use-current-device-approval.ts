@@ -9,10 +9,12 @@ import { computeTrustRoster } from "@/lib/trust-roster";
 
 /**
  * Is THIS browser approved right now? The session gate's own test
- * (docs/TRUST_UX.md §3): this device's registered row is chain-trusted, or a
- * host pins it. Shared so the storage notice asks exactly what the gate asks,
- * rather than reading the host trust this browser holds — which outlives the
- * browser's own removal.
+ * (docs/TRUST_UX.md §3): the account's records reach this device's registered
+ * row from an anchor, or a host pins it. A host that has not confirmed an
+ * approval does not make the device unapproved — that is the host's state
+ * (#138; `pinStanding` in lib/trust-roster.ts). Shared so the storage notice
+ * asks exactly what the gate asks, rather than reading the host trust this
+ * browser holds — which outlives the browser's own removal.
  *
  * The queries are the ones the app-wide ceremony host already keeps warm, so a
  * reader adds no requests. `refetchInterval` is for a reader that is itself
@@ -43,7 +45,7 @@ export function useCurrentDeviceApproval(options: {
     (devices.data ?? []).find((device) => device.public_key === currentPublicKey) ??
     (registration.data?.status === "ready" ? registration.data.device : undefined);
 
-  const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.pinnedDeviceIds);
+  const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.anchorDeviceIds);
   const ready =
     registration.data?.status === "ready" &&
     trustMap.ready &&

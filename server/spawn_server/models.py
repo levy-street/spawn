@@ -631,8 +631,9 @@ class HostBrowserPin(Base):
     endorser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     endorsement_signature: Mapped[str | None] = mapped_column(String(86), nullable=True)
     # Old daemons send neither adoption ack nor nack, so NULL/NULL remains the
-    # backward-compatible optimistic state. A nack writes the reason; a later
-    # ack clears it and stamps delivered_at.
+    # backward-compatible optimistic state. A nack writes the reason (except
+    # that `other` never replaces `invalid_chain`: see ws/daemon.py
+    # `_nack_keeps_rejection`); a later ack clears it and stamps delivered_at.
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     undelivered_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

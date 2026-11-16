@@ -10,13 +10,20 @@ import {
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
-import { hostsTrustingDevice } from "@/lib/trust-roster";
+import { hostPinMap, hostsTrustingDevice } from "@/lib/trust-roster";
 
 /**
- * Advisory trust coverage: which hosts already accept which browser devices.
- * Server data, so it is used for badges and flow routing only — never as
- * verification. Refetches on an interval so a device waiting for approval
- * flips to "trusted" on its own once the endorsement lands.
+ * Advisory trust coverage: which hosts already accept which browser devices,
+ * and which devices the account has approved. Server data, so it is used for
+ * badges and flow routing only — never as verification. Refetches on an
+ * interval so a device waiting for approval flips to "trusted" on its own
+ * once the endorsement lands.
+ *
+ * The two answers differ on purpose (#138): a host that has not confirmed an
+ * approval admits less than the account approved, and that is the host's
+ * state. `trustedHostIdsFor` / `pinsByHost` are per-host and count confirmed
+ * pins only; `anchorDeviceIds` is the account's and counts every pin no host
+ * rejected (`pinStanding` in lib/trust-roster.ts).
  */
 export function useDeviceTrustMap(enabled: boolean) {
   const hostList = useQuery({
@@ -29,29 +36,28 @@ export function useDeviceTrustMap(enabled: boolean) {
   );
   const pins = useQuery({
     queryKey: ["trust", "host-pin-map", keyedHosts.map((host) => host.id).join(",")],
-    queryFn: async () => {
-      const entries = await Promise.all(
-        keyedHosts.map(async (host) => [host.id, await trust.hostPins(host.id)] as const),
-      );
-      const byDevice = new Map<string, string[]>();
-      for (const [hostId, deviceIds] of entries) {
-        for (const deviceId of deviceIds) {
-          byDevice.set(deviceId, [...(byDevice.get(deviceId) ?? []), hostId]);
-        }
-      }
-      return { byDevice, byHost: new Map(entries) };
-    },
+    queryFn: async () =>
+      hostPinMap(
+        await Promise.all(
+          keyedHosts.map(
+            async (host) => [host.id, (await trust.hostPinStatus(host.id)).pins] as const,
+          ),
+        ),
+      ),
     enabled: enabled && keyedHosts.length > 0,
     refetchInterval: 15_000,
   });
   return {
     keyedHosts,
     hostsById: new Map(keyedHosts.map((host) => [host.id, host])),
+    /** Hosts that have confirmed this device's own pin. */
     trustedHostIdsFor: (deviceId: string): string[] => pins.data?.byDevice.get(deviceId) ?? [],
-    /** Live pin device-ids per host, for R5 sole-trust warnings and the roster. */
+    /** Confirmed pin device-ids per host, for R5 sole-trust warnings and for
+     * the hosts an approval signed here can reach. */
     pinsByHost: pins.data?.byHost ?? new Map<string, string[]>(),
-    /** Devices holding at least one per-host pin: the roster's advisory anchors. */
-    pinnedDeviceIds: new Set(pins.data ? pins.data.byDevice.keys() : []),
+    /** Devices whose pin on some host stands as the account's approval,
+     * confirmed or not: the roster's advisory anchors. */
+    anchorDeviceIds: pins.data?.anchorDeviceIds ?? new Set<string>(),
     ready: pins.data !== undefined || keyedHosts.length === 0,
   };
 }

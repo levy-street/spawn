@@ -16,7 +16,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { logOut } from "@/data/api/endpoints/auth";
-import { listHostPins } from "@/data/api/endpoints/trust";
+import { getHostPins } from "@/data/api/endpoints/trust";
 import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import {
@@ -27,6 +27,7 @@ import {
 } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { useConnectionStore } from "@/data/stores/connection";
+import { pinIdsByStanding } from "@/data/trust/chain-reach";
 import { createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { removeLocalTrustAccount } from "@/data/trust/local-account";
@@ -39,7 +40,28 @@ import { spacing, useTheme } from "@/theme";
 
 interface HostDeviceTrust {
   host: HostOut;
+  /** Devices the account approved toward this host, whether or not the host
+   * has confirmed taking the approval in (#138): what "approved" means. */
   deviceIds: readonly string[];
+  /** Devices whose approval this host has confirmed: what it admits today. */
+  confirmedIds: readonly string[];
+}
+
+/** One host's pins, split by `pinIdsByStanding`. */
+export type HostPinIds = Pick<HostDeviceTrust, "deviceIds" | "confirmedIds">;
+
+/** How many hosts the account has approved `deviceId` toward, confirmed or
+ * not: a host that has not confirmed is not a reason to read as waiting. */
+export function approvedHostCount(hostTrust: readonly HostPinIds[], deviceId: string): number {
+  return hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
+}
+
+/** Whether this phone can approve `targetId` on this host the per-host way:
+ * the host has CONFIRMED this phone's own approval (an approval signed here
+ * reaches only what the host admits today), and does not already record the
+ * target, which would make approving again change nothing. */
+export function canApproveOnHost(record: HostPinIds, currentId: string, targetId: string): boolean {
+  return record.confirmedIds.includes(currentId) && !record.deviceIds.includes(targetId);
 }
 
 function derivedDeviceFingerprint(device: BrowserDeviceOut): string {
@@ -94,7 +116,10 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     let active = true;
     const hostList = hosts.data ?? [];
     void Promise.all(
-      hostList.map(async (host) => ({ host, deviceIds: await listHostPins(host.id) })),
+      hostList.map(async (host) => {
+        const { recorded, confirmed } = pinIdsByStanding((await getHostPins(host.id)).pins);
+        return { host, deviceIds: recorded, confirmedIds: confirmed };
+      }),
     ).then(
       (records) => {
         if (active) {
@@ -118,15 +143,13 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     (devices.data ?? []).filter((device) => device.revoked_at === null && !device.is_root),
   );
   const revokedDevices = (devices.data ?? []).filter((device) => device.revoked_at !== null);
-  const trustedCount = (deviceId: string) =>
-    hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
+  const trustedCount = (deviceId: string) => approvedHostCount(hostTrust, deviceId);
   const endorsableHosts = useMemo(() => {
     if (!currentDevice || !approveTarget) return [];
     return hostTrust.filter(
-      ({ host, deviceIds }) =>
-        host.host_public_key !== null &&
-        deviceIds.includes(currentDevice.id) &&
-        !deviceIds.includes(approveTarget.id),
+      (record) =>
+        record.host.host_public_key !== null &&
+        canApproveOnHost(record, currentDevice.id, approveTarget.id),
     );
   }, [approveTarget, currentDevice, hostTrust]);
 
@@ -321,10 +344,8 @@ export function BrowserDevicesPanel(): React.JSX.Element {
                 device.id !== currentDevice?.id &&
                 Boolean(
                   currentDevice &&
-                    hostTrust.some(
-                      (record) =>
-                        record.deviceIds.includes(currentDevice.id) &&
-                        !record.deviceIds.includes(device.id),
+                    hostTrust.some((record) =>
+                      canApproveOnHost(record, currentDevice.id, device.id),
                     ),
                 )
               }
