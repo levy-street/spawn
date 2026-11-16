@@ -3985,8 +3985,8 @@ fn install_control_data_channel(
     let message_active = Arc::clone(&active);
     let message_fence = Arc::clone(&fence);
     let message_channels = Arc::clone(&channels);
-    // Whether this attach's `snapshot` requests have asked for their one
-    // repaint after an empty replay (`SessionHandle::repaint_after_empty_replay`).
+    // Whether this attach has been handed an empty replay that asked for a
+    // repaint (`asks_for_repaint`).
     let message_repaint_asked = Arc::new(AtomicBool::new(false));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let registry = message_registry.clone();
@@ -4262,8 +4262,8 @@ struct ControlRequestContext<'a> {
     effect: &'a SessionEffectPermit,
     uploads: &'a UploadHub,
     upload_capability: Uuid,
-    /// Set once this attach's `snapshot` requests have asked for a repaint
-    /// after an empty replay.
+    /// Set once this attach has been handed an empty replay
+    /// (`asks_for_repaint`).
     repaint_asked: &'a AtomicBool,
 }
 
@@ -4367,11 +4367,8 @@ async fn execute_control_request(
                     lines,
                     plain,
                     resized_at,
-                    // A client asks for `history` again on the same channel
-                    // after a gap in its live stream, and clears the pane to
-                    // load it: every empty one asks, bounded by the
-                    // session's interval.
-                    repaint_once: None,
+                    repaint: RepaintAsk::Always,
+                    repaint_asked,
                 },
                 registry,
                 sender,
@@ -4391,7 +4388,8 @@ async fn execute_control_request(
                     lines,
                     plain,
                     resized_at: None,
-                    repaint_once: Some(repaint_asked),
+                    repaint: RepaintAsk::UnlessAsked,
+                    repaint_asked,
                 },
                 registry,
                 sender,
@@ -4607,9 +4605,24 @@ struct ReplaySpec<'a> {
     /// The output offset just before the request's own size changed the
     /// PTY's width, if it did (`replay_needs_repaint`).
     resized_at: Option<u64>,
-    /// For a request that may ask for a repaint once per attach, the flag
-    /// that records it did (`asks_for_repaint`).
-    repaint_once: Option<&'a AtomicBool>,
+    /// When an empty replay for this request asks for a repaint.
+    repaint: RepaintAsk,
+    /// Set once this attach has been handed an empty replay.
+    repaint_asked: &'a AtomicBool,
+}
+
+/// When an empty replay asks the session for a repaint (`asks_for_repaint`).
+#[derive(Clone, Copy, Debug)]
+enum RepaintAsk {
+    /// `history`: every time. A client loads it to fill its pane, and loads
+    /// it again on the same channel after a gap in its live stream, clearing
+    /// the pane first.
+    Always,
+    /// `snapshot`: only on an attach no empty replay has asked for yet. Web
+    /// sends one shortly after every `history` and ignores it when empty;
+    /// mobile sends one to recover from overflowing its own write queue,
+    /// with the program printing.
+    UnlessAsked,
 }
 
 /// Whether a viewer handed `replay` looks at a blank pane until the session's
@@ -4623,16 +4636,25 @@ fn replay_needs_repaint(replay: &crate::pty::WorkerReplay, resized_at: Option<u6
 }
 
 /// Whether sending `replay` asks the session for a repaint: when it leaves
-/// the pane blank, and, for a request limited to one ask per attach
-/// (`snapshot`), only the first time. The session's own interval bounds the
-/// rest (`SessionHandle::repaint_after_empty_replay`).
+/// the pane blank and `ask` allows it. Every empty replay marks the attach in
+/// `asked`, including one whose own width change brings a repaint, so the
+/// `snapshot` that follows a `history` does not ask again. The session's
+/// budget bounds the rest (`SessionHandle::repaint_after_empty_replay`).
 fn asks_for_repaint(
     replay: &crate::pty::WorkerReplay,
     resized_at: Option<u64>,
-    once: Option<&AtomicBool>,
+    ask: RepaintAsk,
+    asked: &AtomicBool,
 ) -> bool {
-    replay_needs_repaint(replay, resized_at)
-        && once.is_none_or(|asked| !asked.swap(true, Ordering::AcqRel))
+    if replay.has_screen() {
+        return false;
+    }
+    let already = asked.swap(true, Ordering::AcqRel);
+    let allowed = match ask {
+        RepaintAsk::Always => true,
+        RepaintAsk::UnlessAsked => !already,
+    };
+    allowed && replay_needs_repaint(replay, resized_at)
 }
 
 /// Relay committed-history deltas from the session's forwarder to one control
@@ -4816,7 +4838,7 @@ async fn send_session_replay(
     // past this replay's anchor, so the viewer shows it. Unix only: ConPTY
     // repaints by itself on any resize, and nothing there deletes a
     // session's scrollback under it.
-    if cfg!(unix) && asks_for_repaint(&replay, spec.resized_at, spec.repaint_once) {
+    if cfg!(unix) && asks_for_repaint(&replay, spec.resized_at, spec.repaint, spec.repaint_asked) {
         registry.with_bound_handle(session, |handle| handle.repaint_after_empty_replay());
     }
     Ok(())
@@ -9881,23 +9903,67 @@ mod tests {
         assert!(!replay_needs_repaint(&WorkerReplay::live_only(7), Some(7)));
     }
 
-    /// Every empty `history` reply asks for a repaint (a client loads
-    /// `history` again on the same channel after a gap, clearing its pane);
-    /// `snapshot` asks once per attach; a replay with a screen never asks,
-    /// nor uses up the once.
+    /// On one attach: an empty `history` asks, the `snapshot` web sends
+    /// after it does not, and a second empty `history` (the reload after a
+    /// gap in the live stream) asks again. A `snapshot` on an attach with no
+    /// empty replay yet asks once. A replay with a screen never asks, and an
+    /// empty `history` whose own width change brings a repaint still marks
+    /// the attach.
     #[test]
-    fn empty_history_always_asks_and_snapshot_asks_once() {
+    fn history_always_asks_and_snapshot_only_on_an_attach_not_yet_asked() {
         use crate::pty::WorkerReplay;
         let empty = WorkerReplay::live_only(7);
         let screen = WorkerReplay::new(7, b"screen".to_vec());
-        assert!(asks_for_repaint(&empty, None, None));
-        assert!(asks_for_repaint(&empty, None, None));
-        assert!(!asks_for_repaint(&screen, None, None));
 
-        let once = AtomicBool::new(false);
-        assert!(!asks_for_repaint(&screen, None, Some(&once)));
-        assert!(asks_for_repaint(&empty, None, Some(&once)));
-        assert!(!asks_for_repaint(&empty, None, Some(&once)));
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &screen,
+            None,
+            RepaintAsk::Always,
+            &attach
+        ));
+        assert!(asks_for_repaint(&empty, None, RepaintAsk::Always, &attach));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(asks_for_repaint(&empty, None, RepaintAsk::Always, &attach));
+
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &screen,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &empty,
+            Some(7),
+            RepaintAsk::Always,
+            &attach
+        ));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
     }
 
     /// What a viewer's `spawn.pty` receives within `window`, as text.
@@ -9936,10 +10002,10 @@ mod tests {
     /// program sees as two `SIGWINCH` — and never for a replay that has a
     /// screen. The worker is the real, unchanged `spawn-worker`, and the
     /// program reports each size it is given. The order is fixed by the
-    /// program, not by timers: under test the narrower size stands until the
-    /// program's own report of it arrives (`REPAINT_HOLD_MAX`), and that
+    /// program, not by timers: the narrower size stands until the program's
+    /// own report of it arrives (`hold_repaint_until_output_for_test`), and that
     /// report is printed after `stty` has read the size, so the restore's
-    /// `SIGWINCH` comes after it and runs the trap again. Sharing, backoff
+    /// `SIGWINCH` comes after it and runs the trap again. Sharing, the budget
     /// and a viewer leaving are covered with paused time in `pty::tests`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9965,7 +10031,8 @@ mod tests {
         })
         .await
         .expect("launch real worker");
-        let handle = launched.handle;
+        let mut handle = launched.handle;
+        handle.hold_repaint_until_output_for_test();
         let _worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
         handle.control.set_sink(ws_tx).await;

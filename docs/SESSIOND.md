@@ -673,8 +673,9 @@ The timing is best-effort. The output that ends the hold may be unrelated to
 the nudge, and a program that has not read the first `SIGWINCH` by the time
 the size is put back may see no change and draw nothing; that only leaves
 the pane as it would have been without the nudge. The program redraws
-somewhere between 150 ms and the session's current interval (below) after
-the replay, and not at all when the nudge is skipped.
+150 ms after the replay while the session's budget lasts (below), up to a
+minute after it when a viewer has been reattaching in a loop, and not at
+all when the nudge is skipped.
 
 A viewer's own size always wins. Only the controlling viewer's size reaches
 the PTY, and any resize applied meanwhile, even to the narrower size itself,
@@ -682,19 +683,27 @@ takes the size over from the nudge, and the restore stands down. The nudge
 never touches display control: followers keep the controller's geometry.
 
 The bounds:
-- every empty `history` reply asks, because a client asks for `history`
-  again on the same channel after a gap in its live stream and clears its
-  pane to load it; a `snapshot` asks once per attach, via a flag on its
-  `spawn.ctl` channel;
-- a session is nudged at most once per interval. The interval starts at
-  two seconds and doubles with each nudge that comes within five minutes of
-  the one before, up to a minute; a session five minutes without a nudge
-  starts over at two seconds. A viewer reattaching in a loop therefore
-  costs every viewer two repaints, and the activity detection the nudge
-  suppresses for each of its steps, at most once a minute. A viewer whose
-  empty replay comes after a nudge was restored gets its own, deferred to
-  the end of the interval. A nudge that was skipped (a width change came
-  first, or the worker's command queue was full) does not count;
+- every empty `history` reply asks, because a client loads `history` to
+  fill its pane and loads it again on the same channel after a gap in its
+  live stream, clearing the pane first. A `snapshot` asks only on an attach
+  no empty replay has asked for yet (a flag on its `spawn.ctl` channel):
+  web sends a `snapshot` shortly after every `history` and ignores an empty
+  one, and mobile sends one to recover from overflowing its own write
+  queue, while the program is printing anyway;
+- a session has a budget of four nudges, one given back every 75 seconds,
+  and its nudges come at least two seconds apart while the budget lasts.
+  Once it is spent they come at least a minute apart, and each still counts
+  one beyond the budget, so a viewer reattaching in a loop (every 16 s,
+  say) gets four prompt nudges and then about one a minute, with every
+  viewer's two repaints and the activity detection the nudge suppresses
+  around each step, until it stops for a few minutes. People opening a
+  session at a human pace (up to four at once, then no more often than
+  about every 75 seconds on average) never wait past the 150 ms; nobody
+  waits more than a minute. A viewer whose empty
+  replay comes after a nudge was restored gets its own, at the earliest
+  the budget allows; a nudge checks that again when it wakes, so two can
+  never run closer than that. A nudge that was skipped (a width change
+  came first, or the worker's command queue was full) does not count;
 - never for a replay with a screen, and never once the worker connection is
   gone.
 
