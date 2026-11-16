@@ -467,7 +467,24 @@ price, bounded and without a cycle: an attach holds its session's
 transition while it queues on admission, and trust invalidation holds
 admission for up to the teardown deadline (`invalidate_trust_and_close_all`),
 so that session's restart or exit can wait that long behind them. Nothing
-that holds admission waits on a transition. A
+that holds admission waits on a transition. Nothing that holds the peer
+map waits on a session's control transaction (`session_ctl.rs`), and what
+holds admission waits on one only under the teardown deadline (trust
+invalidation's `close_all`, through each peer's `settle_detached_peer` →
+`unregister_viewer`): a `history` or `snapshot` request holds the
+transaction through up to 3 s for its `spawn.pty` channel, up to
+`WORKER_REPLAY_DEADLINE` on the session's worker and then while its reply is
+queued, which a slowly draining viewer stretches to minutes; and every
+offer and attach takes the peer map under admission. So
+`close_for_session` decides under the map whether the session's control
+state goes, lets the map go, and decides again holding the transaction
+(`remove_session_unless`): transaction, then peer map, never the reverse.
+It lets its session closer go first, since trust invalidation takes
+closers under admission. A host-control channel refused at admission is
+closed once the lock is released — the close is an SCTP reset the device
+has to answer. A lock guard made in an `if let` or `match` scrutinee lives
+to the end of the block (edition 2021), so a map lookup that leads to an
+await gets its own `let`. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
 attachment left the peer map when its pair was superseded, and one another
@@ -706,6 +723,43 @@ the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
 never a hard limit, which every shell in a terminal would inherit. For
 temporary SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
+
+`host.agents.check` runs off the dispatch loop (`AgentCheckFlights`): the
+loop reads every frame on the socket, and a check runs programs — the
+user's shell for its PATH, each agent's version flags one after another,
+`npm view` or `pip index` beside them — that took up to half a minute
+inline, while every offer waited behind it and was answered after the
+browser had given up. A request for targets already being checked joins
+that check rather than starting another (clients ask every minute, and
+again after a 504). At most `MAX_CONCURRENT_AGENT_CHECKS` (2) run at once
+— only the host's owner can ask, so one target set is the norm — and one
+that gets no place by its deadline answers nothing (the server's 504);
+at most `MAX_AGENTS_PROBED_AT_ONCE` (8) of a check's agents are probed at
+once, and a frame naming more than `proto::MAX_HOST_AGENT_TARGETS` (64) is
+refused whole. The whole check answers within `HOST_AGENTS_CHECK_DEADLINE`
+(10 s, inside the server's 15 s), the shell getting at most
+`HOST_AGENTS_ENV_SHARE` of it; a probe still running then is stopped with
+its process group and its agent's version reported unknown (`version:
+null`, installed by the PATH lookup — both clients show that as
+installed), with a warning per agent and probe at most every ten minutes.
+The reply's send is bounded too.
+
+Every capture (`run_until_exit`) returns once its program has exited and
+its own output is read (`EXITED_PROGRAM_DRAIN`), never waiting for its
+pipes to close: a background server a CLI starts with the stdout it
+inherited holds that pipe for as long as it lives. What it left holding
+them is not touched before the program's own timeout, as when the capture
+waited for them: `finish_leftovers` reads on until then and stops the
+program's group only if the pipes are still held. A group is only ever
+signalled while its leader is unreaped — the exit is observed with
+`waitid(WNOWAIT)` (`platform::exited_unreaped`) and the leader reaped after
+— so its id cannot have been handed to another process; never group 0 or
+1. At most `MAX_PENDING_LEFTOVERS` (16) such programs wait at once, each a
+zombie for at most its timeout; past that a capture waits out its own, as
+every capture did before. The shell PATH probe is in spawnd's own group
+and is never group-signalled. Session create, restart and kill are still
+awaited on the loop: they need a per-session lifecycle queue to leave it in
+order.
 
 `host.agents.install` is a refusal-only compatibility frame: server identity
 does not authorize running an installer or self-updater. Never restore its

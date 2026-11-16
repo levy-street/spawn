@@ -406,11 +406,16 @@ impl RtcSessions {
                         Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
                     })
                 {
-                    let _admission = sessions.admission.lock().await;
+                    // A refusal is decided under the admission lock and
+                    // carried out after it: closing a channel is an SCTP
+                    // reset the device has to answer, and every offer and
+                    // attach on the daemon waits on this lock.
+                    let admission = sessions.admission.lock().await;
                     if !sessions
                         .pair_is_current(&signal_id, &pc, pair.trust_epoch)
                         .await
                     {
+                        drop(admission);
                         reject_channel(&dc).await;
                         return;
                     }
@@ -428,6 +433,8 @@ impl RtcSessions {
                                 .count()
                                 >= MAX_PAIR_CONTROLS)
                     {
+                        drop(live);
+                        drop(admission);
                         reject_channel(&dc).await;
                         return;
                     }
@@ -1512,6 +1519,149 @@ mod tests {
         for worker in workers {
             worker.abort();
         }
+    }
+
+    /// A restart closes its session's peers, then removes the session's
+    /// control state, which waits for the session's control transaction —
+    /// and a viewer request holds that for as long as it waits on a worker
+    /// that has stopped answering (up to `WORKER_REPLAY_DEADLINE`). That
+    /// wait must not hold the peer map: every offer and every attach on the
+    /// daemon takes it, so one session whose worker hung would make the whole
+    /// host unreachable for as long as its restart waited. The test holds
+    /// the transaction itself, in that request's place, so a wait that
+    /// holds the map shows as a hang, caught by the bounds below, rather
+    /// than as a delay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_waiting_on_a_stuck_viewer_request_blocks_no_offer_or_attach() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let steady = Uuid::new_v4();
+        let restarting = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, steady),
+            spawn_replay_worker(&registry, restarting),
+        ];
+        let first = connect_pair(&sessions, &registry, [16; 32]).await;
+        let _view = attach_answered(&first, restarting).await;
+        let stuck = sessions
+            .controls
+            .lock_transaction(restarting, "request history viewer=stuck")
+            .await;
+
+        // The restart, as `handle_session_restart` runs it.
+        let generation = registry.binding_for(restarting).unwrap().generation();
+        let transition = registry.lock_generation_transition(restarting).await;
+        let restart = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .close_for_session(restarting, generation, "session restarting")
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions
+                .controls
+                .until_waiting(restarting, "remove_session"),
+        )
+        .await
+        .expect("the restart closed the session's peers and waits on the stuck request");
+
+        let offered = tokio::time::timeout(
+            Duration::from_secs(20),
+            connect_pair(&sessions, &registry, [17; 32]),
+        )
+        .await;
+        let attached =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&first, steady)).await;
+        let still_waiting = !restart.is_finished();
+        drop(stuck);
+        let announcements = tokio::time::timeout(Duration::from_secs(10), restart)
+            .await
+            .expect("the restart finishes once the request lets go")
+            .unwrap();
+        drop(transition);
+        announcements.send();
+
+        let second =
+            offered.expect("a device's offer to this host waited on another session's restart");
+        assert!(
+            attached.is_ok(),
+            "an attach to another session waited on a restart"
+        );
+        assert!(
+            still_waiting,
+            "the restart was still waiting on the stuck request while both went through"
+        );
+        sessions.close_all().await;
+        let _ = first.close().await;
+        let _ = second.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    /// A restart in the ordinary case: the session's attachments close, the
+    /// device sees their channels go, the session's control state goes with
+    /// them, and the close does not wait for anything else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_closes_the_sessions_peers_and_forgets_its_control_state() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let restarting = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, restarting);
+        let pc = connect_pair(&sessions, &registry, [18; 32]).await;
+        let (pty, ctl) = attach_answered(&pc, restarting).await;
+        assert_eq!(sessions.controls.retained_counts().await.0, 1);
+
+        let generation = registry.binding_for(restarting).unwrap().generation();
+        let transition = registry.lock_generation_transition(restarting).await;
+        let announcements = tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions.close_for_session(restarting, generation, "session restarting"),
+        )
+        .await
+        .expect("a restart's close of its session's peers finishes");
+        drop(transition);
+        // An attachment's device hears of it on its own connection.
+        assert_eq!(announcements.len(), 0);
+        announcements.send();
+
+        assert!(
+            !sessions
+                .peers
+                .lock()
+                .await
+                .values()
+                .any(|peer| peer.session.session_id() == restarting),
+            "the session's attachment is out of the peer map"
+        );
+        assert_eq!(
+            sessions.controls.retained_counts().await.0,
+            0,
+            "the session's control state went with its peers"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while ctl.ready_state() != RTCDataChannelState::Closed
+                || pty.ready_state() != RTCDataChannelState::Closed
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the device saw the attachment's channels close");
+        assert_eq!(
+            sessions.host_peers.lock().await.len(),
+            1,
+            "the device's connection outlives a restart of one of its sessions"
+        );
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
     }
 
     /// One device, two windows: the one it opens first is restarting and

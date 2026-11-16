@@ -454,6 +454,20 @@ pub struct ForwarderControl {
     /// change-only, rate-limited emission bookkeeping behind
     /// `session.foreground`.
     foreground: Arc<Mutex<ForegroundState>>,
+    /// When a viewer's wait on this worker last ran out and was logged, and
+    /// how many have run out since without a line of their own
+    /// (`worker_stall_report`).
+    worker_stalls: Arc<Mutex<WorkerStallReports>>,
+}
+
+/// A worker that has stopped answering is reported once per this interval
+/// per worker connection, however many viewers' waits on it run out.
+pub(crate) const WORKER_STALL_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct WorkerStallReports {
+    last: Option<tokio::time::Instant>,
+    held_back: u64,
 }
 
 #[derive(Debug, Default)]
@@ -491,7 +505,29 @@ impl ForwarderControl {
             history_wipes: Arc::new(AtomicU64::new(0)),
             activity: Arc::new(Mutex::new(ActivityState::default())),
             foreground: Arc::new(Mutex::new(ForegroundState::default())),
+            worker_stalls: Arc::new(Mutex::new(WorkerStallReports::default())),
         }
+    }
+
+    /// Whether a viewer's wait on this worker that just ran out should be
+    /// logged: the first does, then at most one per
+    /// [`WORKER_STALL_REPORT_EVERY`]. `Some` carries how many ran out
+    /// unlogged since the last line.
+    pub(crate) fn worker_stall_report(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        let mut reports = self
+            .worker_stalls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reports
+            .last
+            .is_some_and(|last| now.duration_since(last) < WORKER_STALL_REPORT_EVERY)
+        {
+            reports.held_back += 1;
+            return None;
+        }
+        reports.last = Some(now);
+        Some(std::mem::take(&mut reports.held_back))
     }
 
     /// The basename the worker last reported in the foreground, if any.

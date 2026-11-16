@@ -77,6 +77,51 @@ where
     deserializer.deserialize_seq(BoundedEdges)
 }
 
+/// The most agents one `host.agents.check` may name. The server sends every
+/// agent the host's owner can use: five built in, plus their own, which it
+/// does not cap. Each named agent can cost the daemon processes, so a list
+/// past this refuses the whole frame at deserialization, as an over-cap
+/// endorsement list does; the server, hearing nothing, reports the check
+/// timed out.
+pub const MAX_HOST_AGENT_TARGETS: usize = 64;
+
+fn deserialize_bounded_agent_targets<'de, D>(
+    deserializer: D,
+) -> Result<Vec<HostAgentTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedTargets;
+    impl<'de> serde::de::Visitor<'de> for BoundedTargets {
+        type Value = Vec<HostAgentTarget>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_HOST_AGENT_TARGETS} agent targets"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut targets = Vec::new();
+            while let Some(target) = seq.next_element::<HostAgentTarget>()? {
+                if targets.len() == MAX_HOST_AGENT_TARGETS {
+                    return Err(serde::de::Error::custom(
+                        "host agents check names more agents than the daemon checks",
+                    ));
+                }
+                targets.push(target);
+            }
+            Ok(targets)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedTargets)
+}
+
 fn serialize_bounded_signed_envelope<S>(
     value: &Option<String>,
     serializer: S,
@@ -366,7 +411,7 @@ pub enum Inbound {
     #[serde(rename = "host.agents.check")]
     HostAgentsCheck {
         request_id: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_bounded_agent_targets")]
         targets: Vec<HostAgentTarget>,
     },
     #[serde(rename = "host.agents.install")]
