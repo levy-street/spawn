@@ -25,4 +25,5 @@ pub mod secret_file;
 pub mod sessiond;
 pub mod signed_signal;
 pub mod signed_signal_wire;
+pub mod support_consent;
 pub mod version;

@@ -57,6 +57,7 @@ struct InstanceStatus {
     /// machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     support_log: Option<String>,
+    support_sharing: crate::support_store::SharingStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +216,46 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     let support_log = crate::support_log::current_path(dir)
         .ok()
         .map(|path| path.display().to_string());
+    let support_config = dir.to_owned();
+    let support_trust = crate::support::Trust::from_record(&stored);
+    // Sharing inspection only reads existing support files.
+    let support_sharing = if let Some(worker) = crate::support_io::Worker::process() {
+        worker
+            .run(
+                tokio::time::Instant::now() + crate::support_io::IO_DEADLINE,
+                move || {
+                    crate::support_log::support_dir(&support_config)
+                        .ok()
+                        .map(|path| {
+                            let mut sharing = crate::support_store::status(
+                                &support_config,
+                                &support_trust,
+                                &path,
+                            );
+                            sharing.runtime = crate::state::read(&support_config)
+                                .ok()
+                                .flatten()
+                                .filter(|state| {
+                                    crate::state::daemon_state_is_live(&support_config, state)
+                                })
+                                .and_then(|state| {
+                                    state
+                                        .support_runtime
+                                        .map(crate::support::RuntimeStatus::today)
+                                });
+                            if sharing.runtime.is_none_or(|state| state.denied.is_some()) {
+                                sharing.enabled = false;
+                            }
+                            sharing
+                        })
+                        .unwrap_or_default()
+                },
+            )
+            .await
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     Ok(InstanceStatus {
         account: dir
             .file_name()
@@ -237,6 +278,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         launch,
         pair,
         support_log,
+        support_sharing,
     })
 }
 
@@ -437,6 +479,57 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         };
         let _ = writeln!(text, "  host key     {shown}");
         let _ = writeln!(text, "  browser pins {}", instance.browser_pins);
+        let sharing = &instance.support_sharing;
+        let _ = writeln!(
+            text,
+            "  sharing      {}",
+            if sharing.enabled { "on" } else { "off" }
+        );
+        if let (Some(device), Some(at)) = (sharing.signer_device_id, sharing.issued_at_ms) {
+            let _ = writeln!(
+                text,
+                "               approved by device {device} at {at} ms since Unix epoch"
+            );
+        }
+        if sharing.account_unproven {
+            let _ = writeln!(
+                text,
+                "               unavailable until a device approval proves the account"
+            );
+        }
+        if let Some(runtime) = sharing
+            .runtime
+            .filter(|r| r.denied.is_some() || r.dropped_requests > 0)
+        {
+            if let Some(reason) = runtime.denied {
+                let _ = writeln!(
+                    text,
+                    "               {}; restarting SPAWN D on this machine clears it",
+                    reason.reason()
+                );
+            }
+            let _ = writeln!(
+                text,
+                "               {} collection requests dropped today",
+                runtime.dropped_requests
+            );
+        }
+        if sharing.server_off {
+            let _ = writeln!(text, "               the server switched sharing off");
+        }
+        for receipt in &sharing.recent {
+            let outcome = serde_json::to_value(receipt.outcome).unwrap_or_default();
+            let _ = writeln!(
+                text,
+                "  collection   {} · {} · {} · {} bytes · {} lines · {} seconds",
+                receipt.time,
+                receipt.request_id,
+                outcome.as_str().unwrap_or("failed"),
+                receipt.bytes,
+                receipt.lines,
+                receipt.window
+            );
+        }
         if let Some(path) = &instance.support_log {
             let _ = writeln!(text, "  support log  {path} · kept on this machine");
         }
@@ -468,6 +561,7 @@ mod tests {
 
     fn state(version: &str, exe: Option<&str>, worker_mismatch: bool) -> crate::state::StateFile {
         crate::state::StateFile {
+            support_runtime: None,
             pid: std::process::id(),
             process_started_100ns: None,
             task_breakaway_denied: None,
@@ -575,6 +669,7 @@ mod tests {
                 }),
                 launch: "release store".into(),
                 pair: "matches".into(),
+                support_sharing: Default::default(),
                 support_log: Some(
                     "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl".into(),
                 ),
@@ -621,6 +716,52 @@ mod tests {
             json["instances"][0]["support_log"],
             "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl"
         );
+    }
+
+    #[test]
+    fn unproven_account_explains_unavailable_sharing_without_a_signer() {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let (mut trust, _) = crate::support::tests::fixture();
+        trust.account = None;
+        let sharing = crate::support_store::status(tmp.path(), &trust, &tmp.path().join("support"));
+        assert!(sharing.account_unproven);
+        assert!(sharing.signer_device_id.is_none());
+        let output = StatusOutput {
+            host: "host".into(),
+            instances: vec![InstanceStatus {
+                account: "account".into(),
+                config_dir: tmp.path().display().to_string(),
+                server: "https://spawnd.dev/".into(),
+                signed_in: true,
+                connection: "connected".into(),
+                service: crate::service::ServiceStatus {
+                    installed: false,
+                    running: false,
+                    name: String::new(),
+                    manager: None,
+                    stdout_log: None,
+                    stderr_log: None,
+                },
+                sessions: 0,
+                rtc_peers: None,
+                version: "0.1.0".into(),
+                update: String::new(),
+                host_key: None,
+                browser_pins: 1,
+                cli_version: "0.1.0".into(),
+                running: None,
+                release: None,
+                launch: String::new(),
+                pair: String::new(),
+                support_sharing: sharing,
+                support_log: None,
+            }],
+        };
+        let plain = format_plain(&output, 0);
+        assert!(plain.contains(
+            "  sharing      off\n               unavailable until a device approval proves the account\n"
+        ));
+        assert!(!plain.contains("approved by device"));
     }
 
     #[test]

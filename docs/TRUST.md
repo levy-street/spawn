@@ -201,6 +201,144 @@ on a host it no longer owns.
 | Agent commands, paths, installed/latest versions, output, and detailed errors | current checks: REST plus `host.agents.check`; install definitions and historical policy/errors remain stored | installation is refused and automation disabled; checks remain server-readable and execute server-selected binaries; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
+### Optional support log sharing: daemon foundation only
+
+**This is an exception that can disclose diagnostic information to the server
+operator. It is off for everyone until the apps ship a sharing switch.** This
+change implements only host-side statement verification and bounded collection.
+No app signs a statement, no server sends a collection request, and server-side
+upload storage, retention and owner-facing collection history are not built yet.
+There is no new server-side storage guarantee or retention promise.
+
+The support log is a separate, bounded local record. It holds event times,
+producer builds, levels, source locations, reviewed counters/identifiers/fixed
+choices and a small reviewed set of local paths and classified filesystem
+errors. Paths can reveal information about the machine's folders. There is no collection path for terminal input/output, terminal history, file
+excerpts, command arguments, environment values, credential fields, arbitrary
+event messages or third-party message/field content. Construction enforces this: unknown fields are withheld
+before formatting; allowed scalar/identity/choice fields have typed rules; path
+origins and error callsites are inventoried in a checked-in policy. Sanitizing
+is a second, heuristic defense and cannot reliably remove short secrets from an
+admitted path. The source guard and canaries cover these boundaries. The
+collection reader opens exactly the two versioned support files, never lists a
+folder, and never reads ordinary daemon output or terminal storage. A typed
+header adds only the documented state counters, classified error kind/time and
+parsed build identity; it never adds general state-file text.
+
+The owner decides through a statement signed by an approved device. Each host
+requires an account proven by its own retained device approvals; a server-named
+account never enables support sharing. Unknown account disables sharing until
+a device approval establishes it. The same direct-pin/carried-chain admission
+rule is used for connections, with an additional attribution check: the signed
+device ID must match the pin or verified final approval. Legacy connection
+admission and its direct-pin-before-chain-cap order are preserved. Newest time
+wins, off wins a tie, and signers use `max(now, current + 1)` within the 24-hour
+future bound. Consent has no expiry. Null disables; an identical current valid
+statement can clear server-off.
+
+One optional sequential actor owns sharing across control reconnects. Its queue
+exists immediately; startup opens no support storage. Dispatch for trust/consent
+clones the parsed support payload, advances one generation with a compare-exchange
+loop, clears the request-started bit, tries the bounded queue and notifies the
+actor. It does no support filesystem or cryptographic work. Queue operations may
+allocate and payload destruction may occur. Actual trust changes, failed or
+timed-out credential observations, consent, teardown and shutdown advance the
+generation; unchanged observations deliver nothing.
+
+The actor takes one input at a time, in arrival order, and finishes it before
+taking another. A combined trust/consent update stays one input. Received trust
+and revocations are retained before writes. Collection runs inside that same
+loop: one preparation job (statement existence, authorization, durable reservation,
+snapshot and encoding), one final disk authorization job, atomic start claim,
+request selected against generation change, then one final receipt job. During
+collection, delivery still advances the generation immediately, while queued
+updates wait for collection to finish. Every filesystem job is awaited to
+completion or its deadline; healthy work is never abandoned. Lock waits are
+bounded at about two seconds. No job queues behind unfinished work. The dedicated
+thread is not joined at daemon shutdown. The collector's custom HTTP resolver
+runs OS lookup as one job on that same thread, under the collection deadline;
+no lookup uses Tokio's blocking pool. An unfinished lookup prevents any later
+job, enters terminal denial, and cannot hold runtime shutdown. This client
+ignores environment proxies; ordinary daemon HTTP clients are unchanged.
+
+Collection admission is charged at delivery, before enqueueing (one per minute,
+burst three). A busy gate or full queue drops/counts a collection and never
+triggers overflow denial. At dequeue, an expired usable deadline or stale
+generation is dropped/counts without a storage job or POST. Before any other
+collection work, absence of the instance's consent file drops/counts the frame:
+no write, receipt, DNS lookup, connection or POST. Counts stay in memory for the
+current UTC day; a running daemon exposes them through its normal heartbeat and
+`spawnd status`. A stopped daemon shows no count.
+
+Any update failure enters terminal `Denied(reason)` for the rest of this process:
+storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
+storage worker, the consent write budget, the 256-key support revocation floor,
+consent/trust delivery queue overflow or gate contention, invalid support update, or
+generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
+write failures also deny. Later inputs are drained and ignored, and stored consent
+is removed once, best-effort; a dead or unfinished worker can prevent that removal.
+No collection is admitted in `Denied`. Status gives the reason in plain words and
+says restarting SPAWN D on that machine clears the process denial. The normal
+heartbeat can be up to 30 seconds old, and storage failure can prevent reporting.
+
+An account whose server delivers more than 256 removed devices cannot share from
+that host. Restart does not cure it while that history is redelivered. Connection
+revocations remain uncapped, as on master. More than 30 sharing changes in ten
+minutes pauses sharing on that host until restart; ordinary toggles across devices
+can reach this budget. Unchanged effective state skips writes, including a
+comparison of the carried approvals: a refreshed approval path is persisted.
+
+Successful persistence survives restart; terminal process denial and the admission
+bucket do not. Removing the statement also removes its timestamp/revocation floor;
+failed removal can leave an old on. An honest server must redeliver current consent
+in `registered` before collection. A dishonest server can withhold withdrawal or
+replay an old valid on after state loss. There is no host acknowledgement that it
+applied a turn-off; apps must not claim one. Capability, silence and collection
+receipts do not provide that confirmation.
+
+A process-wide admission budget allows one request per minute, burst three,
+across reconnects. Excess requests are counted and dropped without file work,
+receipts or POSTs. Admitted collection has one 30-second deadline including
+audit (two seconds reserved for final audit), a five-second connect and
+15-second HTTP timeout. One flight, durable limits of one bundle per five
+minutes/twelve per day (refusals count), a 60-second to 72-hour window and a 900 KiB NDJSON
+body cap (header included) bound disclosure. All support filesystem/encoding work
+runs serially on one bounded, dedicated thread. Every job is awaited to completion or its three-second deadline (final audit
+uses the remaining collection deadline); nothing queues behind unfinished work. A stalled thread cannot hold daemon shutdown. HTTPS uses the configured origin and path prefix, the daemon token,
+no redirects/retries, and only 2xx succeeds. Body provenance is guarded by typed
+construction, source markers and canaries; the guard is not a proof.
+
+Request start means the single atomic compare-exchange from
+`(collection generation, not started)` to `(collection generation, started)`,
+after the final disk authorization job returns and immediately before `send()`
+is created and polled. Generation and started bit occupy one atomic word.
+Delivery before this transition makes the claim fail: no request is created,
+and the receipt is `cancelled`. Delivery after it abandons the request best-effort.
+
+A collection may begin sending only if, immediately before the request is
+started, the statement stored on this host is valid, enabled, not switched off,
+and its signer is still admitted, as read from disk by this process. A change
+this process receives before the request has been started prevents it. Once the
+request has been started it is abandoned on a best-effort basis when a later
+change arrives, but its body (one bundle, at most 900 KiB) may still be delivered,
+and it ends within the 15-second request timeout in any case. A change written
+by another process of the same instance is seen at the next authorisation read.
+Cancellation attempts a typed `cancelled` receipt and never promises that no
+bytes were sent. The server can ask before relaying off; transport buffering
+cannot strengthen that ordering guarantee.
+
+Collector construction starts no storage job; inputs are processed lazily as
+they arrive. Logout (both variants), reset and exorcise retain master's
+ordinary error behavior and cleanup order; support failure adds a warning only.
+Without a proven account no consent statement is stored or honoured; lock,
+receipt and revocation files may still exist. Status explains unavailable account
+proof, terminal denial reasons and admission drops using the normal heartbeat
+(up to 30 seconds old; storage failure may prevent reporting), alongside bounded
+local receipts. No receipt proves server retention. A dishonest server can
+collect within the limits while sharing is on, withhold removals/withdrawal, or
+omit a request from its future history. A maliciously delivered app or web client
+could sign without the person's action; trusted client delivery remains required.
+
 ### Host capacity (2026-08-21)
 
 Showing a fleet means showing how hard each machine is working, and utilization

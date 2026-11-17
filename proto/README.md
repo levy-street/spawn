@@ -36,6 +36,17 @@ Daemon host-key proof during pairing uses
 [`HOST_PAIR_POSSESSION_V1.md`](HOST_PAIR_POSSESSION_V1.md) and the Rust-produced
 `host-pair-possession-v1-vectors.json` corpus.
 
+The daemon-only support sharing statement is specified in
+[`SUPPORT_LOG_CONSENT_V1.md`](SUPPORT_LOG_CONSENT_V1.md), with generated on/off and negative device-attribution
+vectors in [`support-log-consent-v1-vectors.json`](support-log-consent-v1-vectors.json).
+Regenerate with `cargo run --locked --example generate_support_log_consent_vectors`
+from `daemon/`; Rust tests consume the corpus. It adds `register.supports_support_log`,
+optional `registered.support_log_consent`, `host.support_log_consent`, and
+`support_log.collect`. These are additive, with no control-subprotocol bump.
+The daemon can verify and upload, but no server sender/storage or app signer
+exists yet, so sharing remains off. The spec defines null versus absent,
+account/device authorization, NDJSON body limits, local receipts and POST headers.
+
 ## Identifiers
 
 - All IDs are UUIDv4 strings in JSON, raw 16-byte big-endian in binary frames.

@@ -314,7 +314,7 @@ fn classify(msg: Message) -> std::result::Result<Option<WsInbound>, InboundFrame
             // malformed tokens can be copied into its Display text. The
             // hostile server frame must not reach daemon logs.
             let frame: Inbound =
-                serde_json::from_str(&t).map_err(|_| InboundFrameError::MalformedJson)?;
+                crate::proto::parse_inbound(&t).map_err(|_| InboundFrameError::MalformedJson)?;
             Ok(Some(WsInbound::Json(Box::new(frame))))
         }
         Message::Binary(_) => Err(InboundFrameError::BinaryForbidden),

@@ -4,6 +4,21 @@
 use super::*;
 use tracing_subscriber::layer::SubscriberExt;
 
+thread_local! {
+    static SNAPSHOT_WAITING: std::cell::RefCell<Option<mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn snapshot_waiting(lock: &File) {
+    SNAPSHOT_WAITING.with(|signal| {
+        if let Some(signal) = signal.borrow_mut().take() {
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            signal.send(()).unwrap();
+        }
+    });
+}
+
 fn read_lines(dir: &Path) -> Vec<serde_json::Value> {
     let mut lines = Vec::new();
     for name in [PREVIOUS, CURRENT] {
@@ -25,7 +40,10 @@ struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl io::Write for Sink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.0
+            .try_lock()
+            .expect("test sink busy")
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -63,7 +81,7 @@ fn rust_log_trace_and_verbose_flags_do_not_widen_the_support_log() {
         tracing::info!(target: "spawnd::run", "inside-a-span");
     });
     assert!(log.flush(Duration::from_secs(10)));
-    let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let stderr = String::from_utf8(sink.0.try_lock().expect("test sink busy").clone()).unwrap();
     assert!(stderr.contains("spawnd-trace") && stderr.contains("tungstenite-trace"));
     let lines = read_lines(log.dir());
     let mut targets = vec!["spawnd::rtc", "tungstenite::protocol", "spawnd::run"];
@@ -392,10 +410,10 @@ fn neither_path_is_ever_followed_through_a_link() {
         "not the log\n"
     );
     // The reader refuses a link at either name.
-    assert!(read_window(&path, "x", 0, i64::MAX, 1 << 20).is_err());
+    assert!(read_window(&path, "00000000", 0, i64::MAX, 1 << 20, None).is_err());
     std::fs::remove_file(path.join(CURRENT)).unwrap();
     std::os::unix::fs::symlink(&elsewhere, path.join(PREVIOUS)).unwrap();
-    assert!(read_window(&path, "x", 0, i64::MAX, 1 << 20).is_err());
+    assert!(read_window(&path, "00000000", 0, i64::MAX, 1 << 20, None).is_err());
     // A link in place of the folder itself is refused too.
     let linked = tmp.path().join("linked");
     std::os::unix::fs::symlink(tmp.path(), &linked).unwrap();
@@ -412,7 +430,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     // event waited for the writer, this test would never finish.
     let store = Store::open(&path).unwrap();
     let log = SupportLog::open_with(&path, 4, false).unwrap();
-    store.lock.lock().unwrap();
+    crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
     let subscriber = tracing_subscriber::registry().with(log.layer());
     tracing::subscriber::with_default(subscriber, || {
         for index in 0..EVENTS {
@@ -422,19 +440,32 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     // The writer holds at most one batch (64 KiB, a few hundred of these
     // lines) and the channel four more; everything else was dropped.
     let dropped = log.dropped();
-    assert!(dropped >= 1_000, "{dropped}");
     store.lock.unlock().unwrap();
+    assert!(dropped >= 1_000, "{dropped}");
     // Once the writer moves again, everything it had is written and it
     // says how many it lost.
     let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-    log.inner.tx.send(Message::Flush(ack_tx)).unwrap();
+    let mut message = Message::Flush(ack_tx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match log.inner.tx.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(value)) => message = value,
+            Err(TrySendError::Disconnected(_)) => panic!("writer stopped"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer queue stayed full"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(ack_rx.recv_timeout(Duration::from_secs(10)).unwrap());
     let written = read_lines(&path)
         .iter()
         .filter(|line| line["target"] == "spawnd::run")
         .count();
     assert_eq!(written as u64 + dropped, EVENTS as u64);
-    let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 30).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 30, None).unwrap();
     assert_eq!(bundle.header.dropped_events, dropped);
 }
 
@@ -462,17 +493,17 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
     }
     let from = 1_000_000 + 4_000;
     let to = 1_000_000 + 4_099;
-    let all = read_window(&path, "abcd1234", from, to, 1 << 20).unwrap();
+    let all = read_window(&path, "abcd1234", from, to, 1 << 20, None).unwrap();
     assert_eq!(all.lines.len(), 100);
     assert!(!all.header.truncated);
     assert!(all.lines[0].contains("line-004000"));
     assert!(all.lines[99].contains("line-004099"));
     // Spanning both files, oldest first.
-    let spanning = read_window(&path, "abcd1234", 1_000_000, to, 1 << 30).unwrap();
+    let spanning = read_window(&path, "abcd1234", 1_000_000, to, 1 << 30, None).unwrap();
     assert!(spanning.lines.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(spanning.lines.iter().all(|line| !line.contains("DECOY")));
     // A byte cap keeps the newest.
-    let capped = read_window(&path, "abcd1234", from, to, 10 * 1100).unwrap();
+    let capped = read_window(&path, "abcd1234", from, to, 10 * 1100, None).unwrap();
     assert!(capped.header.truncated);
     assert!(capped.header.bytes <= 10 * 1100);
     assert_eq!(capped.lines.len(), capped.header.lines);
@@ -486,11 +517,19 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
         if crate::version::DIAGNOSTICS_BUILD {
             "diagnostics"
         } else {
-            "release"
+            "normal"
         }
     );
     // A missing folder is an empty bundle, not an error.
-    let missing = read_window(&tmp.path().join("none"), "x", 0, i64::MAX, 1 << 20).unwrap();
+    let missing = read_window(
+        &tmp.path().join("none"),
+        "00000000",
+        0,
+        i64::MAX,
+        1 << 20,
+        None,
+    )
+    .unwrap();
     assert!(missing.lines.is_empty());
 }
 
@@ -513,7 +552,7 @@ fn reader_preserves_each_producers_build_identity() {
     older_bytes.push(b'\n');
     store.append(&older_bytes).unwrap();
     store.append(&current).unwrap();
-    let bundle = read_window(&path, "", 0, i64::MAX, 4096).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX, 4096, None).unwrap();
     assert_eq!(bundle.lines.len(), 2);
     let lines: Vec<serde_json::Value> = bundle
         .lines
@@ -542,7 +581,7 @@ fn a_panic_records_location_and_runtime_thread_id_never_payload_or_name() {
         })
         .unwrap();
     let thread_id = format!("{:?}", joined.thread().id());
-    let joined = joined.join();
+    let joined = crate::support::tests::join_thread(joined);
     assert!(joined.is_err());
     let contents = capture.contents();
     let record = contents
@@ -765,12 +804,12 @@ fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
     fill(&store, 1, 10, "safe");
     // An overlapping old process can recreate its files, never the new pair.
     std::fs::write(path.join("support.jsonl"), "unsafe older history\n").unwrap();
-    let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 20).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 20, None).unwrap();
     assert_eq!(bundle.lines.len(), 1);
     assert!(bundle.lines[0].contains("safe"));
     let _reopened = Store::open(&path).unwrap();
     assert_eq!(
-        read_window(&path, "x", 0, i64::MAX / 2, 1 << 20)
+        read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 20, None)
             .unwrap()
             .lines,
         bundle.lines
@@ -781,7 +820,13 @@ fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
 fn dropping_the_last_handle_stops_the_writer() {
     let tmp = capture::private_tempdir();
     let log = SupportLog::open(&tmp.path().join(DIR_NAME)).unwrap();
-    let stopped = log.inner.stopped.lock().unwrap().take().unwrap();
+    let stopped = log
+        .inner
+        .stopped
+        .try_lock()
+        .expect("test stop receiver busy")
+        .take()
+        .unwrap();
     log.push(b"{}\n".to_vec());
     drop(log);
     stopped
@@ -824,7 +869,7 @@ fn construction_withholds_dynamic_messages_unknown_fields_and_unlisted_errors() 
         },
     );
     assert!(
-        String::from_utf8(sink.0.lock().unwrap().clone())
+        String::from_utf8(sink.0.try_lock().expect("test sink busy").clone())
             .unwrap()
             .contains(&marker),
         "stderr lost its original detail"
@@ -881,16 +926,16 @@ fn startup_refuses_a_busy_lock_without_waiting_for_its_owner() {
     let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
-    store.lock.lock().unwrap();
-    // A bounded join detects a regression without stranding the test process:
-    // release the lock before asserting, even if open incorrectly waited.
+    crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
+    // Completion is explicit; scheduler delays cannot be mistaken for lock
+    // contention. The source guard also pins try_lock at startup.
     let (tx, rx) = mpsc::sync_channel(1);
     let attempt = std::thread::spawn(move || {
         tx.send(SupportLog::open(&path).is_err()).unwrap();
     });
-    let result = rx.recv_timeout(Duration::from_secs(5));
+    let result = rx.recv_timeout(Duration::from_secs(30));
     store.lock.unlock().unwrap();
-    attempt.join().unwrap();
+    crate::support::tests::join_thread(attempt).unwrap();
     assert!(result.unwrap());
 }
 
@@ -928,7 +973,7 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
     }
     assert!(lines.last().unwrap()["fields"].get("message").is_none());
     assert!(lines.last().unwrap()["fields"].get("error").is_none());
-    let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let stderr = String::from_utf8(sink.0.try_lock().expect("test sink busy").clone()).unwrap();
     assert!(stderr.contains(error) && stderr.contains(&marker));
     let stderr_lines: Vec<_> = stderr.lines().collect();
     assert_eq!(
@@ -940,4 +985,182 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
         &marker,
         "worker error",
     );
+}
+
+#[test]
+fn snapshot_orders_timestamps_then_append_order_and_skips_large_and_invalid_lines() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    for (at, msg) in [
+        (3000, "tie-first"),
+        (1000, "old-small"),
+        (3000, "tie-second"),
+        (2000, "middle"),
+    ] {
+        store
+            .append(&render_line(
+                &rfc3339_millis(at),
+                "INFO",
+                "spawnd",
+                "src/main.rs:1",
+                msg,
+                vec![],
+            ))
+            .unwrap();
+    }
+    store
+        .append(&render_line(
+            &rfc3339_millis(4000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            &"x".repeat(1500),
+            vec![],
+        ))
+        .unwrap();
+    store.append(b"invalid\n").unwrap();
+    // Deliberately bypass tail repair for an interrupted final write.
+    let mut file = open_or_create(&store.dir, CURRENT).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"{\"t\":").unwrap();
+    drop(file);
+    let mut bundle = read_window(&path, "00000000", 0, 5000, 1600, None).unwrap();
+    assert_eq!(bundle.header.invalid_lines, 2);
+    assert!(bundle.header.truncated);
+    assert!(bundle.encode().unwrap().len() <= 1600);
+    let raw_bytes = bundle.encode().unwrap().len();
+    assert_eq!(bundle.header.bytes, raw_bytes);
+    assert!(!bundle.lines.iter().any(|l| l.contains(&"x".repeat(30))));
+    assert!(bundle.lines[0].contains("old-small"));
+    assert!(bundle.lines[1].contains("middle"));
+    assert!(bundle.lines[2].contains("tie-first"));
+    assert!(bundle.lines[3].contains("tie-second"));
+    assert_eq!(bundle.header.from, Some(1000));
+    assert_eq!(bundle.header.to, Some(3000));
+}
+
+#[test]
+fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    store
+        .append(&render_line(
+            &rfc3339_millis(2000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            "previous",
+            vec![],
+        ))
+        .unwrap();
+    // Fill the remainder with invalid terminated lines without stressing a writer.
+    let mut file = open_or_create(&store.dir, CURRENT).unwrap();
+    let remaining = MAX_FILE_BYTES - file.metadata().unwrap().len();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let mut padding = vec![b'x'; remaining as usize];
+    *padding.last_mut().unwrap() = b'\n';
+    file.write_all(&padding).unwrap();
+    drop(file);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        store
+            .append_locked(&render_line(
+                &rfc3339_millis(1000),
+                "INFO",
+                "spawnd",
+                "src/main.rs:1",
+                "current",
+                vec![],
+            ))
+            .unwrap();
+        store.lock.unlock().unwrap();
+    });
+    let locked = locked_rx.recv_timeout(Duration::from_secs(5));
+    let (done, read) = mpsc::channel();
+    let snapshot_path = path.clone();
+    let (waiting, entered) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        SNAPSHOT_WAITING.with(|signal| *signal.borrow_mut() = Some(waiting));
+        let _ = done.send(read_window(&snapshot_path, "00000000", 0, 5000, 4096, None));
+    });
+    let overlap = entered.recv_timeout(Duration::from_secs(10));
+    // Always release the writer before asserting or joining either thread.
+    drop(release_tx);
+    crate::support::tests::join_thread(writer).unwrap();
+    let result = read.recv_timeout(Duration::from_secs(10));
+    crate::support::tests::join_thread(reader).unwrap();
+    locked.unwrap();
+    overlap.unwrap();
+    assert_eq!(result.unwrap().unwrap().lines.len(), 2);
+    let bundle = read_window(&path, "00000000", 0, 5000, 4096, None).unwrap();
+    assert_eq!(bundle.lines.len(), 2);
+    assert!(bundle.lines[0].contains("current"));
+    assert!(bundle.lines[1].contains("previous"));
+    // Every read handle has closed before the next rotation. This replacement
+    // fails on Windows if a reader kept an incompatible handle open.
+    let next = Store::open(&path).unwrap();
+    let mut file = open_or_create(&next.dir, CURRENT).unwrap();
+    file.set_len(MAX_FILE_BYTES).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    next.append(&render_line(
+        &rfc3339_millis(3000),
+        "INFO",
+        "spawnd",
+        "src/main.rs:1",
+        "next",
+        vec![],
+    ))
+    .unwrap();
+    assert!(read_window(&path, "00000000", 0, 5000, 4096, None).is_ok());
+}
+
+#[test]
+fn typed_header_cannot_copy_state_text_and_body_has_a_final_cap() {
+    let marker = capture::canary();
+    let state: crate::state::StateFile = serde_json::from_value(serde_json::json!({
+        "pid":1,"version":marker,"connected":true,"connected_at":marker,
+        "server":marker,"last_error":{"kind":marker,"detail":marker,"at":"2026-01-01T00:00:00Z"},
+        "sessions":2,"exe":marker,"release":marker,"tree":marker
+    }))
+    .unwrap();
+    let projection = BundleState::from_state(state);
+    capture::assert_absent(
+        &serde_json::to_string(&projection).unwrap(),
+        &marker,
+        "typed state",
+    );
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    let line = render_line(
+        &rfc3339_millis(1000),
+        "INFO",
+        "spawnd",
+        "src/main.rs:1",
+        "event",
+        vec![],
+    );
+    // One bounded fixture write crosses the actual wire cap, without a load loop.
+    open_or_create(&store.dir, CURRENT)
+        .unwrap()
+        .write_all(&line.repeat(MAX_BODY_BYTES / line.len() + 1))
+        .unwrap();
+    let log = SupportLog::open(&path).unwrap();
+    let result = collect_bundle(&log, "00000000", 0, 3000, Some(projection))
+        .unwrap()
+        .unwrap();
+    let raw = String::from_utf8(result.body).unwrap();
+    assert_eq!(result.header.bytes, raw.len());
+    assert!(raw.len() <= MAX_BODY_BYTES);
+    assert!(result.header.truncated);
+    assert_eq!(result.header.lines, raw.lines().count() - 1);
+    capture::assert_absent(&raw, &marker, "complete bundle");
 }

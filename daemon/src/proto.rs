@@ -30,51 +30,126 @@ where
     Ok(Some(value))
 }
 
-/// Bound the carried endorsement edge-set at the wire, independently of the
-/// relay's own `MAX_RELAYED_ENDORSEMENTS` (the same 64 — see the constant's
-/// rationale). The honest relay never forwards more, so an over-cap list can
-/// only come from a party driving this socket directly; refusing the frame at
-/// deserialization stops it before the vector is even fully allocated, and the
-/// admission path re-checks the same cap for defense in depth. `#[serde(default)]`
-/// still handles an absent field; a present field must be a sequence, so
-/// `carried_endorsements: null` cannot collapse to "none carried".
-fn deserialize_bounded_carried_endorsements<'de, D>(
-    deserializer: D,
-) -> Result<Vec<CarriedEndorsement>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
+use spawnd::endorsement_chain::deserialize_bounded_carried_endorsements;
 
-    struct BoundedEdges;
-    impl<'de> serde::de::Visitor<'de> for BoundedEdges {
-        type Value = Vec<CarriedEndorsement>;
+/// Parsed independently from ordinary registration. Invalid support data is
+/// support-only denial; it must never discard a valid ordinary frame.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ConsentInput {
+    #[default]
+    Absent,
+    Null,
+    Valid(spawnd::support_consent::Consent),
+    Invalid,
+}
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SupportUpdate {
+    pub browser_device_ids: Option<Vec<String>>,
+    pub revoked_browser_keys: Option<Vec<String>>,
+    pub consent: ConsentInput,
+}
 
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(
-                formatter,
-                "a sequence of at most {MAX_CARRIED_ENDORSEMENTS} carried endorsement edges"
-            )
+/// Only support-bearing frames get a second parse. The ordinary parse runs
+/// first, with exactly the ordinary field types and serde_json features.
+pub(crate) fn parse_inbound(text: &str) -> Result<Inbound, serde_json::Error> {
+    let mut frame: Inbound = serde_json::from_str(text)?;
+    let field = match &mut frame {
+        Inbound::Registered {
+            support,
+            browser_device_ids,
+            revoked_browser_keys,
+            ..
+        } => {
+            *support = std::sync::Arc::new(SupportUpdate {
+                browser_device_ids: browser_device_ids.clone(),
+                revoked_browser_keys: revoked_browser_keys.clone(),
+                consent: ConsentInput::Absent,
+            });
+            "support_log_consent"
         }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            let mut edges = Vec::new();
-            while let Some(edge) = seq.next_element::<CarriedEndorsement>()? {
-                if edges.len() == MAX_CARRIED_ENDORSEMENTS {
-                    return Err(serde::de::Error::custom(
-                        "carried endorsement edges exceed the daemon cap",
-                    ));
-                }
-                edges.push(edge);
-            }
-            Ok(edges)
+        Inbound::HostSupportLogConsent { .. } => "consent",
+        Inbound::HostBrowserPins {
+            support,
+            browser_device_ids,
+            revoked_browser_keys,
+            ..
+        } => {
+            *support = std::sync::Arc::new(SupportUpdate {
+                browser_device_ids: browser_device_ids.clone(),
+                revoked_browser_keys: revoked_browser_keys.clone(),
+                consent: ConsentInput::Absent,
+            });
+            return Ok(frame);
+        }
+        _ => return Ok(frame),
+    };
+    // This bounds only the extension pass; ordinary WebSocket parsing retains
+    // master's frame limit and behaviour, including unknown/duplicate fields.
+    const MAX_SUPPORT_FRAME_BYTES: usize = 64 * 1024;
+    struct Extension(&'static str);
+    impl<'de> serde::de::DeserializeSeed<'de> for Extension {
+        type Value = ConsentInput;
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
         }
     }
-
-    deserializer.deserialize_seq(BoundedEdges)
+    impl<'de> serde::de::Visitor<'de> for Extension {
+        type Value = ConsentInput;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a daemon frame")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum Value {
+                Valid(spawnd::support_consent::Consent),
+                Null(()),
+                Invalid(serde::de::IgnoredAny),
+            }
+            let mut result = ConsentInput::Absent;
+            let mut seen = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == self.0 {
+                    let value = map.next_value::<Value>()?;
+                    result = if seen {
+                        ConsentInput::Invalid
+                    } else {
+                        match value {
+                            Value::Valid(value) => ConsentInput::Valid(value),
+                            Value::Null(()) => ConsentInput::Null,
+                            Value::Invalid(_) => ConsentInput::Invalid,
+                        }
+                    };
+                    seen = true;
+                } else {
+                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(result)
+        }
+    }
+    let consent = if text.len() > MAX_SUPPORT_FRAME_BYTES {
+        ConsentInput::Invalid
+    } else {
+        use serde::de::DeserializeSeed;
+        Extension(field)
+            .deserialize(&mut serde_json::Deserializer::from_str(text))
+            .unwrap_or(ConsentInput::Invalid)
+    };
+    let consent = match consent {
+        ConsentInput::Absent if field == "consent" => ConsentInput::Invalid,
+        value => value,
+    };
+    match &mut frame {
+        Inbound::Registered { support, .. } | Inbound::HostSupportLogConsent { support } => {
+            std::sync::Arc::make_mut(support).consent = consent;
+        }
+        _ => unreachable!(),
+    }
+    Ok(frame)
 }
 
 /// The most agents one `host.agents.check` may name. The server sends every
@@ -183,6 +258,7 @@ pub enum Outbound {
         /// Old servers ignore the unknown field.
         supports_account_chains: bool,
         supports_device_connections: bool,
+        supports_support_log: bool,
     },
     /// The keepalive, optionally carrying two meter readings. Buckets, never
     /// percentages: see `host_metrics` for why the server is given a coarse
@@ -355,6 +431,8 @@ pub struct DaemonUpdateArtifact {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
+        #[serde(skip)]
+        support: std::sync::Arc<SupportUpdate>,
         host_id: Uuid,
         /// Optional daemon-token rotation. Old servers omit it.
         #[serde(default)]
@@ -380,10 +458,22 @@ pub enum Inbound {
         #[serde(default)]
         revoked_browser_keys: Option<Vec<String>>,
     },
+    #[serde(rename = "host.support_log_consent")]
+    HostSupportLogConsent {
+        #[serde(skip)]
+        support: std::sync::Arc<SupportUpdate>,
+    },
+    #[serde(rename = "support_log.collect")]
+    SupportLogCollect {
+        request_id: Uuid,
+        since_seconds: i64,
+    },
     /// Pushed when a host's browser pin set changes, so an endorsement takes
     /// effect without waiting for the daemon to reconnect.
     #[serde(rename = "host.browser_pins")]
     HostBrowserPins {
+        #[serde(skip)]
+        support: std::sync::Arc<SupportUpdate>,
         #[serde(default)]
         account_id: Option<String>,
         #[serde(default)]
@@ -582,14 +672,7 @@ pub struct RtcIceServerConfig {
 /// server-relayed and untrusted; the daemon re-verifies each signature and finds
 /// the chain (`endorsement_chain::find_valid_chain`). Wire strings, so the daemon
 /// reconstructs the exact `SPAWN-ACCT-ENDORSE-V1` transcript it re-verifies.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CarriedEndorsement {
-    pub account_id: String,
-    pub endorser_public_key: String,
-    pub endorsed_public_key: String,
-    pub endorsed_device_id: String,
-    pub signature: String,
-}
+pub use spawnd::endorsement_chain::CarriedEndorsement;
 
 /// `session.create` / `session.restart` payload. A session always starts as
 /// the user's login shell in `cwd`: the daemon resolves the shell itself, so
@@ -774,9 +857,11 @@ mod daemon_update_wire_tests {
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,
+            supports_support_log: true,
         })
         .unwrap();
         assert_eq!(value["type"], "register");
+        assert_eq!(value["supports_support_log"], true);
         assert_eq!(value["daemon_tree"], "a".repeat(40));
         assert_eq!(value["self_update"], true);
         assert!(value["self_update_blocked"].is_null());
@@ -800,6 +885,7 @@ mod daemon_update_wire_tests {
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,
+            supports_support_log: true,
         })
         .unwrap();
         assert!(without_tree.get("daemon_tree").is_none());
@@ -1347,5 +1433,325 @@ mod device_poll_tests {
             }
             other => panic!("the server's candidate frame parsed as {other:?}"),
         }
+    }
+    #[test]
+    fn support_extensions_preserve_registration_and_bound_consent() {
+        let host = Uuid::from_bytes([1; 16]);
+        for (value, expected) in [
+            (None, "absent"),
+            (Some(serde_json::Value::Null), "null"),
+            (Some(serde_json::json!({})), "invalid"),
+            (Some(serde_json::json!(42)), "invalid"),
+        ] {
+            let mut wire = serde_json::json!({"type":"registered", "host_id":host});
+            if let Some(value) = value {
+                wire["support_log_consent"] = value;
+            }
+            let Inbound::Registered {
+                support, host_id, ..
+            } = parse_inbound(&wire.to_string()).unwrap()
+            else {
+                panic!("registration discarded")
+            };
+            assert_eq!(host_id, host);
+            assert_eq!(
+                match support.consent {
+                    ConsentInput::Absent => "absent",
+                    ConsentInput::Null => "null",
+                    ConsentInput::Invalid => "invalid",
+                    _ => "valid",
+                },
+                expected
+            );
+        }
+        assert!(
+            matches!(parse_inbound(r#"{"type":"host.support_log_consent","consent":null}"#).unwrap(), Inbound::HostSupportLogConsent { support } if matches!(support.consent, ConsentInput::Null))
+        );
+        assert!(parse_inbound(
+            r#"{"type":"support_log.collect","request_id":"../escape","since_seconds":60}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn duplicate_support_extension_does_not_discard_registration() {
+        let wire = format!(
+            r#"{{"type":"registered","host_id":"{}","support_log_consent":null,"support_log_consent":{{}}}}"#,
+            Uuid::from_bytes([1; 16])
+        );
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Invalid))
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_parity {
+    use super::*;
+    // Frozen ordinary frame definition from origin/master at the start of this
+    // repair. Shared payload types have no wire changes in this branch.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum MasterInbound {
+        Registered {
+            host_id: Uuid,
+            /// Optional daemon-token rotation. Old servers omit it.
+            #[serde(default)]
+            access_token: Option<String>,
+            /// Account the host belongs to. Server-supplied, and safe to be: it is
+            /// only an input to endorsement verification, so a wrong value makes
+            /// the signature fail rather than admitting anything.
+            #[serde(default)]
+            account_id: Option<String>,
+            /// Full pin records, so an endorsed device can be adopted. None from a
+            /// server that predates them; adoption simply does not happen.
+            #[serde(default)]
+            browser_pins: Option<Vec<InboundBrowserPin>>,
+            // None means the server never sent the field, which is not the same as
+            // an empty set: a server that cannot report its pins must not cause
+            // every local pin to be dropped.
+            #[serde(default)]
+            browser_device_ids: Option<Vec<String>>,
+            /// Account deny-list (device mesh §3): wire keys of revoked devices this
+            /// host must subtract from acceptance, so a revoked device cannot connect
+            /// even through a chain to an anchor. Server-delivered, add-only for the
+            /// owner, subtract-only here; a wrong value can only DENY, never grant.
+            #[serde(default)]
+            revoked_browser_keys: Option<Vec<String>>,
+        },
+        /// Pushed when a host's browser pin set changes, so an endorsement takes
+        /// effect without waiting for the daemon to reconnect.
+        #[serde(rename = "host.browser_pins")]
+        HostBrowserPins {
+            #[serde(default)]
+            account_id: Option<String>,
+            #[serde(default)]
+            browser_pins: Option<Vec<InboundBrowserPin>>,
+            #[serde(default)]
+            browser_device_ids: Option<Vec<String>>,
+            #[serde(default)]
+            revoked_browser_keys: Option<Vec<String>>,
+        },
+        #[serde(rename = "host.heartbeat")]
+        HostHeartbeat,
+        #[serde(rename = "host.ping")]
+        HostPing { request_id: String },
+        #[serde(rename = "daemon.update")]
+        DaemonUpdate {
+            request_id: String,
+            version: String,
+            tree: String,
+            target: String,
+            spawnd: DaemonUpdateArtifact,
+            spawn_worker: DaemonUpdateArtifact,
+            #[serde(default)]
+            allow_downgrade: bool,
+        },
+        #[serde(rename = "host.agents.check")]
+        HostAgentsCheck {
+            request_id: String,
+            #[serde(default, deserialize_with = "deserialize_bounded_agent_targets")]
+            targets: Vec<HostAgentTarget>,
+        },
+        #[serde(rename = "host.agents.install")]
+        HostAgentsInstall {
+            request_id: String,
+            target: HostAgentTarget,
+        },
+        #[serde(rename = "session.create")]
+        SessionCreate(SessionCreate),
+        #[serde(rename = "session.restart")]
+        SessionRestart(SessionCreate),
+        #[serde(rename = "session.kill")]
+        SessionKill {
+            session_id: Uuid,
+            #[serde(default)]
+            signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
+        },
+        #[serde(rename = "rtc.offer")]
+        RtcOffer {
+            session_id: String,
+            #[serde(default)]
+            binding_nonce: Option<String>,
+            #[serde(default)]
+            binding_generation: Option<u64>,
+            #[serde(default)]
+            scope_type: Option<String>,
+            #[serde(default)]
+            scope_id: Option<Uuid>,
+            #[serde(default)]
+            protocol: Option<String>,
+            #[serde(default)]
+            protocol_version: Option<u16>,
+            #[serde(default)]
+            sdp: Option<String>,
+            /// Preserved exactly for the Phase-3 verifier cutover. F1 accepts the
+            /// relay shape; F2 will verify it before starting WebRTC negotiation.
+            #[serde(
+                default,
+                deserialize_with = "deserialize_present_bounded_signed_envelope"
+            )]
+            signed_envelope: Option<String>,
+            /// Account endorsement edges the browser carries so a daemon that does
+            /// not directly pin the offering key can admit it via a chain to an
+            /// anchor (device mesh §3). Empty for a directly-pinned browser.
+            /// Bounded at the wire: a set larger than the daemon's independent cap
+            /// rejects the whole frame (see the deserializer).
+            #[serde(default, deserialize_with = "deserialize_bounded_carried_endorsements")]
+            carried_endorsements: Vec<CarriedEndorsement>,
+            #[serde(default)]
+            ice_servers: Vec<RtcIceServerConfig>,
+            #[serde(default)]
+            ice_transport_policy: Option<String>,
+            #[serde(default)]
+            ice_restart: bool,
+        },
+        #[serde(rename = "rtc.candidate")]
+        RtcCandidate {
+            session_id: String,
+            #[serde(default)]
+            binding_nonce: Option<String>,
+            #[serde(default)]
+            binding_generation: Option<u64>,
+            #[serde(default)]
+            scope_type: Option<String>,
+            #[serde(default)]
+            scope_id: Option<Uuid>,
+            #[serde(default)]
+            protocol: Option<String>,
+            #[serde(default)]
+            protocol_version: Option<u16>,
+            candidate: serde_json::Value,
+        },
+        #[serde(rename = "rtc.close")]
+        RtcClose {
+            session_id: String,
+            #[serde(default)]
+            binding_nonce: Option<String>,
+            #[serde(default)]
+            binding_generation: Option<u64>,
+            #[serde(default)]
+            scope_type: Option<String>,
+            #[serde(default)]
+            scope_id: Option<Uuid>,
+            #[serde(default)]
+            protocol: Option<String>,
+            #[serde(default)]
+            protocol_version: Option<u16>,
+        },
+        /// The server refusing a frame this daemon sent
+        /// (`spawn_server.ws.reliability.ErrorFrameSender`).
+        ///
+        /// Without this variant the frame did not parse at all and was discarded
+        /// as malformed, content-free and unattributed — so a daemon whose
+        /// signalling the server was rejecting on every connection said only
+        /// "discarding malformed JSON daemon control frame" and there was no way,
+        /// from a running system, to learn which frame or why. That is the whole
+        /// value here: both fields are short server-authored constants, and
+        /// [`BoundedServerText`] keeps them that way in the log.
+        #[serde(rename = "error")]
+        Error {
+            code: BoundedServerText,
+            #[serde(default)]
+            frame_type: Option<BoundedServerText>,
+        },
+    }
+
+    fn nested_markers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for value in map.values_mut() {
+                    nested_markers(value);
+                }
+                map.insert(
+                    "$serde_json::private::RawValue".into(),
+                    serde_json::json!(0),
+                );
+                map.insert(
+                    "unknown".into(),
+                    serde_json::json!({"$serde_json::private::RawValue":0}),
+                );
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    nested_markers(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn parity(wire: &str) {
+        let master = serde_json::from_str::<MasterInbound>(wire);
+        let current = parse_inbound(wire);
+        assert_eq!(
+            master.is_ok(),
+            current.is_ok(),
+            "ordinary parse result diverged"
+        );
+        if let (Ok(master), Ok(current)) = (master, current) {
+            assert_eq!(
+                serde_json::to_value(master).unwrap(),
+                serde_json::to_value(current).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn every_ordinary_frame_matches_master_for_private_marker_unknown_and_duplicate_fields() {
+        let id = uuid::Uuid::nil().to_string();
+        let target = serde_json::json!({"agent_id":"test", "agent_name":"test", "agent_kind":"test", "command":"test"});
+        let frames = vec![
+            serde_json::json!({"type":"registered", "host_id":id, "browser_pins":[{"browser_device_id":id,"browser_key_algorithm":"ed25519","browser_public_key":"test","browser_key_fingerprint":"test"}]}),
+            serde_json::json!({"type":"host.browser_pins"}),
+            serde_json::json!({"type":"host.heartbeat"}),
+            serde_json::json!({"type":"host.ping", "request_id":"test"}),
+            serde_json::json!({"type":"daemon.update", "request_id":"test","version":"test","tree":"test","target":"test","spawnd":{"path":"test","sha256":"test"},"spawn_worker":{"path":"test","sha256":"test"}}),
+            serde_json::json!({"type":"host.agents.check", "request_id":"test", "targets":[target.clone()]}),
+            serde_json::json!({"type":"host.agents.install", "request_id":"test", "target":target}),
+            serde_json::json!({"type":"session.create", "session_id":id, "cwd":".", "skills":[{"id":"test","name":"test","description":"test","content":"test"}]}),
+            serde_json::json!({"type":"session.restart", "session_id":id, "cwd":"."}),
+            serde_json::json!({"type":"session.kill", "session_id":id}),
+            serde_json::json!({"type":"rtc.offer", "session_id":"test", "ice_servers":[{"urls":["test"]}]}),
+            serde_json::json!({"type":"rtc.candidate", "session_id":"test", "candidate":{"candidate":"test","sdpMid":"0","sdpMLineIndex":0}}),
+            serde_json::json!({"type":"rtc.close", "session_id":"test"}),
+            serde_json::json!({"type":"error", "code":"test"}),
+        ];
+        for mut frame in frames {
+            assert!(serde_json::from_value::<MasterInbound>(frame.clone()).is_ok());
+            nested_markers(&mut frame);
+            let wire = frame.to_string();
+            parity(&wire);
+            parity(&format!("{{\"unknown\":1,\"unknown\":2,{}", &wire[1..]));
+            // Duplicate a known ordinary field too: accepted/rejected exactly
+            // as master, rather than normalized by a Value pre-parse.
+            if let Some((key, value)) = frame.as_object().unwrap().iter().find(|(k, _)| {
+                *k != "type" && *k != "unknown" && *k != "$serde_json::private::RawValue"
+            }) {
+                parity(&format!(
+                    "{{{}:{},{}",
+                    serde_json::to_string(&key).unwrap(),
+                    value,
+                    &wire[1..]
+                ));
+            }
+            if frame["type"] == "rtc.candidate" {
+                let Inbound::RtcCandidate { candidate, .. } = parse_inbound(&wire).unwrap() else {
+                    unreachable!()
+                };
+                let parsed: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =
+                    serde_json::from_value(candidate).unwrap();
+                assert_eq!(parsed.candidate, "test");
+            }
+        }
+    }
+    #[test]
+    fn oversized_support_frame_denies_only_support() {
+        let wire = format!(
+            r#"{{"type":"registered","host_id":"{}","padding":"{}"}}"#,
+            uuid::Uuid::nil(),
+            "x".repeat(64 * 1024)
+        );
+        let Inbound::Registered { support, .. } = parse_inbound(&wire).unwrap() else {
+            unreachable!()
+        };
+        assert!(matches!(support.consent, ConsentInput::Invalid));
     }
 }

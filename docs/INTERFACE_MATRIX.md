@@ -81,8 +81,93 @@ The daemon control frames implemented in `daemon/src/proto.rs` are:
 
 | Direction | Frames |
 | --- | --- |
-| daemon → server | `register` (`existing_sessions`, optional `spec`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
-| server → daemon | `registered`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
+| daemon → server | `register` (`existing_sessions`, optional `spec`, `supports_support_log:true`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
+| server → daemon | `registered` (optional `support_log_consent`; absent preserves, null disables), `host.support_log_consent`, `support_log.collect`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
+
+The support additions are daemon-only and additive: current server registration
+reads known properties from a JSON object and ignores the capability. There is
+no sender, upload route or app signing switch yet. `support_log.collect` carries
+a UUID `request_id` and integer `since_seconds`, clamped to 60–259200. Responses
+use a bounded HTTPS POST to the configured origin and path prefix, with bearer
+daemon token, locally proven account/device consent and current actor generation.
+The process-wide admission bucket survives reconnects; excess frames have no
+POST/receipt. Only 2xx succeeds. The full frames, headers, refusal enum and limits
+are in [`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
+
+One optional sequential actor owns sharing across control reconnects. Its queue
+exists immediately; startup opens no support storage. Dispatch for trust/consent
+clones the parsed support payload, advances one generation with a compare-exchange
+loop, clears the request-started bit, tries the bounded queue and notifies the
+actor. It does no support filesystem or cryptographic work. Queue operations may
+allocate and payload destruction may occur. Actual trust changes, failed or
+timed-out credential observations, consent, teardown and shutdown advance the
+generation; unchanged observations deliver nothing.
+
+The actor takes one input at a time, in arrival order, and finishes it before
+taking another. A combined trust/consent update stays one input. Received trust
+and revocations are retained before writes. Collection runs inside that same
+loop: one preparation job (statement existence, authorization, durable reservation,
+snapshot and encoding), one final disk authorization job, atomic start claim,
+request selected against generation change, then one final receipt job. During
+collection, delivery still advances the generation immediately, while queued
+updates wait for collection to finish. Every filesystem job is awaited to
+completion or its deadline; healthy work is never abandoned. Lock waits are
+bounded at about two seconds. No job queues behind unfinished work. The dedicated
+thread is not joined at daemon shutdown. The collector's custom HTTP resolver
+runs OS lookup as one job on that same thread, under the collection deadline;
+no lookup uses Tokio's blocking pool. An unfinished lookup prevents any later
+job, enters terminal denial, and cannot hold runtime shutdown. This client
+ignores environment proxies; ordinary daemon HTTP clients are unchanged.
+
+Collection admission is charged at delivery, before enqueueing (one per minute,
+burst three). A busy gate or full queue drops/counts a collection and never
+triggers overflow denial. At dequeue, an expired usable deadline or stale
+generation is dropped/counts without a storage job or POST. Before any other
+collection work, absence of the instance's consent file drops/counts the frame:
+no write, receipt, DNS lookup, connection or POST. Counts stay in memory for the
+current UTC day; a running daemon exposes them through its normal heartbeat and
+`spawnd status`. A stopped daemon shows no count.
+
+Any update failure enters terminal `Denied(reason)` for the rest of this process:
+storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
+storage worker, the consent write budget, the 256-key support revocation floor,
+consent/trust delivery queue overflow or gate contention, invalid support update, or
+generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
+write failures also deny. Later inputs are drained and ignored, and stored consent
+is removed once, best-effort; a dead or unfinished worker can prevent that removal.
+No collection is admitted in `Denied`. Status gives the reason in plain words and
+says restarting SPAWN D on that machine clears the process denial. The normal
+heartbeat can be up to 30 seconds old, and storage failure can prevent reporting.
+
+An account whose server delivers more than 256 removed devices cannot share from
+that host. Restart does not cure it while that history is redelivered. Connection
+revocations remain uncapped, as on master. More than 30 sharing changes in ten
+minutes pauses sharing on that host until restart; ordinary toggles across devices
+can reach this budget. Unchanged effective state skips writes, including a
+comparison of the carried approvals: a refreshed approval path is persisted.
+
+Successful persistence survives restart; terminal process denial and the admission
+bucket do not. Removing the statement also removes its timestamp/revocation floor;
+failed removal can leave an old on. An honest server must redeliver current consent
+in `registered` before collection. A dishonest server can withhold withdrawal or
+replay an old valid on after state loss. There is no host acknowledgement that it
+applied a turn-off; apps must not claim one. Capability, silence and collection
+receipts do not provide that confirmation.
+
+Request start means the single atomic compare-exchange from
+`(collection generation, not started)` to `(collection generation, started)`,
+after the final disk authorization job returns and immediately before `send()`
+is created and polled. Generation and started bit occupy one atomic word.
+Delivery before this transition makes the claim fail: no request is created,
+and the receipt is `cancelled`. Delivery after it abandons the request best-effort.
+
+A collection may begin sending only when this process's final disk read finds a
+valid, enabled statement, not switched off, with its signer still admitted for
+the locally proven account. An input received before request start prevents it.
+After request start, cancellation is best effort: one bundle, at most 900 KiB,
+may still arrive within the 15-second request timeout. Another process's change
+is seen at the next authorization read. A `cancelled` receipt does not prove
+that nothing arrived.
 
 As implemented:
 

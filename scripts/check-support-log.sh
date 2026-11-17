@@ -45,6 +45,7 @@ CONTENT_MODULES=(
   daemon/src/sessiond/emulator.rs
   daemon/src/sessiond/scrollback.rs
 )
+COLLECTION_MODULES=(daemon/src/support.rs daemon/src/support_store.rs daemon/src/support_consent.rs daemon/src/support_io.rs)
 
 fail() {
   printf 'support-log: %s\n' "$1" >&2
@@ -57,7 +58,7 @@ code_of() {
   grep -v -E '^[[:space:]]*//' "$1" || true
 }
 
-for file in "$MODULE" "$POLICY" "$MAIN" "${CONTENT_MODULES[@]}"; do
+for file in "$MODULE" "$POLICY" "$MAIN" "${CONTENT_MODULES[@]}" "${COLLECTION_MODULES[@]}"; do
   [[ -f "$file" ]] || fail "missing file: $file"
 done
 
@@ -255,7 +256,7 @@ for site in policy["path_sites"]:
     reviewed_paths[key] = site["source"]
 found_paths = {}
 for path in sorted(Path("daemon/src").rglob("*.rs")):
-    if path.name in {"support_log_tests.rs", "update_tests.rs"}:
+    if path.name in {"support_log_tests.rs", "support_tests.rs", "support_store_tests.rs", "update_tests.rs"}:
         continue  # Both are included only by #[cfg(test)] modules.
     text = path.read_text()
     for line, statement, fields in inventory(text):
@@ -284,6 +285,7 @@ for gate in [
     'self.meta.file().map(Path::new) == Some(Path::new(&site.file))', 'Some(site.line) == self.meta.line()',
     'if self.text_allowed(field.name())', 'self.checked_text(field.name(), &format())',
     'rule.kind == "scalar"', '_ => false',
+    '"choice" => rule.values.iter().any(|v| v == raw)',
 ]:
     require(gate in collector, "missing construction gate: " + gate)
 visitor = collector.split("impl Visit for Collector<'_> {", 1)[1]
@@ -293,6 +295,76 @@ require('self.push_text(field,||{' in compact, "str bypasses admission")
 require(compact.count('self.push_scalar(field,||') == 6, "all scalar types must use admission")
 require(compact.count('self.fields.push(') == 1 and 'FieldValue::Str(WITHHELD.to_owned())' in compact, "bytes must be withheld")
 require('msg: &msg' in source and 'fields: is_spawnd(target).then_some(FieldsOut(&fields))' in source, "foreign record shape changed")
+# Pin the production event emission and only its empty message argument. An
+# extra event visitation or render call is a new path requiring review.
+require(layer.count("event.record(") == 1, "additional event visitation path")
+require(layer.count("render_line(") == 1, "additional event rendering path")
+require('"",\n                collector.fields,' in layer, "event messages must remain empty")
+
+# Collection is deliberately split: consent/receipts have local storage, but
+# the uploader may not open any file or choose an arbitrary byte source.
+upload = Path("daemon/src/support.rs").read_text()
+upload_compact = re.sub(r"\s+", "", upload)
+storage = Path("daemon/src/support_store.rs").read_text()
+consent = Path("daemon/src/support_consent.rs").read_text()
+io_worker = Path("daemon/src/support_io.rs").read_text()
+for module in (upload, storage, consent, io_worker):
+    code = "\n".join(line for line in module.splitlines() if not line.lstrip().startswith("//"))
+    for marker in ("read_dir", ".entries(", "glob(", "glob::", "walkdir", "WalkDir", "read_link",
+                   "scrollback", "REPLAY_DUMP", ".replay", "spawnd.log", "err.log", "journal"):
+        require(marker not in code, "forbidden collection source: " + marker)
+for marker in ("std::fs", "tokio::fs", "File::", "OpenOptions", "include_bytes!", "include_str!",
+               "Command::new", "read_to_end", "read_to_string", "crate::host_files", "crate::host_control",
+               "crate::upload", "crate::worker_backend", "crate::sessions", "crate::pty"):
+    require(marker not in upload, "uploader must not open or produce another byte source: " + marker)
+require(upload_compact.count("request.send()") == 1 and upload.count("client.post(") == 1,
+        "exactly one HTTP upload call site")
+require(upload_compact.count(".body(") == 1 and
+        ".body(body)" in upload_compact,
+        "only the reader NDJSON may be a raw body")
+require(upload_compact.count(".json(") == 1 and
+        ".json(&reason)" in upload_compact,
+        "only the typed refusal enum may be JSON")
+require(upload.count("let support_log::UploadBundle { header, body } = prepared;") == 1,
+        "NDJSON bytes must come from the support reader")
+require(not re.search(r"\blet\s+(?:mut\s+)?body\b", upload), "body shadowing requires review")
+require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra byte-returning helper")
+# Hash reviewed token markers, not whitespace or line numbers. These pin the
+# refusal representation and every function carrying upload bytes;
+# they are a regression guard, NOT a data-flow or security proof.
+import hashlib
+UPLOAD_MARKERS = [('#[serde(tag = "declined", rename_all = "snake_case")]', 'pub(crate) struct Trust {', '851d0947e59bb94da22450470376692fcae746c02fb7df3e6ffa26baec323296'), ('fn prepare(', 'fn endpoint(', 'a00b4d7b12bf5e35d0e0a39fcc142614f4821c6b7cdc96387d063e4d9fb11555'), ('async fn collect(', '#[path = "support_tests.rs"]', 'f5b389e55f2043f6a35bb17cff87c5b7075a204b2c41f7255c65b36ff3174a73')]
+for start, end, digest in UPLOAD_MARKERS:
+    require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
+    region = upload.split(start, 1)[1].split(end, 1)[0]
+    marked = " ".join(value for value, _, _ in tokens(region))
+    require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review upload marker: " + start)
+BODY_MARKERS = [('fn read_window(', 'pub(crate) const MAX_BODY_BYTES:', 'f551404eba6ad4d79e9fe8d26c65e7b6282ba9ddd436652393d0feb0f3ad3bfd'), ('impl Bundle {', 'fn record_time(', '94b3f931a7ec20d2fd04c66d77f46da1f9608bd93e9d11137a8b775c3d6bc858'), ('pub(crate) const MAX_BODY_BYTES:', '/// Tests only: one support log', '9d3a8035f9566d9297ed3a1be7708b2e488aa6588ea1211622976570d7f9151d')]
+for start, end, digest in BODY_MARKERS:
+    require(source.count(start) == 1 and source.count(end) == 1, "unique body source marker")
+    region = source.split(start, 1)[1].split(end, 1)[0]
+    marked = " ".join(value for value, _, _ in tokens(region))
+    require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review body source marker: " + start)
+require(upload.count("support_log::collect_bundle(") == 1, "one support reader per collection")
+require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(work_deadline" in upload_compact,
+        "origin-pinned bounded upload required")
+require("request_id: Uuid" in upload and "crate::config::api_url(&base," in upload, "typed request path required")
+require("spawn_blocking" not in upload and "ctx.io.run_with(" in upload_compact,
+        "snapshot must run on the dedicated support worker")
+require(upload.count("tokio::spawn(") == 1 and "tokio::spawn(serve(" in upload_compact,
+        "only the sequential support actor may be spawned")
+require('.no_proxy()' in upload and '.dns_resolver(' in upload,
+        "collector DNS must use the support worker without environment proxies")
+require('MAX_BODY_BYTES: usize = 900 * 1024;' in source and
+        'application/x-ndjson' in upload, "bounded NDJSON body required")
+for module in (storage, consent, io_worker):
+    require("reqwest" not in module and ".post(" not in module, "storage cannot upload")
+run = Path("daemon/src/run.rs").read_text()
+arm = run.split("Inbound::SupportLogCollect {", 1)[1].split("Inbound::Error", 1)[0]
+require(".await" not in arm and "support.collect(" in arm, "dispatch must only enqueue collection")
+require("crate::run::admitted_device(" in upload and "find_valid_chain(" in run and
+        "if revoked.contains(&verified.sender_public_key().to_bytes())" in run,
+        "support admission must preserve the unchanged connection verifier")
 PY_POLICY
 
 self_test() {
@@ -378,6 +450,67 @@ PY_REPLACE
 
   printf '%s\n' 'warn!(%shell, "unreviewed shell origin");' >>"$fixture/$MODULE"
   expect_failure "an imported shorthand path callsite"
+
+  mutate_module '"choice" => rule.values.iter().any(|v| v == raw)' '"choice" => true'
+  expect_failure "accepting arbitrary choice strings"
+
+  mutate_module '                collector.fields,' '                { event.record(&mut collector); collector.fields },'
+  expect_failure "an extra event visitation path"
+
+  mutate_module '                "",' '                &format!("{:?}", event),'
+  expect_failure "formatting a message into an event"
+
+  local upload_file="$fixture/daemon/src/support.rs"
+  local original_upload
+  original_upload="$(cat "$upload_file")"
+  expect_upload_failure() {
+    if SUPPORT_LOG_GUARD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      fail "self-test: $1 passed"
+    fi
+    printf '%s\n' "$original_upload" >"$upload_file"
+  }
+  for mutation in 'let b = std::fs::read(path);' 'let b = tokio::fs::read(path);' 'let b = File::open(path);' 'let b = include_bytes!("extra");' 'let b = glob("*");' 'let b = dir.entries();' 'let b = "scrollback";' 'let b = "SPAWND_DIAG_REPLAY_DUMP_DIR";' 'let b = "spawnd.log";' 'let b = "err.log";' 'let b = "journal";' 'let b = client.post(url).send().await;'; do
+    printf '%s\n' "$mutation" >>"$upload_file"
+    expect_upload_failure "another collection source or upload: $mutation"
+  done
+  python3 -I - "$upload_file" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+assert '.body(body)' in s
+p.write_text(s.replace('.body(body)', '.body(arbitrary)'))
+PY_MUTATE_UPLOAD
+  expect_upload_failure "a body not supplied by the support reader"
+
+  for mutation in 'request = request.json(&credentials);' 'request = request.body(arbitrary);' 'let body = arbitrary;' 'fn other_bytes() -> Vec<u8> { elsewhere() }'; do
+    printf '%s\n' "$mutation" >>"$upload_file"
+    expect_upload_failure "extra, shadowed or helper body: $mutation"
+  done
+  python3 -I - "$upload_file" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+p.write_text(s.replace('.body(body)', '.body(other_bytes())') + '\nfn other_bytes() -> Vec<u8> { elsewhere() }\n')
+PY_MUTATE_UPLOAD
+  expect_upload_failure "helper sourcing bytes elsewhere"
+
+  mutate_module 'MAX_BODY_BYTES: usize = 900 * 1024;' 'MAX_BODY_BYTES: usize = 1024 * 1024;'
+  expect_failure "an enlarged NDJSON body cap"
+  mutate_module 'self.header.bytes = total;' 'self.header.bytes = 0;'
+  expect_failure "changed NDJSON encoding"
+  mutate_module 'used + text.len() + 1 > max_bytes' 'used > max_bytes'
+  expect_failure "changed NDJSON selection"
+
+  for pair in 'application/x-ndjson application/octet-stream' '.no_proxy() .pool_max_idle_per_host(0)'; do
+    read -r old new <<<"$pair"
+    python3 -I - "$upload_file" "$old" "$new" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+p.write_text(s.replace(sys.argv[2], sys.argv[3]))
+PY_MUTATE_UPLOAD
+    expect_upload_failure "changed body or resolver contract: $old"
+  done
 
   local original_policy
   original_policy="$(cat "$fixture/$POLICY")"

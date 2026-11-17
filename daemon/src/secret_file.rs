@@ -389,6 +389,19 @@ impl SecretFile {
         }
     }
 
+    /// Nonblocking owner-only lock for bounded background work. The returned
+    /// handle owns the lock until dropped, including across async deadlines.
+    pub fn try_lock_file(&self, path: &Path) -> Result<std::fs::File> {
+        let file = self.open_lock(path)?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "secret file lock busy")
+            }
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(file)
+    }
+
     #[cfg(unix)]
     fn open_lock(&self, path: &Path) -> Result<std::fs::File> {
         use rustix::fs::{Mode, OFlags};

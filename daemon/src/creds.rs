@@ -1588,28 +1588,40 @@ pub async fn logout() -> Result<()> {
 /// Clear both credential backends without presentation output. Recovery
 /// commands use this before removing the rest of the instance directory.
 pub(crate) fn reset_local_credentials() -> Result<ClearOutcome> {
-    with_credential_lock(|| {
-        let path = config::credentials_path()?;
-        cleanup_stale_credential_temps(&path)?;
-        clear_stored_credentials(
-            Ok(path),
-            keyring_delete,
-            |path| std::fs::remove_file(path),
-            sync_parent_directory,
-        )
-    })
+    let support_cleanup = crate::support_store::credential_cleanup();
+    crate::support_store::cleanup_after(
+        || {
+            with_credential_lock(|| {
+                let path = config::credentials_path()?;
+                cleanup_stale_credential_temps(&path)?;
+                clear_stored_credentials(
+                    Ok(path),
+                    keyring_delete,
+                    |path| std::fs::remove_file(path),
+                    sync_parent_directory,
+                )
+            })
+        },
+        support_cleanup,
+    )
 }
 
 /// Remove only the daemon token while retaining the host identity, server,
 /// Host ID, and browser pins for a one-approval re-attachment.
 pub fn logout_keep_identity() -> Result<()> {
-    let mut stored = load().context("loading credentials to sign out")?;
-    let expected = credential_revision(&stored)?;
-    if let Some(token) = stored.access_token.as_mut() {
-        token.zeroize();
-    }
-    stored.access_token = None;
-    save(&mut stored, &expected).context("persisting signed-out host identity")
+    let support_cleanup = crate::support_store::credential_cleanup();
+    crate::support_store::cleanup_after(
+        || {
+            let mut stored = load().context("loading credentials to sign out")?;
+            let expected = credential_revision(&stored)?;
+            if let Some(token) = stored.access_token.as_mut() {
+                token.zeroize();
+            }
+            stored.access_token = None;
+            save(&mut stored, &expected).context("persisting signed-out host identity")
+        },
+        support_cleanup,
+    )
 }
 
 pub(crate) struct ClearOutcome {
