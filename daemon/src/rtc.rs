@@ -553,7 +553,7 @@ fn reap_finished(tasks: &mut tokio::task::JoinSet<()>) {
     while let Some(finished) = tasks.try_join_next() {
         if let Err(error) = finished {
             if error.is_panic() {
-                tracing::error!(%error, "an rtc cleanup task panicked; its peer may not have settled");
+                tracing::error!(payload_error = %error, "an rtc cleanup task panicked; its peer may not have settled");
             }
         }
     }
@@ -1273,7 +1273,7 @@ impl RtcSessions {
             tracing::debug!(
                 session_id = %bound.signaling.session_id,
                 signal_id = %bound.signaling.signal_id,
-                error = %e,
+                sdp_error = %e,
                 "rtc offer failure detail"
             );
             send_status(
@@ -1573,7 +1573,7 @@ impl RtcSessions {
             .await
         {
             tracing::warn!(signal_id = %signal.signal_id, class = "negotiation", "host rtc offer failed");
-            tracing::debug!(signal_id = %signal.signal_id, %error, "host rtc offer failure detail");
+            tracing::debug!(signal_id = %signal.signal_id, sdp_error = %error, "host rtc offer failure detail");
             send_host_status(&out_tx, signal.signal_id, &binding, "failed").await;
         }
     }
@@ -2158,7 +2158,7 @@ impl RtcSessions {
         if let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(candidate) {
             let candidate = resolve_mdns_candidate(candidate).await;
             if let Err(error) = peer.pc.add_ice_candidate(candidate).await {
-                tracing::debug!(signal_id = %signal.signal_id, %error, "adding host rtc candidate failed");
+                tracing::debug!(signal_id = %signal.signal_id, candidate_error = %error, "adding host rtc candidate failed");
             }
         }
     }
@@ -2526,11 +2526,11 @@ impl RtcSessions {
             Ok(candidate) => {
                 let candidate = resolve_mdns_candidate(candidate).await;
                 if let Err(e) = pc.add_ice_candidate(candidate).await {
-                    tracing::debug!(%signal_id, error = %e, "adding rtc candidate failed");
+                    tracing::debug!(%signal_id, candidate_error = %e, "adding rtc candidate failed");
                 }
             }
             Err(e) => {
-                tracing::debug!(%signal_id, error = %e, "decoding rtc candidate failed");
+                tracing::debug!(%signal_id, candidate_error = %e, "decoding rtc candidate failed");
             }
         }
     }
@@ -3209,7 +3209,7 @@ async fn wait_for_data_channel_capacity(
                 if waited.is_multiple_of(5) {
                     let buffered = dc.buffered_amount().await;
                     tracing::debug!(
-                        label = dc.label(),
+                        channel_kind = channel_kind(dc.label()),
                         buffered,
                         waited_secs = waited,
                         "data channel has not drained below the pacing threshold"
@@ -3241,6 +3241,15 @@ where
             return true;
         }
         wait_for_low().await;
+    }
+}
+
+fn channel_kind(label: &str) -> &'static str {
+    match label.split('/').next().unwrap_or("") {
+        CONTROL_DATA_CHANNEL_LABEL => "control",
+        PTY_DATA_CHANNEL_LABEL => "pty",
+        "spawn.host.ctl" => "host_control",
+        _ => "unknown",
     }
 }
 
@@ -3282,7 +3291,7 @@ fn install_ice_handler(
                 Some(candidate) => match candidate.to_json() {
                     Ok(candidate) => candidate,
                     Err(e) => {
-                        tracing::debug!(session_id = %binding.session_id, error = %e, "encoding rtc candidate failed");
+                        tracing::debug!(session_id = %binding.session_id, candidate_error = %e, "encoding rtc candidate failed");
                         return;
                     }
                 },
@@ -3308,7 +3317,7 @@ fn install_ice_handler(
                     .await;
                 }
                 Err(e) => {
-                    tracing::debug!(session_id = %binding.session_id, error = %e, "serializing rtc candidate failed");
+                    tracing::debug!(session_id = %binding.session_id, candidate_error = %e, "serializing rtc candidate failed");
                 }
             }
         })
@@ -3410,7 +3419,7 @@ fn session_data_channel_handler(
         Box::pin(async move {
             let viewer_id = viewer_id(&binding.signaling.signal_id, &binding.signaling.generation);
             if !reliable {
-                tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unreliable rtc data channel");
+                tracing::warn!(session_id = %binding.signaling.session_id, channel_kind = channel_kind(dc.label()), "rejecting unreliable rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
                     &binding.signaling.signal_id,
@@ -3448,7 +3457,7 @@ fn session_data_channel_handler(
                 return;
             }
             if label != PTY_DATA_CHANNEL_LABEL {
-                tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unknown rtc data channel");
+                tracing::warn!(session_id = %binding.signaling.session_id, channel_kind = "unknown", "rejecting unknown rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
                     &binding.signaling.signal_id,
@@ -4827,7 +4836,7 @@ async fn send_session_replay(
         session_id = %session.session_id(),
         viewer_id = spec.viewer_id,
         operation = spec.operation,
-        replay_bytes = replay.bytes().len(),
+        replay_size = replay.bytes().len(),
         utf8_error = ?std::str::from_utf8(replay.bytes()).err(),
         pty_offset,
         watermark = source_boundary,
@@ -5156,11 +5165,11 @@ async fn resolve_mdns_candidate(init: RTCIceCandidateInit) -> RTCIceCandidateIni
     let addresses = match lookup {
         Ok(Ok(addresses)) => addresses,
         Ok(Err(error)) => {
-            tracing::debug!(%name, %error, "resolving an mDNS ICE candidate failed");
+            tracing::debug!(candidate_name = %name, candidate_error = %error, "resolving an mDNS ICE candidate failed");
             return init;
         }
         Err(_) => {
-            tracing::debug!(%name, "resolving an mDNS ICE candidate timed out");
+            tracing::debug!(candidate_name = %name, "resolving an mDNS ICE candidate timed out");
             return init;
         }
     };
@@ -5178,13 +5187,13 @@ async fn resolve_mdns_candidate(init: RTCIceCandidateInit) -> RTCIceCandidateIni
         }
     }
     let Some(address) = chosen.or(fallback) else {
-        tracing::debug!(%name, "an mDNS ICE candidate resolved to no address");
+        tracing::debug!(candidate_name = %name, "an mDNS ICE candidate resolved to no address");
         return init;
     };
     let Some(candidate) = rewrite_candidate_host(&init.candidate, address) else {
         return init;
     };
-    tracing::debug!(%name, "resolved an mDNS ICE candidate");
+    tracing::debug!(candidate_name = %name, "resolved an mDNS ICE candidate");
     RTCIceCandidateInit { candidate, ..init }
 }
 
@@ -9979,7 +9988,7 @@ mod tests {
         let capture = crate::support_log::capture::global();
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
-        let canary = format!("CANARY-{}", Uuid::new_v4());
+        let canary = crate::support_log::capture::canary();
         for decoy in ["support.jsonl.2", "support.log", "seg-00000001.log"] {
             std::fs::write(
                 capture.log.dir().join(decoy),

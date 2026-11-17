@@ -239,7 +239,7 @@ impl RtcSessions {
             )
             .await
         {
-            tracing::debug!(%error, "device connection admission failed");
+            tracing::debug!(sdp_error = %error, "device connection admission failed");
             send_host_status(&out_tx, signal.signal_id, &binding, "failed").await;
         }
     }

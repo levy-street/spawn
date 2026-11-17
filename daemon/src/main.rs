@@ -122,18 +122,20 @@ async fn main() -> anyhow::Result<()> {
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
-            login::run(cli.server.clone(), args).await?;
-            if no_run {
-                return Ok(());
+            match login::run(cli.server.clone(), args).await {
+                Err(error) => Err(error),
+                Ok(_) if no_run => Ok(()),
+                Ok(_) => {
+                    tracing::info!("login complete; transitioning to run");
+                    run::run(
+                        cli.server.clone(),
+                        cli::RunArgs {
+                            background_service: false,
+                        },
+                    )
+                    .await
+                }
             }
-            tracing::info!("login complete; transitioning to run");
-            run::run(
-                cli.server.clone(),
-                cli::RunArgs {
-                    background_service: false,
-                },
-            )
-            .await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
         Command::BuildInfo => {
@@ -164,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => tracing::error!(
                 role,
                 pid = std::process::id(),
-                error = %format_args!("{error:#}"),
+                payload_error = %format_args!("{error:#}"),
                 "SPAWN D background process failed"
             ),
         }

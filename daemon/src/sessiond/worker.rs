@@ -674,7 +674,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             let _ = wire::write_json_frame(
                                 w,
                                 wire::T_ERROR,
-                                &wire::WorkerError { message: format!("{e:#}") },
+                                &wire::WorkerError { message: frame_error_message(frame_type, &e) },
                             ).await;
                         }
                     }
@@ -1026,6 +1026,45 @@ async fn handle_frame(
             Ok(LoopAction::Continue)
         }
     }
+}
+
+// Only replay errors are filesystem/position diagnostics. Start and shutdown
+// errors can quote parsed JSON or portable-pty's complete Windows command line.
+// Older supervisors log WorkerError.message verbatim, so keep it safe at source.
+fn frame_error_message(frame_type: u8, error: &anyhow::Error) -> String {
+    if frame_type == wire::T_REPLAY_REQ {
+        return format!("{error:#}");
+    }
+    let code = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+    });
+    match code {
+        Some(code) => format!("worker frame rejected (OS error {code})"),
+        None => "worker frame rejected".to_string(),
+    }
+}
+
+#[test]
+fn forwarded_worker_errors_never_quote_commands_or_json_values() {
+    let error = anyhow::anyhow!("CreateProcessW private command arguments");
+    for frame_type in [wire::T_START, wire::T_SHUTDOWN] {
+        assert_eq!(
+            frame_error_message(frame_type, &error),
+            "worker frame rejected"
+        );
+    }
+    let error = anyhow::Error::from(std::io::Error::from_raw_os_error(2));
+    assert_eq!(
+        frame_error_message(wire::T_START, &error),
+        "worker frame rejected (OS error 2)"
+    );
+    let error = anyhow::anyhow!("missing history file");
+    assert_eq!(
+        frame_error_message(wire::T_REPLAY_REQ, &error),
+        "missing history file"
+    );
 }
 
 fn state_name(state: &State) -> &'static str {

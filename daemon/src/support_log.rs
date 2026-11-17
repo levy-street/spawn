@@ -12,27 +12,17 @@
 //!   again on every event in case it is ever composed without it.
 //! - **Events only.** Spans are refused by the filter and the layer records no
 //!   span fields, so nothing reaches this file through a span.
-//! - **Field rules.** A string or `Debug`/`Display` value of a field whose
-//!   name, or one `_`/`.`-separated part of it, is in [`WITHHELD_FIELDS`] is
-//!   written as `<withheld>` without being formatted. Numbers and booleans
-//!   pass. A byte slice is always withheld.
-//! - **A sanitiser** ([`sanitize`]) on every other string, the message
-//!   included: ANSI sequences and control characters are stripped, bearer
-//!   tokens, JWT-shaped strings, long mixed-case base64 runs, secret-looking
-//!   `KEY=VALUE` pairs, URL userinfo, query strings and fragments, and a
-//!   panic message carried by a task's join error are redacted, each value is
-//!   capped at 512 characters and each event at 2 KiB.
+//! - **Field rules.** Withheld names apply to every value type without
+//!   formatting; byte slices are always withheld. Other strings are bounded
+//!   before scanning and heuristically sanitised. This does not recognise
+//!   arbitrary terminal content or short secrets: fix their source statements.
 //!
-//! One JSON object per line, `{t, level, target, at, msg, fields}`, in
-//! `support/support.jsonl` under the instance log directory, rotated to
-//! `support.jsonl.1` at 4 MiB: at most 8 MiB per instance, for ever. A
-//! dedicated writer thread owns the files and is fed by a bounded channel;
-//! when the channel is full an event is dropped and counted, never waited
-//! for, so no async task and no dispatch loop ever waits on this disk.
-//! Every append and every rotation happens under a cross-process lock
-//! (`support.lock`), so the two processes of one instance that overlap during
-//! a self-update write whole lines and rotate once. Each file is opened by its
-//! exact name, through the verified private directory, never following a link.
+//! One JSON object per line in `support/support-v2.jsonl`, rotated to
+//! `support-v2.jsonl.1` at 4 MiB. Legacy unversioned files are discarded at
+//! startup and never read. The two named files are bounded, though open readers
+//! may retain replaced files. A bounded queue feeds a dedicated writer, with a
+//! cross-process lock for append/rotation. Directory guarantees and ancestor
+//! trust are described by `platform::open_support_dir` and daemon/CLAUDE.md.
 //!
 //! [`read_window`] is the only reader. It opens exactly the two file names and
 //! never lists the folder, so nothing else that ever lands beside them — a
@@ -41,13 +31,15 @@
 //! Anything that could carry terminal content, file content, a command line
 //! or a credential must be logged under a withheld field name, or not logged.
 
+use std::cell::Cell;
 use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -64,9 +56,9 @@ use tracing_subscriber::layer::{Context, Filter, Layer};
 /// The folder under the instance log directory that holds the support log.
 pub(crate) const DIR_NAME: &str = "support";
 /// The file being written.
-pub(crate) const CURRENT: &str = "support.jsonl";
+pub(crate) const CURRENT: &str = "support-v2.jsonl";
 /// The file before it. Rotation replaces it; there is never a third.
-pub(crate) const PREVIOUS: &str = "support.jsonl.1";
+pub(crate) const PREVIOUS: &str = "support-v2.jsonl.1";
 /// Held for every append, rotation and read, across processes.
 const LOCK: &str = "support.lock";
 
@@ -78,6 +70,7 @@ const MAX_VALUE_CHARS: usize = 512;
 const MAX_RAW_VALUE_BYTES: usize = 4 * MAX_VALUE_CHARS;
 /// One event's JSON line, newline excluded.
 const MAX_EVENT_BYTES: usize = 2048;
+const MAX_FIELDS: usize = 16;
 /// Events waiting for the writer. Beyond this they are dropped and counted.
 const CHANNEL_CAPACITY: usize = 1024;
 /// One append writes at most about this much.
@@ -91,7 +84,7 @@ const REDACTED: &str = "<redacted>";
 const DROPPED_TARGET: &str = "spawnd::support_log";
 const DROPPED_MESSAGE: &str = "support log events dropped";
 
-/// Field names whose string and `Debug` values are never written. A field
+/// Field names whose values of every type are withheld. A field
 /// matches when its whole name, or one `_`- or `.`-separated part of it
 /// (plural `s` ignored), is listed: `offer_sdp`, `refresh_token`,
 /// `skills` and `stdin_error` are all withheld.
@@ -180,16 +173,58 @@ pub(crate) struct SupportLog {
 
 struct Inner {
     tx: SyncSender<Message>,
-    dropped: AtomicU64,
+    dropped: Arc<AtomicU64>,
+    slots: Arc<AtomicUsize>,
     /// Tests only: wait for room instead of dropping, so a canary test sees
     /// every event the filter let through.
     block_when_full: bool,
     dir: PathBuf,
+    #[cfg(test)]
+    stopped: std::sync::Mutex<Option<Receiver<()>>>,
+}
+
+static EXIT_LOG: OnceLock<Weak<Inner>> = OnceLock::new();
+
+/// exec/process::exit bypass Rust drops and main's normal return path.
+pub(crate) fn flush_before_exit() {
+    if let Some(inner) = EXIT_LOG.get().and_then(Weak::upgrade) {
+        SupportLog { inner }.flush(Duration::from_millis(500));
+    }
 }
 
 enum Message {
-    Line(Vec<u8>),
-    Flush(SyncSender<()>),
+    Line(Vec<u8>, Permit),
+    Flush(SyncSender<bool>),
+}
+
+// Reservation happens before formatting, so saturation costs no field visits.
+struct Permit(Option<Arc<AtomicUsize>>);
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if let Some(slots) = &self.0 {
+            slots.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+thread_local! { static IN_SUPPORT: Cell<bool> = const { Cell::new(false) }; }
+
+/// A field formatter can panic. Contain its unwind, including a panic payload
+/// whose destructor itself panics. The panic hook skips support recording while
+/// inside this boundary (a hook panicking during unwinding would abort).
+fn contain(dropped: &AtomicU64, action: impl FnOnce()) {
+    IN_SUPPORT.with(|active| {
+        if active.replace(true) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let result = catch_unwind(AssertUnwindSafe(action));
+        active.set(false);
+        if let Err(payload) = result {
+            std::mem::forget(payload);
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 /// `<instance log dir>/support`. Nothing is created.
@@ -219,10 +254,6 @@ impl SupportLog {
     /// Open (creating it owner-only when missing) this instance's support
     /// folder and start its writer thread.
     pub(crate) fn open_for_instance(config_dir: &Path) -> Result<Self> {
-        // On Windows the log directory is created and protected the way the
-        // daemon's own log is; the support folder below it is owner-only.
-        #[cfg(windows)]
-        crate::service::instance_log_dir(config_dir)?;
         Self::open(&support_dir(config_dir)?)
     }
 
@@ -233,16 +264,25 @@ impl SupportLog {
     fn open_with(dir: &Path, capacity: usize, block_when_full: bool) -> Result<Self> {
         let store = Store::open(dir)?;
         let (tx, rx) = mpsc::sync_channel(capacity);
+        #[cfg(test)]
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
         let inner = Arc::new(Inner {
             tx,
-            dropped: AtomicU64::new(0),
+            dropped: Arc::new(AtomicU64::new(0)),
+            slots: Arc::new(AtomicUsize::new(capacity)),
             block_when_full,
             dir: dir.to_path_buf(),
+            #[cfg(test)]
+            stopped: std::sync::Mutex::new(Some(stopped_rx)),
         });
-        let writer_inner = Arc::clone(&inner);
+        let dropped = Arc::clone(&inner.dropped);
         std::thread::Builder::new()
             .name(WRITER_THREAD.into())
-            .spawn(move || write_loop(rx, store, &writer_inner.dropped))
+            .spawn(move || {
+                write_loop(rx, store, &dropped);
+                #[cfg(test)]
+                let _ = stopped_tx.send(());
+            })
             .context("starting the support log writer")?;
         Ok(Self { inner })
     }
@@ -260,17 +300,39 @@ impl SupportLog {
         &self.inner.dir
     }
 
-    /// Events dropped since this process started because the writer was
-    /// behind or the disk refused them.
+    /// Events dropped since startup: queue saturation, disk failure, or a
+    /// panic/reentrant call inside the support layer.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }
 
+    fn reserve(&self) -> Option<Permit> {
+        // Blocking capture is test-only; it deliberately sees every event.
+        if self.inner.block_when_full {
+            return Some(Permit(None));
+        }
+        match self
+            .inner
+            .slots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        {
+            Ok(_) => Some(Permit(Some(Arc::clone(&self.inner.slots)))),
+            Err(_) => {
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     fn push(&self, line: Vec<u8>) {
-        let message = Message::Line(line);
-        // Waiting for room is for tests only, and never on the writer
-        // thread, which is the only thing that makes room.
+        if let Some(permit) = self.reserve() {
+            self.push_reserved(line, permit);
+        }
+    }
+
+    fn push_reserved(&self, line: Vec<u8>, permit: Permit) {
+        let message = Message::Line(line, permit);
         let sent =
             if self.inner.block_when_full && std::thread::current().name() != Some(WRITER_THREAD) {
                 self.inner.tx.send(message).is_ok()
@@ -287,6 +349,8 @@ impl SupportLog {
 
     /// Wait up to `wait` for everything queued so far to be written. Never
     /// waits for room in the channel: a full channel answers `false` at once.
+    /// Also false if any append failed since the preceding flush; this does
+    /// not fsync, and is not a durable snapshot for a collector.
     pub(crate) fn flush(&self, wait: Duration) -> bool {
         if std::thread::current().name() == Some(WRITER_THREAD) {
             return false;
@@ -295,7 +359,7 @@ impl SupportLog {
         if self.inner.tx.try_send(Message::Flush(ack_tx)).is_err() {
             return false;
         }
-        ack_rx.recv_timeout(wait).is_ok()
+        ack_rx.recv_timeout(wait).unwrap_or(false)
     }
 
     /// Record that a thread panicked: where, and the thread's name. Never the
@@ -324,10 +388,15 @@ impl SupportLog {
     /// Chain a panic hook that records each panic's location and thread
     /// name here, then runs the hook it replaced, so stderr is unchanged.
     pub(crate) fn install_panic_hook(&self) {
+        let _ = EXIT_LOG.set(Arc::downgrade(&self.inner));
         let log = self.clone();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            log.record_panic(info.location(), std::thread::current().name());
+            if !IN_SUPPORT.with(Cell::get) {
+                contain(&log.inner.dropped, || {
+                    log.record_panic(info.location(), std::thread::current().name())
+                });
+            }
             previous(info);
         }));
     }
@@ -344,29 +413,34 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _cx: Context<'_, S>) {
-        // A `log` record arrives on tracing-log's per-level callsite; its own
-        // target, file and line are in the normalized metadata.
-        let normalized = event.normalized_metadata();
-        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
-        if !admits(meta.target(), meta.level()) {
-            return;
-        }
-        let mut collector = Collector::default();
-        event.record(&mut collector);
-        let at = match (meta.file(), meta.line()) {
-            (Some(file), Some(line)) => format!("{file}:{line}"),
-            (Some(file), None) => file.to_string(),
-            _ => String::new(),
-        };
-        let line = render_line(
-            &now_rfc3339_millis(),
-            meta.level().as_str(),
-            &sanitize(meta.target()),
-            &sanitize(&at),
-            collector.message.as_deref().unwrap_or(""),
-            collector.fields,
-        );
-        self.log.push(line);
+        contain(&self.log.inner.dropped, || {
+            // A `log` record arrives on tracing-log's per-level callsite; its own
+            // target, file and line are in the normalized metadata.
+            let normalized = event.normalized_metadata();
+            let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+            if !admits(meta.target(), meta.level()) {
+                return;
+            }
+            let Some(permit) = self.log.reserve() else {
+                return;
+            };
+            let mut collector = Collector::default();
+            event.record(&mut collector);
+            let at = match (meta.file(), meta.line()) {
+                (Some(file), Some(line)) => format!("{}:{line}", sanitize(file)),
+                (Some(file), None) => sanitize(file),
+                _ => String::new(),
+            };
+            let line = render_line(
+                &now_rfc3339_millis(),
+                meta.level().as_str(),
+                &sanitize(meta.target()),
+                &sanitize(&at),
+                collector.message.as_deref().unwrap_or(""),
+                collector.fields,
+            );
+            self.log.push_reserved(line, permit);
+        });
     }
 }
 
@@ -390,7 +464,7 @@ impl Collector {
     fn keep(&self, field: &Field) -> bool {
         // tracing-log's bookkeeping fields; the layer reads them through the
         // normalized metadata instead.
-        !field.name().starts_with("log.")
+        self.fields.len() < MAX_FIELDS && !field.name().starts_with("log.")
     }
 
     fn push_text(&mut self, field: &Field, format: impl FnOnce() -> String) {
@@ -400,7 +474,7 @@ impl Collector {
         let value = if is_withheld(field.name()) {
             WITHHELD.to_string()
         } else {
-            sanitize(&format())
+            format()
         };
         self.fields.push((field.name(), FieldValue::Str(value)));
     }
@@ -412,7 +486,7 @@ impl Visit for Collector {
             self.message = Some(sanitize(&bounded_format(value)));
             return;
         }
-        self.push_text(field, || bounded_format(value));
+        self.push_text(field, || sanitize(&bounded_format(value)));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -420,7 +494,7 @@ impl Visit for Collector {
             self.message = Some(sanitize(value));
             return;
         }
-        self.push_text(field, || value.to_string());
+        self.push_text(field, || sanitize(value));
     }
 
     fn record_bytes(&mut self, field: &Field, _value: &[u8]) {
@@ -431,19 +505,25 @@ impl Visit for Collector {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             self.fields.push((field.name(), FieldValue::I64(value)));
         }
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             self.fields.push((field.name(), FieldValue::U64(value)));
         }
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             let value = i64::try_from(value)
                 .map(FieldValue::I64)
                 .unwrap_or_else(|_| FieldValue::Str(value.to_string()));
@@ -452,7 +532,9 @@ impl Visit for Collector {
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             let value = u64::try_from(value)
                 .map(FieldValue::U64)
                 .unwrap_or_else(|_| FieldValue::Str(value.to_string()));
@@ -461,13 +543,17 @@ impl Visit for Collector {
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             self.fields.push((field.name(), FieldValue::F64(value)));
         }
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if self.keep(field) {
+        if is_withheld(field.name()) {
+            self.push_text(field, || unreachable!());
+        } else if self.keep(field) {
             self.fields.push((field.name(), FieldValue::Bool(value)));
         }
     }
@@ -486,8 +572,8 @@ pub(crate) fn is_withheld(name: &str) -> bool {
 }
 
 /// Format a `Debug` (or `Display`, which tracing passes as `Debug`) value,
-/// stopping once it passes [`MAX_RAW_VALUE_BYTES`]: a huge value costs no
-/// more than that. A value cut short loses its unfinished last word, which
+/// stopping output once it passes [`MAX_RAW_VALUE_BYTES`]. This bounds our
+/// buffer, not computation or allocation inside an arbitrary Debug impl. A value cut short loses its unfinished last word, which
 /// could be the front half of a token too short, cut, to be recognised.
 fn bounded_format(value: &dyn fmt::Debug) -> String {
     struct Bounded {
@@ -526,9 +612,29 @@ fn bounded_format(value: &dyn fmt::Debug) -> String {
 /// Everything a string goes through before it is written: control
 /// characters out, secrets redacted, length capped.
 pub(crate) fn sanitize(raw: &str) -> String {
+    let (raw, truncated) = bounded_input(raw);
     let stripped = strip_controls(raw);
     let redacted = redact(&stripped);
-    cap_chars(redacted, MAX_VALUE_CHARS)
+    let mut result = cap_chars(redacted, MAX_VALUE_CHARS);
+    if truncated && result.chars().count() < MAX_VALUE_CHARS {
+        result.push('…');
+    }
+    result
+}
+
+// Inspect at most the cap, even for huge &str fields. Discard the incomplete
+// trailing token before redaction: a truncated token must not become admissible.
+fn bounded_input(raw: &str) -> (&str, bool) {
+    if raw.len() <= MAX_RAW_VALUE_BYTES {
+        return (raw, false);
+    }
+    let mut end = MAX_RAW_VALUE_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &raw[..end];
+    let end = prefix.rfind(char::is_whitespace).unwrap_or(0);
+    (&prefix[..end], true)
 }
 
 fn cap_chars(text: String, max: usize) -> String {
@@ -680,11 +786,12 @@ fn redact(text: &str) -> String {
 /// A task's `JoinError` renders as "task 7 panicked with message \"…\"",
 /// and that message is the panic payload.
 fn redact_after_panic(text: &str) -> String {
-    const MARKER: &str = "panicked with message";
-    match text.find(MARKER) {
-        Some(index) => format!("{} {WITHHELD}", &text[..index + MARKER.len()]),
-        None => text.to_string(),
+    for marker in ["panicked with message", "JoinError::Panic("] {
+        if let Some(index) = text.find(marker) {
+            return format!("{} {WITHHELD}", &text[..index + marker.len()]);
+        }
     }
+    text.to_string()
 }
 
 fn redact_urls(text: &str) -> String {
@@ -696,7 +803,11 @@ fn redact_urls(text: &str) -> String {
     while let Some(index) = rest.find("://") {
         let (head, tail) = rest.split_at(index + 3);
         out.push_str(head);
-        let end = tail.find(ends_value).unwrap_or(tail.len());
+        // URL sub-delimiters (& , ; ' etc.) are legal in userinfo/query.
+        // Only whitespace and unambiguous enclosing delimiters end this URL.
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '`'))
+            .unwrap_or(tail.len());
         let (url, after) = tail.split_at(end);
         let authority_end = url.find(['/', '?', '#']).unwrap_or(url.len());
         let (authority, path) = url.split_at(authority_end);
@@ -735,12 +846,16 @@ fn redact_bearer(text: &str) -> String {
             .find(|c: char| !(c == ' ' || c == ':' || c == '='))
             .map(|offset| word_end + offset)
             .unwrap_or(text.len());
+        out.push_str(&text[cursor..word_end]);
+        if gap == word_end {
+            cursor = word_end;
+            continue;
+        }
         let token_end = text[gap..]
             .find(ends_value)
             .map(|offset| gap + offset)
             .unwrap_or(text.len());
-        out.push_str(&text[cursor..word_end]);
-        if gap > word_end && token_end > gap {
+        if token_end > gap {
             out.push(' ');
             out.push_str(REDACTED);
             cursor = token_end;
@@ -977,13 +1092,29 @@ struct Store {
 
 impl Store {
     fn open(path: &Path) -> Result<Self> {
-        crate::platform::create_private_dir_all(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        let dir = crate::platform::open_private_dir(path)
+        let dir = crate::platform::open_support_dir(path, true)
             .with_context(|| format!("opening {}", path.display()))?;
         let lock = open_or_create(&dir, LOCK)
             .with_context(|| format!("opening {}", path.join(LOCK).display()))?;
-        Ok(Self { dir, lock })
+        let store = Self { dir, lock };
+        store.lock.lock()?;
+        let result = store.discard_legacy();
+        let unlocked = store.lock.unlock();
+        result.and(unlocked)?;
+        Ok(store)
+    }
+
+    fn discard_legacy(&self) -> io::Result<()> {
+        // Versioned names also isolate an older process still running during
+        // an update. It cannot append unsafe history to the new pair.
+        for name in ["support.jsonl", "support.jsonl.1"] {
+            match self.dir.remove_file(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Append whole lines, rotating first when they would take the current
@@ -997,6 +1128,7 @@ impl Store {
 
     fn append_locked(&self, bytes: &[u8]) -> io::Result<()> {
         let mut file = open_or_create(&self.dir, CURRENT)?;
+        repair_tail(&mut file)?;
         let len = file.metadata()?.len();
         if len > 0 && len + bytes.len() as u64 > MAX_FILE_BYTES {
             drop(file);
@@ -1007,9 +1139,42 @@ impl Store {
         }
         // Every writer appends under the lock, so the end found here is the
         // end this write lands at.
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(bytes)
+        append_transaction(&mut file, bytes, |file, bytes| file.write_all(bytes))
     }
+}
+
+// Repair an interrupted append under the same cross-process lock. Every
+// admitted line is bounded, so finding its last newline costs at most one line.
+fn repair_tail(file: &mut File) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub((MAX_EVENT_BYTES + 1) as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    file.take((MAX_EVENT_BYTES + 1) as u64)
+        .read_to_end(&mut tail)?;
+    if tail.last().is_some_and(|b| *b != b'\n') {
+        let keep = tail
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| start + i as u64 + 1);
+        file.set_len(keep)?;
+    }
+    Ok(())
+}
+
+fn append_transaction(
+    file: &mut File,
+    bytes: &[u8],
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let start = file.seek(SeekFrom::End(0))?;
+    if let Err(error) = write(file, bytes) {
+        // If truncation also fails, the next append repairs the tail before
+        // writing. No later append may join onto an incomplete JSON line.
+        let _ = file.set_len(start);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Open `name` in the verified folder for writing, creating it owner-only
@@ -1040,14 +1205,18 @@ fn line_count(bytes: &[u8]) -> u64 {
 /// flushes, and note drops in the log itself.
 fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
     let mut batch: Vec<u8> = Vec::with_capacity(MAX_BATCH_BYTES);
-    let mut acks: Vec<SyncSender<()>> = Vec::new();
+    let mut acks: Vec<SyncSender<bool>> = Vec::new();
     let mut reported = 0u64;
     let mut failing = false;
+    let mut failed_since_flush = false;
     while let Ok(first) = rx.recv() {
         let mut next = Some(first);
         while let Some(message) = next.take() {
             match message {
-                Message::Line(line) => batch.extend_from_slice(&line),
+                Message::Line(line, permit) => {
+                    drop(permit);
+                    batch.extend_from_slice(&line);
+                }
                 Message::Flush(ack) => acks.push(ack),
             }
             if batch.len() < MAX_BATCH_BYTES {
@@ -1075,6 +1244,7 @@ fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
                     }
                 }
                 Err(error) => {
+                    failed_since_flush = true;
                     // The lines are gone; count them so the next marker says so.
                     let lost = line_count(&batch).saturating_sub(u64::from(total > reported));
                     dropped.fetch_add(lost, Ordering::Relaxed);
@@ -1086,8 +1256,12 @@ fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
             }
             batch.clear();
         }
+        let had_flush = !acks.is_empty();
         for ack in acks.drain(..) {
-            let _ = ack.send(());
+            let _ = ack.send(!failed_since_flush);
+        }
+        if had_flush {
+            failed_since_flush = false;
         }
     }
 }
@@ -1179,7 +1353,7 @@ pub(crate) fn read_window(
     to_ms: i64,
     max_bytes: usize,
 ) -> Result<Bundle> {
-    let (current, previous) = match crate::platform::open_private_dir(support_dir) {
+    let (current, previous) = match crate::platform::open_support_dir(support_dir, false) {
         Ok(dir) => {
             let lock = open_or_create(&dir, LOCK)?;
             lock.lock()?;
@@ -1231,7 +1405,7 @@ pub(crate) fn read_window(
     selected.reverse();
     let header = BundleHeader {
         kind: "spawnd-support-log",
-        format: 1,
+        format: 2,
         version: crate::version::build_version(),
         variant: if crate::version::DIAGNOSTICS_BUILD {
             "diagnostics"
@@ -1324,12 +1498,81 @@ pub(crate) mod capture {
         }
     }
 
+    pub(crate) fn private_tempdir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::fs::remove_dir(tmp.path()).unwrap();
+            crate::platform::create_private_dir_all(tmp.path()).unwrap();
+        }
+        tmp
+    }
+
+    /// Short, punctuated and unique: every tested representation survives the
+    /// backstop, so a missing field rule cannot be hidden by heuristic redaction.
+    pub(crate) fn canary() -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let marker = format!("reed!{:08x}?", NEXT.fetch_add(1, Ordering::Relaxed));
+        assert_eq!(sanitize(&marker), marker);
+        assert_detector_works(&marker);
+        marker
+    }
+
+    fn assert_detector_works(marker: &str) {
+        use base64::Engine as _;
+        let tmp = private_tempdir();
+        let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 32, true).unwrap();
+        let subscriber = tracing_subscriber::registry().with(log.layer());
+        let hex: String = marker.bytes().map(|b| format!("{b:02x}")).collect();
+        let mut lossy_bytes = vec![0xff];
+        lossy_bytes.extend_from_slice(marker.as_bytes());
+        let forms = [
+            marker.to_owned(),
+            String::from_utf8_lossy(&lossy_bytes).into_owned(),
+            hex,
+            base64::engine::general_purpose::STANDARD.encode(marker),
+            format!("{:?}", marker.as_bytes()),
+        ];
+        tracing::subscriber::with_default(subscriber, || {
+            for form in &forms {
+                assert_eq!(sanitize(form), *form);
+            }
+            tracing::warn!(target: "spawnd::canary", detail = marker, "deliberate string leak");
+            tracing::warn!(target: "spawnd::canary", detail = %String::from_utf8_lossy(&lossy_bytes), "deliberate lossy string leak");
+            tracing::warn!(target: "spawnd::canary", detail = %forms[2], "deliberate hex leak");
+            tracing::warn!(target: "spawnd::canary", detail = %forms[3], "deliberate base64 leak");
+            tracing::warn!(target: "spawnd::canary", detail = ?marker.as_bytes(), "deliberate byte Debug leak");
+        });
+        assert!(log.flush(Duration::from_secs(10)));
+        let written = std::fs::read_to_string(log.dir().join(CURRENT)).unwrap();
+        let lines: Vec<_> = written.lines().collect();
+        assert_eq!(lines.len(), forms.len());
+        for line in lines {
+            assert!(
+                std::panic::catch_unwind(|| assert_absent(line, marker, "negative control"))
+                    .is_err(),
+                "the canary detector accepted a deliberately logged representation"
+            );
+        }
+    }
+
     /// The forms a canary could take in a log: as typed, hex in either case,
     /// and base64 (standard and URL-safe) at each of the three alignments it
     /// could have inside a longer encoded run.
     pub(crate) fn canary_forms(canary: &str) -> Vec<String> {
         use base64::Engine as _;
-        let mut forms = vec![canary.to_string()];
+        let decimal = canary
+            .bytes()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let compact = decimal.replace(' ', "");
+        let mut forms = vec![canary.to_string(), decimal, compact];
         let hex: String = canary.bytes().map(|b| format!("{b:02x}")).collect();
         forms.push(hex.to_uppercase());
         forms.push(hex);

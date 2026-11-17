@@ -577,62 +577,84 @@ fsync, and the offer path waits on the locks it would run under.
 
 ## The support log
 
-`support_log.rs` writes a second log, separate from stderr, for the day
-someone has to work out what went wrong on a host. Nothing reads it yet:
-collecting it, with the owner's device-signed consent checked by the host,
-comes in later pull requests. Until then it never leaves the machine;
-`spawnd status` names its file.
+`support_log.rs` writes a separate local diagnostic record. This PR adds no
+collection or transmission; the device-signed consent and collection path come
+later. `spawnd status` names its file.
 
-- **Where, and how much.** `support/support.jsonl` and `support.jsonl.1` under
-  the instance log directory (`~/.local/state/spawn/logs/<instance>/support/`
-  on Linux and macOS, `%LOCALAPPDATA%\spawn\logs\<instance>\support\` on
-  Windows), owner-only, rotated at 4 MiB: **at most 8 MiB per instance, for
-  ever.** `reset` and `exorcise` remove the folder
-  (`service::purge_local_instance_data`).
-- **Who writes it.** `spawnd run` and `spawnd login` install the layer
-  (`main.rs`); other commands do not, and workers write nothing to it.
-  `main.rs` composes a registry in which `RUST_LOG` and `-v` filter only the
-  stderr `fmt` layer — whose output is unchanged, byte for byte — and the
-  support layer carries its own fixed filter: `spawnd` at INFO (DEBUG in the
-  diagnostics variant), every other crate at WARN, events only, never a span.
-- **What goes in.** One JSON object per line, `{t, level, target, at, msg,
-  fields}`. A field whose name or one `_`/`.` part of it is in
-  `WITHHELD_FIELDS` (`sdp`, `token`, `content`, `input`, `output`, `text`,
-  `env`, `args`, `stdin`, `skill`, …) is written as `<withheld>` without being
-  formatted; numbers and booleans pass; byte slices are withheld. Every
-  other string, the message included, is sanitised: ANSI and control
-  characters stripped; bearer tokens, JWTs, long mixed-case base64,
-  secret-looking `KEY=VALUE`, URL userinfo, query strings and fragments, and
-  a join error's panic message redacted; 512 characters per value, 2 KiB per
-  event. A panic hook records the location and thread name only, never the
-  payload.
-- **The rule for every log statement.** Anything that could carry terminal
-  content, file content, a command line, an environment value or a
-  credential must use a withheld field name or not be logged. The sanitiser
-  is a backstop for text nobody expected, not a licence: it cannot recognise
-  a line of someone's terminal. The modules that handle contents
-  (`host_files.rs`, `host_control.rs`, `host_preview.rs`, `upload.rs`,
-  `host_transcripts.rs`, `activity.rs`, `sessions.rs`,
-  `sessiond/emulator.rs`, `sessiond/scrollback.rs`) make no tracing calls at
-  all.
-- **Never on the hot path's clock.** A dedicated writer thread owns the files,
-  fed by a bounded channel (1,024 events); a full channel drops the event and
-  counts it, and the writer records how many it lost. No task, and not the
-  dispatch loop, waits on that disk. Appends and rotation hold
-  `support.lock`, so two processes of one instance overlapping during a
-  self-update write whole lines and rotate once.
-- **The reader** (`read_window`, for the collection to come) opens exactly
-  the two file names through the verified folder, never follows a link, and
-  never lists a folder — so a diagnostics replay dump or a scrollback segment
-  can never be read through it.
+- **Storage.** `support/support-v2.jsonl` and `support-v2.jsonl.1` under the
+  instance log directory, rotated at 4 MiB each. These two names occupy at most
+  8 MiB; a reader holding a replaced file can retain additional disk storage.
+  Startup unlinks the unversioned legacy pair under the rotation lock. An older
+  overlapping process cannot write into the versioned pair. `reset` and
+  `exorcise` remove the folder.
+- **Directories.** On Unix, `platform::open_support_dir` opens the immediate
+  parent with `O_NOFOLLOW`, verifies its owner and that group/others cannot
+  write it, then creates/opens the support leaf relative to that handle with
+  no-follow semantics. It verifies the opened leaf's type and owner before
+  setting its mode through a handle. A symlinked support leaf or immediate
+  parent is refused without changing the target's permissions. Earlier
+  ancestors are trusted OS/user-selected paths: their symlinks are followed,
+  their ownership/permissions are not proved here, and the parent hierarchy
+  is not protected against renames. Windows pins the verified parent and
+  validates owner-only DACLs and non-reparse handles; existing ACLs are never
+  repaired by this support-folder opener. The same ancestor trust applies.
+- **Filtering.** Only `run` and `login` install the layer; workers do not.
+  The stderr formatter retains its formatting options and per-layer
+  `RUST_LOG`/verbosity filter, but byte-for-byte equivalence is not claimed
+  (individual unsafe statements have changed). The support layer admits
+  `spawnd` INFO, diagnostics DEBUG, and foreign WARN, events only. A restrictive
+  `RUST_LOG` does not reduce this: the second layer can raise the daemon-wide
+  maximum level, causing additional event arguments to be evaluated.
+- **Contents.** Each JSON event has `{t, level, target, at, msg, fields}`.
+  Withheld names and their `_`/`.` parts apply to every type, including numbers
+  and booleans, without formatting; byte slices are always withheld. Counters
+  use explicit safe names such as `replay_size`, `count` and `length`.
+  Other strings lose controls and undergo heuristic redaction of Bearer/JWT,
+  long mixed-case base64, secret-looking assignments, URL userinfo and entire
+  queries/fragments, and common join-panic renderings. This is a backstop, not
+  proof that arbitrary text is safe: it misses ordinary short secrets and can
+  over-redact mixed-case paths. Content-bearing errors and peer strings must
+  be withheld at their source. The panic hook records location and thread
+  name, skips recording during a support-layer failure, and chains the existing
+  local hook; it does not record the payload.
+- **Work and failures.** Strings are bounded before copying/scanning (2 KiB
+  raw, incomplete trailing token discarded), then capped at 512 characters.
+  At most 16 fields are formatted/retained and an event is capped at 2 KiB. Queue slots
+  are reserved before formatting; a full queue drops/counts without visiting
+  fields. The layer catches/counts unwinding panics, including from formatters.
+  Formatting output is bounded, but arbitrary `Debug` code can still compute
+  or allocate before writing; aborts/OOM are not recoverable unwind failures.
+  A dedicated writer holds the cross-process lock for append/rotation. Failed
+  writes make the next flush fail; partial appends roll back, and interrupted
+  tails are repaired before appending. Dropping all senders stops the writer.
+  Normal command returns, login failures/`--no-run`, exec and explicit exit
+  paths attempt a bounded flush; this is not crash durability or a guarantee
+  that a full queue/disk stall can be flushed before exit.
+- **Reader, pending PR 2.** `read_window` opens only the two versioned names,
+  with leaf links refused, and never lists the folder. It is not yet a flushed
+  snapshot: Windows reads through the writer, concurrent rotation/read tests,
+  ordering semantics and a total collection cap remain collection work.
 
-The canary tests type `CANARY-<uuid>` into a real worker, replay it (with the
-diagnostics replay dump on in that variant), break a Codex `config.toml` with
-it, and panic with it, and require it absent in plain, hex and base64 from
-the log and the reader's output. `scripts/check-support-log.sh` (with
-`--self-test`, run by `scripts/test-all.sh`) pins the rest literally: the
-two file names, no folder listing, no replay-dump or scrollback reference,
-no environment-driven filter, and no tracing in the content modules.
+The content-handling modules (`host_files.rs`, `host_control.rs`,
+`host_preview.rs`, `upload.rs`, `host_transcripts.rs`, `activity.rs`,
+`sessions.rs`, `sessiond/emulator.rs`, `sessiond/scrollback.rs`) make no
+tracing calls. Anything carrying terminal/input/file/clipboard content,
+command arguments, environment values or credentials uses withheld fields
+or is not logged. Credential JSON errors retain category and position only;
+worker start/shutdown errors forwarded to the supervisor retain a fixed
+category and an OS code when available. The vendored SCTP panic statement
+omits the payload; ICE username errors omit credentials, and candidate
+warnings use parsed socket addresses instead of peer-supplied strings.
+
+Canaries use short punctuated markers asserted to survive `sanitize`, with
+negative controls that deliberately log string, lossy string, hex, base64 and
+decimal byte Debug forms and require detection. The real worker test types,
+echoes and replays its marker, enabling the replay dump in diagnostics builds;
+Codex-config and panic tests use the same detector. Global tracing/capture
+still shares the test process. `scripts/check-support-log.sh --self-test`
+pins filenames, no folder listing/content-path reads, fixed filters and the
+absence of tracing in content modules; it is a textual guard, not data-flow
+analysis.
 
 ## A skilled window's home
 

@@ -5,8 +5,9 @@
 # in where it is not allowed to look. This gate pins the second part in the
 # source, so it cannot be relaxed quietly:
 #
-#   1. The reader names exactly two files, `support.jsonl` and
-#      `support.jsonl.1` (plus the lock), and reads them only by those names.
+#   1. The reader names exactly two files, `support-v2.jsonl` and
+#      `support-v2.jsonl.1` (plus the lock), read only by those names.
+#      Legacy names are deletion-only.
 #   2. The module never lists a folder: no read_dir, no cap-std `entries`, no
 #      glob or directory walk. Whatever else lands in or beside the support
 #      folder — a diagnostics replay dump, a scrollback segment — is never
@@ -59,14 +60,19 @@ module_code="$(code_of "$MODULE")"
 
 # 1. Exactly the reviewed file names, and reads only by them.
 names="$(grep -oE '"[^"]*\.(jsonl|jsonl\.[0-9]+|lock|log|replay)"' <<<"$module_code" | sort -u || true)"
-expected_names='"support.jsonl"
+expected_names='"support-v2.jsonl"
+"support-v2.jsonl.1"
+"support.jsonl"
 "support.jsonl.1"
 "support.lock"'
 if [[ "$names" != "$expected_names" ]]; then
   printf 'support-log: file names in the module:\n%s\n' "$names" >&2
-  fail "the support log names exactly support.jsonl, support.jsonl.1 and support.lock"
+  fail "the support log names only the versioned pair, the deletion-only legacy pair and support.lock"
 fi
-for binding in 'const CURRENT: &str = "support.jsonl";' 'const PREVIOUS: &str = "support.jsonl.1";' 'const LOCK: &str = "support.lock";'; do
+legacy_names="$(grep -E '"support\.jsonl(\.1)?"' <<<"$module_code" || true)"
+[[ "$legacy_names" == '        for name in ["support.jsonl", "support.jsonl.1"] {' ]] ||
+  fail "legacy names must appear only in the deletion loop"
+for binding in 'const CURRENT: &str = "support-v2.jsonl";' 'const PREVIOUS: &str = "support-v2.jsonl.1";' 'const LOCK: &str = "support.lock";'; do
   grep -qF "$binding" <<<"$module_code" || fail "missing file-name constant: $binding"
 done
 reads="$(grep -oE 'read_capped\(&dir, [A-Z_]+\)' <<<"$module_code" | sort -u || true)"
@@ -134,7 +140,7 @@ self_test() {
     printf '%s\n' "$original" >"$fixture/$MODULE"
   }
 
-  printf '%s\n' 'const OLDER: &str = "support.jsonl.2";' >>"$fixture/$MODULE"
+  printf '%s\n' 'const OLDER: &str = "support-v2.jsonl.2";' >>"$fixture/$MODULE"
   expect_failure "a third file name"
 
   printf '%s\n' 'let x = read_capped(&dir, OLDER);' >>"$fixture/$MODULE"
@@ -154,6 +160,9 @@ self_test() {
 
   printf '%s\n' 'let filter = EnvFilter::from_default_env();' >>"$fixture/$MODULE"
   expect_failure "an environment-driven filter"
+
+  printf '%s\n' 'let legacy = read_capped(&dir, "support.jsonl");' >>"$fixture/$MODULE"
+  expect_failure "a legacy file read"
 
   # A comment may name what the module avoids.
   printf '%s\n' '// never a read_dir, never a scrollback segment' >>"$fixture/$MODULE"

@@ -512,6 +512,7 @@ fn exec_into(path: &Path) -> std::io::Error {
         command.arg0(argv0);
     }
     command.args(argv);
+    crate::support_log::flush_before_exit();
     command.exec()
 }
 
@@ -794,7 +795,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                     tracing::error!(
                         stage = failure.stage.as_str(),
                         error = failure.error,
-                        reinstall = %reinstall,
+                        reinstall_args = %reinstall,
                         "SPAWN D daemon cannot satisfy the server protocol; reinstall it"
                     );
                 }
@@ -1428,7 +1429,7 @@ async fn reconcile_browser_pins(
         Ok(outcomes) => outcomes,
         Err(error) => {
             tracing::warn!(
-                error = format!("{error:#}"),
+                credential_error = %format_args!("{error:#}"),
                 "could not reconcile browser pins off the dispatch task"
             );
             send_pin_adoption_failures(out_tx, &proposed_ids, "other").await;
@@ -1468,7 +1469,7 @@ async fn reconcile_browser_pins(
         }
         Some(Err(error)) => {
             tracing::warn!(
-                error = format!("{error:#}"),
+                credential_error = %format_args!("{error:#}"),
                 "could not adopt endorsed browser pins"
             );
             send_pin_adoption_failures(out_tx, &proposed_ids, "other").await;
@@ -1481,7 +1482,7 @@ async fn reconcile_browser_pins(
             tracing::warn!(removed, "dropped browser pins the server no longer lists");
         }
         Some(Err(error)) => tracing::warn!(
-            error = format!("{error:#}"),
+            credential_error = %format_args!("{error:#}"),
             "could not reconcile browser pins against the server"
         ),
     }
@@ -1975,7 +1976,7 @@ async fn dispatch_loop(
                         match persisted {
                             Ok(Ok(())) => credentials_touched_notify().notify_one(),
                             Ok(Err(error)) | Err(error) => tracing::warn!(
-                                error = format!("{error:#}"),
+                                credential_error = %format_args!("{error:#}"),
                                 "could not persist rotated daemon token"
                             ),
                         }
@@ -2816,7 +2817,8 @@ async fn run_agent_probe(
             tracing::warn!(
                 agent_id = %target.agent_id,
                 agent = %target.agent_name,
-                probe = %probe,
+                probe_kind = "agent_version_or_package_metadata",
+                argv = %probe,
                 timeout_ms = timeout.as_millis() as u64,
                 limit = if timeout < TOOL_VERSION_TIMEOUT {
                     "the check's deadline"
@@ -3840,7 +3842,7 @@ async fn handle_session_create(
     let launched = match worker_backend::launch(spec).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(%session_id, error = %format_args!("{e:#}"), "session failed to start");
+            tracing::warn!(%session_id, argv_error = %format_args!("{e:#}"), "session failed to start");
             send_error_code(
                 out_tx,
                 Some(session_id),

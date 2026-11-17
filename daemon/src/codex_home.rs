@@ -1109,7 +1109,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
     fn a_broken_config_is_logged_by_line_and_column_never_its_content() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let canary = format!("CANARY-{}", uuid::Uuid::new_v4());
+        let canary = crate::support_log::capture::canary();
         let broken = format!("model = \"o4\"\n[mcp_servers.x.env]\nAPI_TOKEN = {canary} oops\n");
         assert!(broken
             .parse::<DocumentMut>()
@@ -1117,7 +1117,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
             .to_string()
             .contains(&canary));
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::support_log::capture::private_tempdir();
         let log = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
         let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let sink = stderr.clone();

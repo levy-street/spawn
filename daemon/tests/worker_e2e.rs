@@ -916,7 +916,18 @@ cat
         let (frame_type, payload) = read_frame(&mut conn).await;
         assert_eq!(frame_type, wire::T_ERROR);
         let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
-        assert!(err.message.contains("argv"), "unexpected error: {err:?}");
+        assert_eq!(err.message, "worker frame rejected");
+
+        // Serde's error would quote this value. The forwarded error is a
+        // category even when the supervisor sent malformed Start JSON.
+        let malformed = br#"{"cwd":"/","argv":[],"env":{},"cols":"short!private?","rows":24}"#;
+        wire::write_frame(&mut conn, wire::T_START, malformed)
+            .await
+            .unwrap();
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        assert_eq!(frame_type, wire::T_ERROR);
+        let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
+        assert_eq!(err.message, "worker frame rejected");
     }
 
     /// Committed-history delta streaming: nothing is emitted before the

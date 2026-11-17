@@ -32,7 +32,7 @@ impl io::Write for Sink {
 
 #[test]
 fn rust_log_trace_and_verbose_flags_do_not_widen_the_support_log() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 4096, true).unwrap();
     let sink = Sink::default();
     let writer = sink.clone();
@@ -78,7 +78,7 @@ fn rust_log_trace_and_verbose_flags_do_not_widen_the_support_log() {
 
 #[test]
 fn log_crate_records_are_capped_at_warn_by_their_own_target() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 4096, true).unwrap();
     let subscriber = tracing_subscriber::registry().with(log.layer());
     let dispatch = tracing::Dispatch::new(subscriber);
@@ -112,14 +112,14 @@ fn log_crate_records_are_capped_at_warn_by_their_own_target() {
 }
 
 #[test]
-fn withheld_fields_are_never_formatted_and_numbers_pass() {
+fn withheld_fields_cover_every_type_and_safe_counters_pass() {
     struct Explodes;
     impl fmt::Debug for Explodes {
         fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
             panic!("a withheld value was formatted");
         }
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 4096, true).unwrap();
     let subscriber = tracing_subscriber::registry().with(log.layer());
     tracing::subscriber::with_default(subscriber, || {
@@ -133,6 +133,12 @@ fn withheld_fields_are_never_formatted_and_numbers_pass() {
             bytes = 1234u64,
             input_len = 5i64,
             data = true,
+            token = 123u128,
+            env = -123i128,
+            secret = 1.5f64,
+            count = 1234u64,
+            length = 5i64,
+            ready = true,
             ratio = 0.5f64,
             session_id = "4b1c2d3e",
             "withheld"
@@ -142,12 +148,24 @@ fn withheld_fields_are_never_formatted_and_numbers_pass() {
     assert!(log.flush(Duration::from_secs(10)));
     let lines = read_lines(log.dir());
     let fields = &lines[0]["fields"];
-    for name in ["sdp", "offer_sdp", "refresh_token", "skills", "stdin_error"] {
+    for name in [
+        "sdp",
+        "offer_sdp",
+        "refresh_token",
+        "skills",
+        "stdin_error",
+        "bytes",
+        "input_len",
+        "data",
+        "token",
+        "env",
+        "secret",
+    ] {
         assert_eq!(fields[name], WITHHELD, "{name}");
     }
-    assert_eq!(fields["bytes"], 1234);
-    assert_eq!(fields["input_len"], 5);
-    assert_eq!(fields["data"], true);
+    assert_eq!(fields["count"], 1234);
+    assert_eq!(fields["length"], 5);
+    assert_eq!(fields["ready"], true);
     assert_eq!(fields["ratio"], 0.5);
     assert_eq!(fields["session_id"], "4b1c2d3e");
     assert_eq!(lines[1]["fields"]["raw"], WITHHELD);
@@ -300,7 +318,7 @@ fn fill(store: &Store, lines: usize, width: usize, tag: &str) {
 
 #[test]
 fn rotation_keeps_exactly_two_files_under_their_cap() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
     // About 2.2 files' worth of 1 KiB lines.
@@ -310,7 +328,9 @@ fn rotation_keeps_exactly_two_files_under_their_cap() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, [CURRENT, PREVIOUS, LOCK]);
+    let mut expected = vec![CURRENT, PREVIOUS, LOCK];
+    expected.sort();
+    assert_eq!(names, expected);
     for name in [CURRENT, PREVIOUS] {
         let len = std::fs::metadata(path.join(name)).unwrap().len();
         assert!(len <= MAX_FILE_BYTES, "{name}: {len}");
@@ -329,7 +349,7 @@ fn rotation_keeps_exactly_two_files_under_their_cap() {
 #[cfg(unix)]
 #[test]
 fn neither_path_is_ever_followed_through_a_link() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let elsewhere = tmp.path().join("elsewhere.txt");
     std::fs::write(&elsewhere, "not the log\n").unwrap();
@@ -354,14 +374,14 @@ fn neither_path_is_ever_followed_through_a_link() {
 #[test]
 fn a_full_channel_drops_and_counts_and_never_waits() {
     const EVENTS: usize = 2_000;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     // Stand in for a disk that does not answer: hold the cross-process lock
     // the writer takes for every append, through a second handle. If an
     // event waited for the writer, this test would never finish.
     let store = Store::open(&path).unwrap();
-    store.lock.lock().unwrap();
     let log = SupportLog::open_with(&path, 4, false).unwrap();
+    store.lock.lock().unwrap();
     let subscriber = tracing_subscriber::registry().with(log.layer());
     tracing::subscriber::with_default(subscriber, || {
         for index in 0..EVENTS {
@@ -375,13 +395,9 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     store.lock.unlock().unwrap();
     // Once the writer moves again, everything it had is written and it
     // says how many it lost.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !log.flush(Duration::from_millis(100)) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the writer never resumed"
-        );
-    }
+    let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+    log.inner.tx.send(Message::Flush(ack_tx)).unwrap();
+    assert!(ack_rx.recv_timeout(Duration::from_secs(10)).unwrap());
     let written = read_lines(&path)
         .iter()
         .filter(|line| line["msg"] == "event")
@@ -393,7 +409,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
 
 #[test]
 fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
     fill(&store, 5_000, 1000, "line");
@@ -449,7 +465,7 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
 #[test]
 fn a_panic_records_where_and_which_thread_never_the_payload() {
     let capture = capture::global();
-    let canary = format!("CANARY-{}", uuid::Uuid::new_v4());
+    let canary = crate::support_log::capture::canary();
     let payload = canary.clone();
     let thread = format!("support-panic-{}", uuid::Uuid::new_v4().simple());
     let joined = std::thread::Builder::new()
@@ -476,4 +492,225 @@ fn a_panic_records_where_and_which_thread_never_the_payload() {
         .contains("support_log_tests.rs:"));
     capture::assert_absent(&contents, &canary, "the support log");
     capture::assert_absent(&capture.bundle(), &canary, "the bundle");
+}
+
+#[test]
+fn url_redaction_consumes_all_parameters_and_userinfo_punctuation() {
+    for url in [
+        "https://host/?a=one&code=short-secret&next=two#fragment",
+        "https://host/?a=one;code=short-secret,next=two#fragment",
+        "https://host/?code=short-secret'next&x=y",
+    ] {
+        assert_eq!(sanitize(url), "https://host/?<redacted>");
+    }
+    for userinfo in ["user,pw;secret", "user:pw&secret", "user'pw(secret)"] {
+        assert_eq!(
+            sanitize(&format!(
+                "https://{userinfo}@host/path?a=1&code=secret done"
+            )),
+            "https://<redacted>@host/path?<redacted> done"
+        );
+    }
+    assert_eq!(
+        sanitize("https://[::1]/#one,two;three&four"),
+        "https://[::1]/#<redacted>"
+    );
+    assert_eq!(
+        sanitize("\"https://host/?a=one&code=secret\" next"),
+        "\"https://host/?<redacted>\" next"
+    );
+}
+
+#[test]
+fn input_is_bounded_before_scanning_and_incomplete_tokens_are_discarded() {
+    // The helper returns a borrowed slice within the cap, independent of the
+    // suffix. This checks the work bound structurally, without a timing test.
+    let prefix = "ready ".repeat(MAX_RAW_VALUE_BYTES / 6);
+    let a = format!("{prefix}unfinished{}", "x".repeat(MAX_RAW_VALUE_BYTES));
+    let b = format!(
+        "{prefix}unfinished{}",
+        "secret ".repeat(MAX_RAW_VALUE_BYTES)
+    );
+    let (bounded, cut) = bounded_input(&a);
+    assert!(cut && bounded.len() <= MAX_RAW_VALUE_BYTES);
+    assert_eq!(bounded.as_ptr(), a.as_ptr());
+    assert!(!bounded.contains("unfinished"));
+    assert_eq!(sanitize(&a), sanitize(&b));
+    assert_eq!(sanitize(&"é".repeat(MAX_RAW_VALUE_BYTES)), "…");
+    let repeated = "bearer".repeat(64);
+    assert_eq!(sanitize(&repeated), repeated);
+    assert_eq!(
+        sanitize("JoinError::Panic(Id(1), \"short private note\", ...)"),
+        "JoinError::Panic( <withheld>"
+    );
+}
+
+#[test]
+fn a_panicking_debug_value_drops_one_event_and_the_layer_continues() {
+    struct Panics;
+    impl fmt::Debug for Panics {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("formatter panic");
+        }
+    }
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open(&tmp.path().join(DIR_NAME)).unwrap();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
+        tracing::warn!(detail = ?Panics, "broken formatter");
+        tracing::warn!("after formatter panic");
+    });
+    assert!(log.flush(Duration::from_secs(10)));
+    assert_eq!(log.dropped(), 1);
+    let lines = read_lines(log.dir());
+    assert!(lines
+        .iter()
+        .any(|line| line["msg"] == "after formatter panic"));
+    assert!(!lines.iter().any(|line| line["msg"] == "broken formatter"));
+}
+
+#[test]
+fn saturation_does_not_visit_fields() {
+    struct MustNotFormat<'a>(&'a Cell<bool>);
+    impl fmt::Debug for MustNotFormat<'_> {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.set(true);
+            panic!("full queue formatted a field");
+        }
+    }
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 1, false).unwrap();
+    let permit = log.reserve().unwrap();
+    let formatted = Cell::new(false);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
+        tracing::warn!(detail = ?MustNotFormat(&formatted), "saturated");
+    });
+    assert!(!formatted.get());
+    assert_eq!(log.dropped(), 1);
+    drop(permit);
+    assert!(log.reserve().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn support_and_parent_symlinks_never_change_target_permissions() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let tmp = capture::private_tempdir();
+    let target = tmp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let support = tmp.path().join(DIR_NAME);
+    symlink(&target, &support).unwrap();
+    assert!(Store::open(&support).is_err());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+    let parent_link = tmp.path().join("parent-link");
+    symlink(&target, &parent_link).unwrap();
+    assert!(Store::open(&parent_link.join(DIR_NAME)).is_err());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+    assert!(!target.join(DIR_NAME).exists());
+    // Earlier ancestors are trusted, and may be links (e.g. the OS home root).
+    let parent = target.join("instance");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open(&parent_link.join("instance").join(DIR_NAME)).unwrap();
+    store.append(b"{}\n").unwrap();
+    assert!(parent.join(DIR_NAME).join(CURRENT).exists());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+}
+
+#[test]
+fn flush_reports_failed_writes_then_recovers() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let log = SupportLog::open(&path).unwrap();
+    std::fs::create_dir(path.join(CURRENT)).unwrap();
+    log.push(b"{}\n".to_vec());
+    assert!(
+        !log.flush(Duration::from_secs(10)),
+        "a lost batch was acknowledged as written"
+    );
+    assert_eq!(log.dropped(), 1);
+    std::fs::remove_dir(path.join(CURRENT)).unwrap();
+    log.push(b"{}\n".to_vec());
+    assert!(log.flush(Duration::from_secs(10)));
+    assert!(std::fs::read_to_string(path.join(CURRENT))
+        .unwrap()
+        .lines()
+        .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
+}
+
+#[test]
+fn partial_writes_roll_back_and_interrupted_tails_are_repaired() {
+    let tmp = capture::private_tempdir();
+    let store = Store::open(&tmp.path().join(DIR_NAME)).unwrap();
+    store.append(b"{\"first\":true}\n").unwrap();
+    let mut file = open_or_create(&store.dir, CURRENT).unwrap();
+    let error = append_transaction(&mut file, b"{\"second\":true}\n", |file, bytes| {
+        file.write_all(&bytes[..5])?;
+        Err(io::Error::other("injected partial write"))
+    });
+    assert!(error.is_err());
+    assert_eq!(
+        file.metadata().unwrap().len(),
+        b"{\"first\":true}\n".len() as u64
+    );
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"{\"torn\"").unwrap();
+    store.append(b"{\"third\":true}\n").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "{\"first\":true}\n{\"third\":true}\n");
+}
+
+#[test]
+fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    for name in ["support.jsonl", "support.jsonl.1"] {
+        std::fs::write(path.join(name), "unsafe older history\n").unwrap();
+    }
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    for name in ["support.jsonl", "support.jsonl.1"] {
+        assert!(!path.join(name).exists());
+    }
+    fill(&store, 1, 10, "safe");
+    // An overlapping old process can recreate its files, never the new pair.
+    std::fs::write(path.join("support.jsonl"), "unsafe older history\n").unwrap();
+    let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 20).unwrap();
+    assert_eq!(bundle.lines.len(), 1);
+    assert!(bundle.lines[0].contains("safe"));
+    let _reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        read_window(&path, "x", 0, i64::MAX / 2, 1 << 20)
+            .unwrap()
+            .lines,
+        bundle.lines
+    );
+}
+
+#[test]
+fn dropping_the_last_handle_stops_the_writer() {
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open(&tmp.path().join(DIR_NAME)).unwrap();
+    let stopped = log.inner.stopped.lock().unwrap().take().unwrap();
+    log.push(b"{}\n".to_vec());
+    drop(log);
+    stopped
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer retained its sender");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(DIR_NAME).join(CURRENT)).unwrap(),
+        "{}\n"
+    );
 }
