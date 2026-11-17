@@ -7,12 +7,13 @@ import hashlib
 import stat
 import uuid
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete, update
 
-from spawn_server import auth
+from spawn_server import auth, main, support_log_retention
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogCollection
@@ -42,18 +43,20 @@ def headers(body=BODY, **overrides):
 async def storage(tmp_path, monkeypatch):
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
     store = get_store()
-    await store.prepare()
     yield store
     store.close()
     assert not route._inflight and not route._reading
 
 
 @pytest_asyncio.fixture
-async def app(app, storage):
-    # The shared fixture owns the database; assemble routes after configuring storage.
-    from spawn_server.main import create_app
-
-    return create_app()
+async def app(app, storage, monkeypatch):
+    # The shared fixture owns the database. These tests drive retention explicitly.
+    monkeypatch.setattr(main, "init_engine", Mock())
+    monkeypatch.setattr(main, "dispose_engine", AsyncMock())
+    monkeypatch.setattr(support_log_retention, "sweep_once", AsyncMock())
+    upload_app = main.create_app()
+    async with upload_app.router.lifespan_context(upload_app):
+        yield upload_app
 
 
 async def setup_request(*, state="dispatched", enabled=True):
@@ -586,8 +589,6 @@ async def test_bundle_against_refusal_has_one_outcome(app, file_sqlite_client, s
 async def test_four_body_reads_reject_fifth_without_touching_record(
     app, file_sqlite_client, storage
 ):
-    from spawn_server.main import create_app
-
     records = [await setup_request() for _ in range(5)]
     entered = [asyncio.Event() for _ in range(4)]
     proceed = asyncio.Event()
@@ -613,7 +614,9 @@ async def test_four_body_reads_reject_fifth_without_touching_record(
     try:
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 30)
         # A second app in the same process shares the receive limit.
-        status, _, reads = await raw_request(create_app(), fifth_id, token=fifth_token)
+        other_app = main.create_app()
+        async with other_app.router.lifespan_context(other_app):
+            status, _, reads = await raw_request(other_app, fifth_id, token=fifth_token)
         assert status == 503 and reads == 0
         after = await get_collection(fifth_id)
         assert all(

@@ -88,10 +88,11 @@ is reserved for that later dispatch change.
 
 `SPAWN_SUPPORT_LOG_DIR` is unset by default. Unset means 404 without reading
 the body, no support file access and no sweep task. Set it only to an absolute
-private storage directory outside the repository checkout. The startup sweep
-creates it with mode 0700 in a background thread; uploads stay off until that
-check succeeds. An unusable directory or missing Unix file locking support logs
-one error and leaves storage off.
+private storage directory outside the repository checkout. Before serving,
+startup gives a worker thread five seconds to create the directory with mode
+0700 and check that it is usable. Only then does startup register the upload
+route and start the sweeps. A failed check or timeout logs one error and keeps
+the feature off for the life of the process.
 Keeping bundles outside the checkout prevents a deploy or source backup from
 copying plain diagnostic logs. They are separate from database backups.
 

@@ -24,6 +24,7 @@ from .config import get_settings
 from .support_consent import canonical_uuid
 
 log = logging.getLogger("spawn.support_log")
+PREPARE_SECONDS = 5
 
 
 def checkout_root() -> Path:
@@ -55,6 +56,15 @@ class SupportLogFiles:
         self._entries = None
         self._init_lock = asyncio.Lock()
 
+    @staticmethod
+    def _probe(root: Path):
+        if not root.is_dir():
+            raise NotADirectoryError
+        root.chmod(0o700)
+        fd, path = tempfile.mkstemp(prefix=".probe-", dir=root)
+        os.close(fd)
+        os.unlink(path)
+
     def _prepare(self):
         if fcntl is None or not all(
             hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "fchmod")
@@ -63,12 +73,26 @@ class SupportLogFiles:
         root = self.root.resolve()
         if not self.root.is_absolute() or root.is_relative_to(checkout_root()):
             raise OSError("support directory must be absolute and outside checkout")
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root.chmod(0o700)
-        fd, path = tempfile.mkstemp(prefix=".probe-", dir=root)
-        os.close(fd)
-        os.unlink(path)
-        self.root = root
+        if self.disabled:
+            raise StoreUnavailable
+        if not root.exists():
+            root.parent.mkdir(parents=True, exist_ok=True)
+            # Probe a new directory before publishing it at the configured path.
+            with tempfile.TemporaryDirectory(prefix=".support-", dir=root.parent) as temp:
+                self._probe(Path(temp))
+                # Two starting workers must never replace each other's directory.
+                parent = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    fcntl.flock(parent, fcntl.LOCK_EX)
+                    if self.disabled:
+                        raise StoreUnavailable
+                    if not root.exists():
+                        os.rename(temp, root)
+                        return root
+                finally:
+                    os.close(parent)
+        self._probe(root)
+        return root
 
     async def prepare(self):
         async with self._init_lock:
@@ -76,8 +100,11 @@ class SupportLogFiles:
                 raise StoreUnavailable
             if not self.ready:
                 try:
-                    await finish_job(asyncio.to_thread(self._prepare))
-                except (OSError, ValueError):
+                    # Only the waiting task can publish readiness. A timed-out
+                    # filesystem call may still return after startup has continued.
+                    async with asyncio.timeout(PREPARE_SECONDS):
+                        self.root = await asyncio.to_thread(self._prepare)
+                except Exception:
                     self.disabled = True
                     log.error("SPAWN D support log storage is unusable; sharing storage is off")
                     raise StoreUnavailable from None

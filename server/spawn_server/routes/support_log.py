@@ -151,7 +151,6 @@ async def publish(store, record, body, metadata):
 @router.post("/uploads/{request_id}", status_code=204)
 async def upload(request_id: str, request: Request):
     store = get_store()
-    # Startup checks storage in the background; stay off until it succeeds.
     if store is None or not store.ready:
         raise HTTPException(404, NOT_FOUND)
     # Explicit dependency scope ends before a body read, including auth's SELECT.

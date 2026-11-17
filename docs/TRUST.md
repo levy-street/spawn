@@ -250,8 +250,9 @@ folder, and never reads ordinary daemon output or terminal storage. A typed
 header adds only the documented state counters, classified error kind/time and
 parsed build identity; it never adds general state-file text.
 
-The support log route is the only route where the server accepts a body from a
-machine for storage, and it carries only the bundle described above.
+Through the support log route, the machine sends either a refusal code that
+the server records or a support log bundle that the server checks for size,
+digest and line framing and stores as a file without interpreting its events.
 `scripts/check-no-server-agent-upload.sh` names it as the single exception to
 the rule that keeps agent upload routes off the server.
 
