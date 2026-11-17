@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => tracing::error!(
                 role,
                 pid = std::process::id(),
-                payload_error = %format_args!("{error:#}"),
+                error = %format_args!("{error:#}"),
                 "SPAWN D background process failed"
             ),
         }

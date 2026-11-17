@@ -534,7 +534,7 @@ impl Association {
                             );
                             break 'outer;
                         } else {
-                            log::error!("[{name}] panic while serializing a packet");
+                            log::error!("[{name}] panic while serializing a packet: {err:?}");
                         }
                     }
                 }

@@ -12,24 +12,23 @@
 //!   again on every event in case it is ever composed without it.
 //! - **Events only.** Spans are refused by the filter and the layer records no
 //!   span fields, so nothing reaches this file through a span.
-//! - **Field rules.** Withheld names apply to every value type without
-//!   formatting; byte slices are always withheld. Other strings are bounded
-//!   before scanning and heuristically sanitised. This does not recognise
-//!   arbitrary terminal content or short secrets: fix their source statements.
+//! - **Construction.** Foreign events retain source metadata only. Native
+//!   events never record message text: Visit erases fmt::Arguments behind
+//!   &dyn Debug, so its static/dynamic distinction cannot be recovered safely.
+//!   Fields require support_log_policy.json admission by type or reviewed
+//!   origin; errors additionally require an exact reviewed callsite. Unknown
+//!   values are withheld before formatting. Sanitising is a second defence.
 //!
-//! One JSON object per line in `support/support-v2.jsonl`, rotated to
-//! `support-v2.jsonl.1` at 4 MiB. Legacy unversioned files are discarded at
-//! startup and never read. The two named files are bounded, though open readers
-//! may retain replaced files. A bounded queue feeds a dedicated writer, with a
+//! One JSON object per line in `support/support-v3.jsonl`, rotated to
+//! `support-v3.jsonl.1` at 4 MiB. Unversioned and v2 files are discarded under
+//! a nonblocking startup lock and never read. On contention main runs without
+//! this layer. The two named files are bounded, though readers may retain
+//! replaced files. A bounded queue feeds a dedicated writer, with a
 //! cross-process lock for append/rotation. Directory guarantees and ancestor
 //! trust are described by `platform::open_support_dir` and daemon/CLAUDE.md.
 //!
-//! [`read_window`] is the only reader. It opens exactly the two file names and
-//! never lists the folder, so nothing else that ever lands beside them — a
-//! diagnostics replay dump, a scrollback segment — can be read through it.
-//!
-//! Anything that could carry terminal content, file content, a command line
-//! or a credential must be logged under a withheld field name, or not logged.
+//! [`read_window`] opens exactly the current versioned pair and never lists
+//! the folder. Collection, a flushed snapshot and transmission are future work.
 
 use std::cell::Cell;
 use std::fmt::{self, Write as _};
@@ -56,9 +55,9 @@ use tracing_subscriber::layer::{Context, Filter, Layer};
 /// The folder under the instance log directory that holds the support log.
 pub(crate) const DIR_NAME: &str = "support";
 /// The file being written.
-pub(crate) const CURRENT: &str = "support-v2.jsonl";
+pub(crate) const CURRENT: &str = "support-v3.jsonl";
 /// The file before it. Rotation replaces it; there is never a third.
-pub(crate) const PREVIOUS: &str = "support-v2.jsonl.1";
+pub(crate) const PREVIOUS: &str = "support-v3.jsonl.1";
 /// Held for every append, rotation and read, across processes.
 const LOCK: &str = "support.lock";
 
@@ -84,36 +83,40 @@ const REDACTED: &str = "<redacted>";
 const DROPPED_TARGET: &str = "spawnd::support_log";
 const DROPPED_MESSAGE: &str = "support log events dropped";
 
-/// Field names whose values of every type are withheld. A field
-/// matches when its whole name, or one `_`- or `.`-separated part of it
-/// (plural `s` ignored), is listed: `offer_sdp`, `refresh_token`,
-/// `skills` and `stdin_error` are all withheld.
-pub(crate) const WITHHELD_FIELDS: &[&str] = &[
-    "sdp",
-    "candidate",
-    "token",
-    "access_token",
-    "credential",
-    "password",
-    "secret",
-    "content",
-    "body",
-    "bytes",
-    "data",
-    "payload",
-    "input",
-    "output",
-    "text",
-    "env",
-    "argv",
-    "args",
-    "command_line",
-    "stdin",
-    "stdout",
-    "stderr",
-    "clipboard",
-    "skill",
-];
+// One reviewed policy for both the runtime and scripts/check-support-log.sh.
+// Missing names, unknown kinds, changed callsites and message text fail closed.
+#[derive(Deserialize)]
+struct Policy {
+    fields: std::collections::BTreeMap<String, FieldRule>,
+    error_sites: Vec<ErrorSite>,
+}
+
+#[derive(Deserialize)]
+struct FieldRule {
+    kind: String,
+    #[serde(default)]
+    values: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ErrorSite {
+    target: String,
+    file: String,
+    line: u32,
+    field: String,
+}
+
+fn policy() -> &'static Policy {
+    static POLICY: OnceLock<Policy> = OnceLock::new();
+    POLICY.get_or_init(|| {
+        serde_json::from_str(include_str!("support_log_policy.json"))
+            .expect("support log policy is checked by the guard")
+    })
+}
+
+fn is_spawnd(target: &str) -> bool {
+    target == "spawnd" || target.starts_with("spawnd::")
+}
 
 /// The most verbose level a `spawnd` event is recorded at.
 const SPAWND_LEVEL: Level = if crate::version::DIAGNOSTICS_BUILD {
@@ -127,7 +130,7 @@ const OTHER_LEVEL: Level = Level::WARN;
 /// The fixed rule: whether an event from `target` at `level` belongs in the
 /// support log. Nothing at runtime changes it.
 pub(crate) fn admits(target: &str, level: &Level) -> bool {
-    let spawnd = target == "spawnd" || target.starts_with("spawnd::");
+    let spawnd = is_spawnd(target);
     let ceiling = if spawnd { SPAWND_LEVEL } else { OTHER_LEVEL };
     // tracing orders levels by verbosity: ERROR < WARN < … < TRACE.
     *level <= ceiling
@@ -362,16 +365,16 @@ impl SupportLog {
         ack_rx.recv_timeout(wait).unwrap_or(false)
     }
 
-    /// Record that a thread panicked: where, and the thread's name. Never the
+    /// Record that a thread panicked: where, and the runtime thread ID. Never the
     /// payload, which is whatever the panicking code put in it — an
     /// `unwrap()` on an `Err` carries the error's value.
-    fn record_panic(&self, location: Option<&std::panic::Location<'_>>, thread: Option<&str>) {
+    fn record_panic(&self, location: Option<&std::panic::Location<'_>>) {
         let at = location
             .map(|location| format!("{}:{}", location.file(), location.line()))
             .unwrap_or_default();
         let fields = vec![(
             "thread",
-            FieldValue::Str(sanitize(thread.unwrap_or("<unnamed>"))),
+            FieldValue::Str(format!("{:?}", std::thread::current().id())),
         )];
         let line = render_line(
             &now_rfc3339_millis(),
@@ -386,16 +389,14 @@ impl SupportLog {
     }
 
     /// Chain a panic hook that records each panic's location and thread
-    /// name here, then runs the hook it replaced, so stderr is unchanged.
+    /// ID here, then runs the hook it replaced, so stderr is unchanged.
     pub(crate) fn install_panic_hook(&self) {
         let _ = EXIT_LOG.set(Arc::downgrade(&self.inner));
         let log = self.clone();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if !IN_SUPPORT.with(Cell::get) {
-                contain(&log.inner.dropped, || {
-                    log.record_panic(info.location(), std::thread::current().name())
-                });
+                contain(&log.inner.dropped, || log.record_panic(info.location()));
             }
             previous(info);
         }));
@@ -424,8 +425,15 @@ where
             let Some(permit) = self.log.reserve() else {
                 return;
             };
-            let mut collector = Collector::default();
-            event.record(&mut collector);
+            // Foreign events never visit fields, including the formatted message.
+            // Log bridge normalization reads only its source metadata.
+            let mut collector = Collector {
+                meta,
+                fields: Vec::new(),
+            };
+            if is_spawnd(meta.target()) && normalized.is_none() {
+                event.record(&mut collector);
+            }
             let at = match (meta.file(), meta.line()) {
                 (Some(file), Some(line)) => format!("{}:{line}", sanitize(file)),
                 (Some(file), None) => sanitize(file),
@@ -436,7 +444,7 @@ where
                 meta.level().as_str(),
                 &sanitize(meta.target()),
                 &sanitize(&at),
-                collector.message.as_deref().unwrap_or(""),
+                "",
                 collector.fields,
             );
             self.log.push_reserved(line, permit);
@@ -454,121 +462,156 @@ enum FieldValue {
     Bool(bool),
 }
 
-#[derive(Default)]
-struct Collector {
-    message: Option<String>,
+struct Collector<'a> {
+    meta: &'a Metadata<'a>,
     fields: Vec<(&'static str, FieldValue)>,
 }
 
-impl Collector {
+impl Collector<'_> {
     fn keep(&self, field: &Field) -> bool {
-        // tracing-log's bookkeeping fields; the layer reads them through the
-        // normalized metadata instead.
-        self.fields.len() < MAX_FIELDS && !field.name().starts_with("log.")
+        // fmt::Arguments is erased behind &dyn Debug; neither Visit nor
+        // Metadata exposes as_str(). Never format or record message, even if
+        // delivered as record_str or a scalar. A string comparison cannot
+        // establish provenance. This also excludes explicit message fields.
+        self.fields.len() < MAX_FIELDS
+            && field.name() != "message"
+            && !field.name().starts_with("log.")
+    }
+
+    fn error_allowed(&self, name: &str) -> bool {
+        policy().error_sites.iter().any(|site| {
+            site.field == name
+                && site.target == self.meta.target()
+                && self.meta.file().map(Path::new) == Some(Path::new(&site.file))
+                && Some(site.line) == self.meta.line()
+        })
+    }
+
+    fn text_allowed(&self, name: &str) -> bool {
+        self.error_allowed(name)
+            || policy().fields.get(name).is_some_and(|rule| {
+                matches!(rule.kind.as_str(), "text" | "id" | "choice" | "version")
+            })
+    }
+
+    fn checked_text(&self, name: &str, raw: &str) -> String {
+        // Validate before sanitising; a truncated value must not acquire a
+        // permitted shape. Arbitrary text is admitted only by reviewed origin.
+        let allowed = self.error_allowed(name)
+            || policy()
+                .fields
+                .get(name)
+                .is_some_and(|rule| match rule.kind.as_str() {
+                    "text" => true,
+                    "choice" => rule.values.iter().any(|v| v == raw),
+                    "id" => {
+                        raw.len() <= MAX_VALUE_CHARS
+                            && raw.split(['/', ':']).all(|part| {
+                                uuid::Uuid::parse_str(part).is_ok()
+                                    || ((1..=64).contains(&part.len())
+                                        && part.bytes().all(|b| b.is_ascii_hexdigit()))
+                            })
+                    }
+                    "version" => {
+                        raw.len() <= 128 && {
+                            let core = raw.split(['+', '-']).next().unwrap_or("");
+                            core.split('.').count() == 3
+                                && core
+                                    .split('.')
+                                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                                && raw
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+                        }
+                    }
+                    _ => false,
+                });
+        if allowed {
+            sanitize(raw)
+        } else {
+            WITHHELD.to_owned()
+        }
     }
 
     fn push_text(&mut self, field: &Field, format: impl FnOnce() -> String) {
         if !self.keep(field) {
             return;
         }
-        let value = if is_withheld(field.name()) {
-            WITHHELD.to_string()
+        let value = if self.text_allowed(field.name()) {
+            self.checked_text(field.name(), &format())
         } else {
-            format()
+            WITHHELD.to_owned()
         };
         self.fields.push((field.name(), FieldValue::Str(value)));
     }
-}
 
-impl Visit for Collector {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            self.message = Some(sanitize(&bounded_format(value)));
+    fn push_scalar(&mut self, field: &Field, value: impl FnOnce() -> FieldValue) {
+        if !self.keep(field) {
             return;
         }
-        self.push_text(field, || sanitize(&bounded_format(value)));
+        let value = if policy()
+            .fields
+            .get(field.name())
+            .is_some_and(|rule| rule.kind == "scalar")
+        {
+            value()
+        } else {
+            FieldValue::Str(WITHHELD.to_owned())
+        };
+        self.fields.push((field.name(), value));
+    }
+}
+
+impl Visit for Collector<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.push_text(field, || bounded_format(value));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(sanitize(value));
-            return;
-        }
-        self.push_text(field, || sanitize(value));
+        // Bound before copying even when the field permits path/error text.
+        self.push_text(field, || {
+            let (prefix, truncated) = bounded_input(value);
+            if truncated {
+                format!("{prefix} …")
+            } else {
+                prefix.to_owned()
+            }
+        });
     }
 
     fn record_bytes(&mut self, field: &Field, _value: &[u8]) {
         if self.keep(field) {
             self.fields
-                .push((field.name(), FieldValue::Str(WITHHELD.to_string())));
+                .push((field.name(), FieldValue::Str(WITHHELD.to_owned())));
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            self.fields.push((field.name(), FieldValue::I64(value)));
-        }
+        self.push_scalar(field, || FieldValue::I64(value));
     }
-
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            self.fields.push((field.name(), FieldValue::U64(value)));
-        }
+        self.push_scalar(field, || FieldValue::U64(value));
     }
-
     fn record_i128(&mut self, field: &Field, value: i128) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            let value = i64::try_from(value)
+        self.push_scalar(field, || {
+            i64::try_from(value)
                 .map(FieldValue::I64)
-                .unwrap_or_else(|_| FieldValue::Str(value.to_string()));
-            self.fields.push((field.name(), value));
-        }
+                .unwrap_or_else(|_| FieldValue::Str(value.to_string()))
+        });
     }
-
     fn record_u128(&mut self, field: &Field, value: u128) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            let value = u64::try_from(value)
+        self.push_scalar(field, || {
+            u64::try_from(value)
                 .map(FieldValue::U64)
-                .unwrap_or_else(|_| FieldValue::Str(value.to_string()));
-            self.fields.push((field.name(), value));
-        }
+                .unwrap_or_else(|_| FieldValue::Str(value.to_string()))
+        });
     }
-
     fn record_f64(&mut self, field: &Field, value: f64) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            self.fields.push((field.name(), FieldValue::F64(value)));
-        }
+        self.push_scalar(field, || FieldValue::F64(value));
     }
-
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if is_withheld(field.name()) {
-            self.push_text(field, || unreachable!());
-        } else if self.keep(field) {
-            self.fields.push((field.name(), FieldValue::Bool(value)));
-        }
+        self.push_scalar(field, || FieldValue::Bool(value));
     }
-}
-
-pub(crate) fn is_withheld(name: &str) -> bool {
-    let listed = |part: &str| {
-        WITHHELD_FIELDS
-            .iter()
-            .any(|withheld| withheld.eq_ignore_ascii_case(part))
-    };
-    listed(name)
-        || name
-            .split(['_', '.'])
-            .any(|part| listed(part) || part.strip_suffix(['s', 'S']).is_some_and(listed))
 }
 
 /// Format a `Debug` (or `Display`, which tracing passes as `Debug`) value,
@@ -1005,8 +1048,10 @@ struct LineOut<'a> {
     level: &'a str,
     target: &'a str,
     at: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     msg: &'a str,
-    fields: FieldsOut<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields: Option<FieldsOut<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
 }
@@ -1031,7 +1076,7 @@ fn render_line(
             target,
             at,
             msg: &msg,
-            fields: FieldsOut(&fields),
+            fields: is_spawnd(target).then_some(FieldsOut(&fields)),
             truncated,
         };
         let mut bytes = serde_json::to_vec(&line).unwrap_or_default();
@@ -1097,7 +1142,12 @@ impl Store {
         let lock = open_or_create(&dir, LOCK)
             .with_context(|| format!("opening {}", path.join(LOCK).display()))?;
         let store = Self { dir, lock };
-        store.lock.lock()?;
+        // Startup must never wait for another daemon's writer. main continues
+        // without the support log if the lock is busy (including older builds).
+        store
+            .lock
+            .try_lock()
+            .map_err(|error| anyhow::anyhow!("support log startup lock: {error}"))?;
         let result = store.discard_legacy();
         let unlocked = store.lock.unlock();
         result.and(unlocked)?;
@@ -1107,7 +1157,12 @@ impl Store {
     fn discard_legacy(&self) -> io::Result<()> {
         // Versioned names also isolate an older process still running during
         // an update. It cannot append unsafe history to the new pair.
-        for name in ["support.jsonl", "support.jsonl.1"] {
+        for name in [
+            "support.jsonl",
+            "support.jsonl.1",
+            "support-v2.jsonl",
+            "support-v2.jsonl.1",
+        ] {
             match self.dir.remove_file(name) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1542,11 +1597,11 @@ pub(crate) mod capture {
             for form in &forms {
                 assert_eq!(sanitize(form), *form);
             }
-            tracing::warn!(target: "spawnd::canary", detail = marker, "deliberate string leak");
-            tracing::warn!(target: "spawnd::canary", detail = %String::from_utf8_lossy(&lossy_bytes), "deliberate lossy string leak");
-            tracing::warn!(target: "spawnd::canary", detail = %forms[2], "deliberate hex leak");
-            tracing::warn!(target: "spawnd::canary", detail = %forms[3], "deliberate base64 leak");
-            tracing::warn!(target: "spawnd::canary", detail = ?marker.as_bytes(), "deliberate byte Debug leak");
+            tracing::warn!(target: "spawnd::canary", path = marker, "deliberate string leak");
+            tracing::warn!(target: "spawnd::canary", path = %String::from_utf8_lossy(&lossy_bytes), "deliberate lossy string leak");
+            tracing::warn!(target: "spawnd::canary", path = %forms[2], "deliberate hex leak");
+            tracing::warn!(target: "spawnd::canary", path = %forms[3], "deliberate base64 leak");
+            tracing::warn!(target: "spawnd::canary", path = ?marker.as_bytes(), "deliberate byte Debug leak");
         });
         assert!(log.flush(Duration::from_secs(10)));
         let written = std::fs::read_to_string(log.dir().join(CURRENT)).unwrap();

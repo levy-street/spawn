@@ -62,15 +62,19 @@ fn rust_log_trace_and_verbose_flags_do_not_widen_the_support_log() {
     assert!(log.flush(Duration::from_secs(10)));
     let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(stderr.contains("spawnd-trace") && stderr.contains("tungstenite-trace"));
-    let messages: Vec<String> = read_lines(log.dir())
-        .iter()
-        .map(|line| line["msg"].as_str().unwrap().to_string())
-        .collect();
-    let mut expected = vec!["spawnd-info", "tungstenite-warn", "inside-a-span"];
+    let lines = read_lines(log.dir());
+    let mut targets = vec!["spawnd::rtc", "tungstenite::protocol", "spawnd::run"];
     if crate::version::DIAGNOSTICS_BUILD {
-        expected.insert(0, "spawnd-debug");
+        targets.insert(0, "spawnd::rtc");
     }
-    assert_eq!(messages, expected);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["target"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        targets
+    );
+    assert!(lines.iter().all(|line| line.get("msg").is_none()));
     let raw = std::fs::read_to_string(log.dir().join(CURRENT)).unwrap();
     assert!(!raw.contains("span-field"), "a span field reached the log");
     assert!(!raw.contains("the-span-name"), "a span reached the log");
@@ -105,10 +109,11 @@ fn log_crate_records_are_capped_at_warn_by_their_own_target() {
     assert!(log.flush(Duration::from_secs(10)));
     let lines = read_lines(log.dir());
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["msg"], "webrtc-warn");
+    assert!(lines[0].get("msg").is_none());
     assert_eq!(lines[0]["target"], "webrtc_ice::agent");
     assert_eq!(lines[0]["at"], "src/agent/mod.rs:7");
-    assert_eq!(lines[0]["fields"], serde_json::json!({}));
+    assert!(lines[0].get("fields").is_none());
+    assert_eq!(lines[0].as_object().unwrap().len(), 4);
 }
 
 #[test]
@@ -138,8 +143,8 @@ fn withheld_fields_cover_every_type_and_safe_counters_pass() {
             secret = 1.5f64,
             count = 1234u64,
             length = 5i64,
-            ready = true,
-            ratio = 0.5f64,
+            active = true,
+            elapsed_secs = 0.5f64,
             session_id = "4b1c2d3e",
             "withheld"
         );
@@ -165,8 +170,8 @@ fn withheld_fields_cover_every_type_and_safe_counters_pass() {
     }
     assert_eq!(fields["count"], 1234);
     assert_eq!(fields["length"], 5);
-    assert_eq!(fields["ready"], true);
-    assert_eq!(fields["ratio"], 0.5);
+    assert_eq!(fields["active"], true);
+    assert_eq!(fields["elapsed_secs"], 0.5);
     assert_eq!(fields["session_id"], "4b1c2d3e");
     assert_eq!(lines[1]["fields"]["raw"], WITHHELD);
     let raw = std::fs::read_to_string(log.dir().join(CURRENT)).unwrap();
@@ -215,7 +220,7 @@ fn the_sanitizer_strips_controls_and_redacts_secrets() {
     assert_eq!(sanitize(&format!("key {b64}")), "key <redacted>");
     let hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
     assert_eq!(sanitize(hex), hex);
-    let path = "/Users/Max1/Projects/spawn/daemon/src/run.rs";
+    let path = "/tmp/projects/daemon/src/run.rs";
     assert_eq!(sanitize(path), path);
     let words = "connection_reset_by_peer_while_reading_the_registered_frame";
     assert_eq!(sanitize(words), words);
@@ -245,32 +250,11 @@ fn the_sanitizer_strips_controls_and_redacts_secrets() {
 }
 
 #[test]
-fn field_names_match_whole_or_by_part() {
-    for name in [
-        "sdp",
-        "offer_sdp",
-        "access_token",
-        "refresh_token",
-        "tokens",
-        "skills",
-        "command_line",
-        "stdin_error",
-        "env.vars",
-        "Payload",
-        "candidate_type",
-    ] {
-        assert!(is_withheld(name), "{name}");
-    }
-    for name in [
-        "session_id",
-        "error",
-        "path",
-        "dir",
-        "viewer_id",
-        "operation",
-    ] {
-        assert!(!is_withheld(name), "{name}");
-    }
+fn unknown_names_and_error_sites_are_closed_by_default() {
+    assert!(!policy().fields.contains_key("future_field"));
+    assert_eq!(policy().fields["error"].kind, "withheld");
+    assert_eq!(policy().fields["session_id"].kind, "id");
+    assert_eq!(policy().fields["replay_bytes"].kind, "scalar");
 }
 
 #[test]
@@ -400,7 +384,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     assert!(ack_rx.recv_timeout(Duration::from_secs(10)).unwrap());
     let written = read_lines(&path)
         .iter()
-        .filter(|line| line["msg"] == "event")
+        .filter(|line| line["target"] == "spawnd::run")
         .count();
     assert_eq!(written as u64 + dropped, EVENTS as u64);
     let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 30).unwrap();
@@ -463,11 +447,11 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
 }
 
 #[test]
-fn a_panic_records_where_and_which_thread_never_the_payload() {
+fn a_panic_records_location_and_runtime_thread_id_never_payload_or_name() {
     let capture = capture::global();
     let canary = crate::support_log::capture::canary();
     let payload = canary.clone();
-    let thread = format!("support-panic-{}", uuid::Uuid::new_v4().simple());
+    let thread = canary.clone();
     let joined = std::thread::Builder::new()
         .name(thread.clone())
         .spawn(move || {
@@ -475,13 +459,14 @@ fn a_panic_records_where_and_which_thread_never_the_payload() {
             let error: Result<(), String> = std::hint::black_box(Err(payload));
             error.unwrap();
         })
-        .unwrap()
-        .join();
+        .unwrap();
+    let thread_id = format!("{:?}", joined.thread().id());
+    let joined = joined.join();
     assert!(joined.is_err());
     let contents = capture.contents();
     let record = contents
         .lines()
-        .find(|line| line.contains(&thread))
+        .find(|line| line.contains(&thread_id))
         .expect("the panic was recorded");
     let record: serde_json::Value = serde_json::from_str(record).unwrap();
     assert_eq!(record["target"], "spawnd::panic");
@@ -556,16 +541,17 @@ fn a_panicking_debug_value_drops_one_event_and_the_layer_continues() {
     let tmp = capture::private_tempdir();
     let log = SupportLog::open(&tmp.path().join(DIR_NAME)).unwrap();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
-        tracing::warn!(detail = ?Panics, "broken formatter");
+        tracing::warn!(path = ?Panics, "broken formatter");
         tracing::warn!("after formatter panic");
     });
     assert!(log.flush(Duration::from_secs(10)));
     assert_eq!(log.dropped(), 1);
-    let lines = read_lines(log.dir());
-    assert!(lines
-        .iter()
-        .any(|line| line["msg"] == "after formatter panic"));
-    assert!(!lines.iter().any(|line| line["msg"] == "broken formatter"));
+    let lines: Vec<_> = read_lines(log.dir())
+        .into_iter()
+        .filter(|line| line["target"] != DROPPED_TARGET)
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].get("msg").is_none());
 }
 
 #[test]
@@ -582,7 +568,7 @@ fn saturation_does_not_visit_fields() {
     let permit = log.reserve().unwrap();
     let formatted = Cell::new(false);
     tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
-        tracing::warn!(detail = ?MustNotFormat(&formatted), "saturated");
+        tracing::warn!(path = ?MustNotFormat(&formatted), "saturated");
     });
     assert!(!formatted.get());
     assert_eq!(log.dropped(), 1);
@@ -676,12 +662,22 @@ fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
     let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
-    for name in ["support.jsonl", "support.jsonl.1"] {
+    for name in [
+        "support.jsonl",
+        "support.jsonl.1",
+        "support-v2.jsonl",
+        "support-v2.jsonl.1",
+    ] {
         std::fs::write(path.join(name), "unsafe older history\n").unwrap();
     }
     drop(store);
     let store = Store::open(&path).unwrap();
-    for name in ["support.jsonl", "support.jsonl.1"] {
+    for name in [
+        "support.jsonl",
+        "support.jsonl.1",
+        "support-v2.jsonl",
+        "support-v2.jsonl.1",
+    ] {
         assert!(!path.join(name).exists());
     }
     fill(&store, 1, 10, "safe");
@@ -712,5 +708,144 @@ fn dropping_the_last_handle_stops_the_writer() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(DIR_NAME).join(CURRENT)).unwrap(),
         "{}\n"
+    );
+}
+
+#[test]
+fn construction_withholds_dynamic_messages_unknown_fields_and_unlisted_errors() {
+    struct MustNotFormat;
+    impl fmt::Debug for MustNotFormat {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("unapproved formatter ran");
+        }
+    }
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 32, true).unwrap();
+    let marker = capture::canary();
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let stderr = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(move || writer.clone());
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(stderr)
+            .with(log.layer()),
+        || {
+            tracing::warn!(target: "spawnd::run", "dynamic {}", marker);
+            tracing::warn!(target: "spawnd::run", future_field = %marker, "static message");
+            tracing::warn!(target: "webrtc_ice::agent", error = %marker, "peer {}", marker);
+            tracing::warn!(target: "spawnd::run", error = %marker, "unlisted error");
+            tracing::warn!(target: "spawnd::run", message = marker.as_str());
+            // An admitted name cannot smuggle arbitrary text through its type rule.
+            tracing::warn!(target: "spawnd::run", count = %marker, reason = %marker, session_id = %marker, "wrong types");
+        },
+    );
+    assert!(
+        String::from_utf8(sink.0.lock().unwrap().clone())
+            .unwrap()
+            .contains(&marker),
+        "stderr lost its original detail"
+    );
+    // With no stderr formatter, no rejected Debug implementation is invoked.
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
+        tracing::warn!(target: "spawnd::run", future_field = ?MustNotFormat, error = ?MustNotFormat, "{:?}", MustNotFormat);
+        tracing::warn!(target: "webrtc_turn", error = ?MustNotFormat, "{:?}", MustNotFormat);
+        tracing::warn!(target: "spawnd::run", future_number = 42u64, future_boolean = true, "unknown scalar fields");
+        tracing::warn!(target: "spawnd::run", reason = "worker replay barrier failed", count = 7u64, "incident category");
+    });
+    assert!(log.flush(Duration::from_secs(10)));
+    assert_eq!(log.dropped(), 0);
+    let written = std::fs::read_to_string(log.dir().join(CURRENT)).unwrap();
+    capture::assert_absent(&written, &marker, "constructed log");
+    let lines = read_lines(log.dir());
+    assert_eq!(lines.len(), 10);
+    for line in &lines {
+        assert!(line.get("msg").is_none());
+        if !is_spawnd(line["target"].as_str().unwrap()) {
+            assert_eq!(line.as_object().unwrap().len(), 4);
+        }
+    }
+    assert_eq!(lines[8]["fields"]["future_number"], WITHHELD);
+    assert_eq!(lines[8]["fields"]["future_boolean"], WITHHELD);
+    assert_eq!(lines[9]["fields"]["reason"], "worker replay barrier failed");
+    assert_eq!(lines[9]["fields"]["count"], 7);
+    // The log facade used by ICE/TURN must also leave arbitrary reasons out.
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log.layer()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        tracing_log::format_trace(
+            &tracing_log::log::Record::builder()
+                .args(format_args!("peer reason: {marker}"))
+                .level(tracing_log::log::Level::Warn)
+                .target("webrtc_ice::agent")
+                .file(Some("src/agent/mod.rs"))
+                .line(Some(1))
+                .build(),
+        )
+        .unwrap();
+    });
+    assert!(log.flush(Duration::from_secs(10)));
+    let lines = read_lines(log.dir());
+    assert_eq!(lines.last().unwrap().as_object().unwrap().len(), 4);
+    capture::assert_absent(
+        &std::fs::read_to_string(log.dir().join(CURRENT)).unwrap(),
+        &marker,
+        "log bridge",
+    );
+}
+
+#[test]
+fn startup_refuses_a_busy_lock_without_waiting_for_its_owner() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    store.lock.lock().unwrap();
+    // A bounded join detects a regression without stranding the test process:
+    // release the lock before asserting, even if open incorrectly waited.
+    let (tx, rx) = mpsc::sync_channel(1);
+    let attempt = std::thread::spawn(move || {
+        tx.send(SupportLog::open(&path).is_err()).unwrap();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    store.lock.unlock().unwrap();
+    attempt.join().unwrap();
+    assert!(result.unwrap());
+}
+
+#[test]
+fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 32, true).unwrap();
+    let marker = capture::canary();
+    let error = "reading /tmp/history/seg-00000001.log: No such file or directory (os error 2)";
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let stderr = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(move || writer.clone());
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(stderr)
+            .with(log.layer()),
+        || {
+            crate::worker_backend::log_worker_error(uuid::Uuid::new_v4(), error);
+            crate::worker_backend::log_worker_error(uuid::Uuid::new_v4(), &marker);
+        },
+    );
+    assert!(log.flush(Duration::from_secs(10)));
+    let lines = read_lines(log.dir());
+    if crate::version::DIAGNOSTICS_BUILD {
+        assert_eq!(lines[0]["fields"]["error"], error);
+        assert_eq!(lines.len(), 2);
+    } else {
+        assert_eq!(lines.len(), 1);
+    }
+    assert_eq!(lines.last().unwrap()["fields"]["error"], WITHHELD);
+    let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(stderr.contains(error) && stderr.contains(&marker));
+    capture::assert_absent(
+        &std::fs::read_to_string(log.dir().join(CURRENT)).unwrap(),
+        &marker,
+        "worker error",
     );
 }

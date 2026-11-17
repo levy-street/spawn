@@ -916,10 +916,31 @@ cat
         let (frame_type, payload) = read_frame(&mut conn).await;
         assert_eq!(frame_type, wire::T_ERROR);
         let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
-        assert_eq!(err.message, "worker frame rejected");
+        assert!(err.message.contains("argv"), "unexpected error: {err:?}");
 
-        // Serde's error would quote this value. The forwarded error is a
-        // category even when the supervisor sent malformed Start JSON.
+        // The PTY launch cause must survive WorkerError too, even when the
+        // PTY library returns a string error with no downcastable OS error.
+        drop(conn);
+        drop(fixture);
+        let fixture = WorkerFixture::launch().await;
+        let mut conn = fixture.connect().await;
+        expect_hello(&mut conn, "awaiting_start").await;
+        let missing_shell = fixture._dir.path().join("missing-shell");
+        let mut spec = spec;
+        spec.argv = vec![missing_shell.to_string_lossy().into_owned()];
+        wire::write_json_frame(&mut conn, wire::T_START, &spec)
+            .await
+            .unwrap();
+        let (frame_type, payload) = read_frame(&mut conn).await;
+        assert_eq!(frame_type, wire::T_ERROR);
+        let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
+        assert!(
+            err.message.contains("missing-shell"),
+            "missing launch cause: {err:?}"
+        );
+
+        // Local JSON explanations also survive. The supervisor's unlisted
+        // error callsite withholds these values from the support file.
         let malformed = br#"{"cwd":"/","argv":[],"env":{},"cols":"short!private?","rows":24}"#;
         wire::write_frame(&mut conn, wire::T_START, malformed)
             .await
@@ -927,7 +948,10 @@ cat
         let (frame_type, payload) = read_frame(&mut conn).await;
         assert_eq!(frame_type, wire::T_ERROR);
         let err: wire::WorkerError = wire::decode_json(&payload).unwrap();
-        assert_eq!(err.message, "worker frame rejected");
+        assert!(
+            err.message.contains("short!private?"),
+            "missing JSON explanation: {err:?}"
+        );
     }
 
     /// Committed-history delta streaming: nothing is emitted before the

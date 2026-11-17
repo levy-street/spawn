@@ -1274,7 +1274,7 @@ fn resolve_unix_keyring_read_with_warning(
         }
         Err(failure) if failure.unavailable => {
             if warn_unavailable {
-                tracing::warn!(credential_error = %failure.error, "keyring read failed; using the complete Unix credential record");
+                tracing::warn!(error = %failure.error, "keyring read failed; using the complete Unix credential record");
             }
             Ok(from_file.unwrap_or_default())
         }
@@ -1303,8 +1303,8 @@ where
         Err(file_error) => {
             let recoverable_torn_projection = file_error.chain().any(|cause| {
                 cause
-                    .downcast_ref::<CredentialParseError>()
-                    .is_some_and(|error| error.category == serde_json::error::Category::Eof)
+                    .downcast_ref::<serde_json::Error>()
+                    .is_some_and(serde_json::Error::is_eof)
             });
             if !recoverable_torn_projection {
                 if let Some(keyring) = from_keyring.as_mut() {
@@ -1322,7 +1322,7 @@ where
                 zeroize_stored_creds(keyring);
                 return Err(error).context("rebuilding native credential projection from keyring");
             }
-            tracing::warn!(credential_error = %file_error, "rebuilt torn native credential projection from the complete keyring record");
+            tracing::warn!(error = %file_error, "rebuilt torn native credential projection from the complete keyring record");
             Ok(from_keyring.expect("validated complete keyring record remains present"))
         }
     }
@@ -1419,7 +1419,7 @@ where
     match policy {
         BackendPolicy::UnixCompleteFile => {
             if let Err(error) = set_keyring(creds) {
-                tracing::warn!(credential_error = %error, "keyring write failed; committing the complete Unix file fallback");
+                tracing::warn!(error = %error, "keyring write failed; committing the complete Unix file fallback");
             }
             save_file(creds)
         }
@@ -1857,9 +1857,8 @@ fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     // of StoredCreds, while an older raw daemon token remains supported. The
     // next save upgrades either form to a complete versioned record.
     if value.trim_start().starts_with('{') {
-        let mut creds: StoredCreds = serde_json::from_str(value)
-            .map_err(CredentialParseError::from)
-            .context("parsing keyring credential record")?;
+        let mut creds: StoredCreds =
+            serde_json::from_str(value).context("parsing keyring credential record")?;
         if let Err(error) = validate_loaded_creds(&creds) {
             zeroize_stored_creds(&mut creds);
             return Err(error);
@@ -1970,31 +1969,11 @@ fn load_file_at(path: &Path) -> Result<StoredCreds> {
     Ok(load_file_record_at(path)?.unwrap_or_default())
 }
 
-// A serde error can quote a value from the credential file or keyring. Keep
-// classification and position, never the original error or its source chain.
-#[derive(Debug, thiserror::Error)]
-#[error("credential JSON {category:?} error at line {line}, column {column}")]
-struct CredentialParseError {
-    category: serde_json::error::Category,
-    line: usize,
-    column: usize,
-}
-
-impl From<serde_json::Error> for CredentialParseError {
-    fn from(error: serde_json::Error) -> Self {
-        Self {
-            category: error.classify(),
-            line: error.line(),
-            column: error.column(),
-        }
-    }
-}
-
 fn load_file_record_at(path: &Path) -> Result<Option<StoredCreds>> {
     let Some(mut raw) = read_credentials_file(path)? else {
         return Ok(None);
     };
-    let parsed = serde_json::from_slice(&raw).map_err(CredentialParseError::from);
+    let parsed = serde_json::from_slice(&raw);
     raw.zeroize();
     let mut creds: StoredCreds = parsed.with_context(|| format!("parsing {}", path.display()))?;
     if let Err(error) = validate_loaded_creds(&creds) {
@@ -3613,36 +3592,13 @@ mod tests {
     }
 
     #[test]
-    fn credential_parse_errors_never_quote_file_or_keyring_values() {
-        let canary = crate::support_log::capture::canary();
-        let raw = format!(r#"{{"credential_generation":"{canary}"}}"#);
-        assert!(serde_json::from_str::<StoredCreds>(&raw)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains(&canary));
-        let tmp = tempfile::tempdir().unwrap();
-        secure_test_credential_dir(tmp.path());
-        let path = tmp.path().join("credentials.json");
-        write_secure(&path, raw.as_bytes()).unwrap();
-        for error in [
-            load_file_record_at(&path).err().unwrap(),
-            decode_keyring_value(&raw).err().unwrap(),
-        ] {
-            let text = format!("{error:#}");
-            assert!(text.contains("Data error at line 1, column"));
-            crate::support_log::capture::assert_absent(&text, &canary, "credential error chain");
-        }
-    }
-
-    #[test]
     fn native_projection_recovers_only_truncation_from_complete_keyring() {
         use std::cell::{Cell, RefCell};
 
         fn parse_error(json: &str) -> anyhow::Error {
             match serde_json::from_str::<StoredCreds>(json) {
                 Ok(_) => panic!("fixture must be invalid"),
-                Err(error) => CredentialParseError::from(error).into(),
+                Err(error) => error.into(),
             }
         }
 

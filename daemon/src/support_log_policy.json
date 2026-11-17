@@ -1,0 +1,616 @@
+{
+  "fields": {
+    "READ_IDLE_TIMEOUT": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "acknowledged": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "active": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "adopted": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "after": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "agent": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "agent_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "anchors": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "before": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "bound": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "buffered": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "carried": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "chained": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "claimed_browser_fingerprint": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "class": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "negotiation",
+        "unauthorized",
+        "protocol_required",
+        "handshake",
+        "dns",
+        "tcp",
+        "tls",
+        "timeout"
+      ]
+    },
+    "cleanup_pending": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "code": {
+      "kind": "scalar",
+      "why": "Only numeric visitor values pass; peer strings and paths under this ambiguous name are withheld."
+    },
+    "codex_home": {
+      "kind": "text",
+      "why": "Window Codex home directory from the local home plan; bound and sanitise the path."
+    },
+    "cols": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "column": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "count": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "current": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "daemon_pid": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "deadline_secs": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "delay": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "dir": {
+      "kind": "text",
+      "why": "Local instance configuration directory in deregistration diagnostics; bound and sanitise the path."
+    },
+    "effect_valid": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "elapsed_secs": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "endpoint": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "error": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "exit_code": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "frame_type": {
+      "kind": "scalar",
+      "why": "Only numeric visitor values pass; peer strings and paths under this ambiguous name are withheld."
+    },
+    "generation": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "hard": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "held_back": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "held_secs": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "history_anchor": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "holder": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "host_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "instance": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "interval": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "label": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "launch": {
+      "kind": "text",
+      "why": "Local immutable-release executable path, not release.json contents; bound and sanitise the path."
+    },
+    "length": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "limit": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "the check's deadline",
+        "the probe's own timeout"
+      ]
+    },
+    "line": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "lines": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "local_protocol": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "udp",
+        "tcp"
+      ]
+    },
+    "local_type": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "host",
+        "srflx",
+        "prflx",
+        "relay",
+        "Unspecified"
+      ]
+    },
+    "max": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "mode": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "name": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "operation": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "history",
+        "snapshot",
+        "resize",
+        "scroll",
+        "redraw",
+        "upload_start",
+        "upload_cancel",
+        "take_control",
+        "focus_view",
+        "history_subscribe"
+      ]
+    },
+    "parsed_edges": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "path": {
+      "kind": "text",
+      "why": "Local home/config mirror, replay-dump or update filesystem path; bound and sanitise the path."
+    },
+    "payload_len": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "pending_secs": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "permissions": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "phase": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "closing_peers",
+        "peers_closed",
+        "sending_term",
+        "term_completed",
+        "sending_kill",
+        "kill_completed",
+        "worker_exit_timeout",
+        "launching_replacement",
+        "before_launch",
+        "child_running",
+        "update_wait",
+        "restart_backoff"
+      ]
+    },
+    "pid": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "probe": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "pty_offset": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "reason": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "worker replay barrier failed",
+        "unspecified",
+        "revoked-pinned-key",
+        "no-account-anchor",
+        "no-carried-endorsements",
+        "carried-endorsements-over-cap",
+        "no-host-identity",
+        "bad-host-key",
+        "unreadable-envelope-sender",
+        "envelope-verification-failed",
+        "no-valid-chain",
+        "daemon_exit_zero",
+        "update_wait_timeout",
+        "registration_unreadable",
+        "registration_changed",
+        "registration_removed",
+        "never connected",
+        "failed",
+        "stayed disconnected",
+        "data channel acceptor ended",
+        "spawn.pty and spawn.ctl are both required",
+        "worker replay is unavailable",
+        "worker live-stream barrier timed out"
+      ]
+    },
+    "refreshed": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "refused": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "reinstall": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "release": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "remote_protocol": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "udp",
+        "tcp"
+      ]
+    },
+    "remote_type": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "host",
+        "srflx",
+        "prflx",
+        "relay",
+        "Unspecified"
+      ]
+    },
+    "removed": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "replay_bytes": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "requests": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "resized_since": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "role": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "daemon",
+        "watchdog",
+        "update_handoff"
+      ]
+    },
+    "rows": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "running_at_once": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "scope": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "host",
+        "session",
+        "Host",
+        "Session"
+      ]
+    },
+    "scope_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "scope_type": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "host",
+        "session",
+        "Host",
+        "Session"
+      ]
+    },
+    "send_viewer_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "sender": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "session_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "shell": {
+      "kind": "text",
+      "why": "Local shell executable path, never its arguments or probe output; bound and sanitise the path."
+    },
+    "signal": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "signal_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "source_offset": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "stage": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "download",
+        "verify",
+        "swap",
+        "exec",
+        "health",
+        "precondition"
+      ]
+    },
+    "state": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "awaiting_start",
+        "running",
+        "exited"
+      ]
+    },
+    "status": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "new",
+        "connecting",
+        "connected",
+        "disconnected",
+        "failed",
+        "closed",
+        "unavailable"
+      ]
+    },
+    "success": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "target": {
+      "kind": "scalar",
+      "why": "Only numeric visitor values pass; peer strings and paths under this ambiguous name are withheld."
+    },
+    "timeout_ms": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "transport_pending": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "truncated": {
+      "kind": "scalar",
+      "why": "Local boolean or numeric state; only scalar visitor values pass."
+    },
+    "udp_port_max": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "udp_port_min": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "unit": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "utf8_error": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "variant": {
+      "kind": "choice",
+      "why": "Only these enum/static values pass; all other text is withheld.",
+      "values": [
+        "release",
+        "diagnostics"
+      ]
+    },
+    "version": {
+      "kind": "version",
+      "why": "Build version; numeric dotted core with bounded ASCII semver suffix, then sanitised."
+    },
+    "viewer_id": {
+      "kind": "id",
+      "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "wait": {
+      "kind": "choice",
+      "why": "Only the two static replay wait phases pass.",
+      "values": [
+        "worker_reply",
+        "live_stream"
+      ]
+    },
+    "waited_secs": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "waiting": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    },
+    "watchdog_pid": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "watermark": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "weight": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "worker_pid": {
+      "kind": "scalar",
+      "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
+    },
+    "ws_url": {
+      "kind": "withheld",
+      "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
+    }
+  },
+  "error_sites": [
+    {
+      "target": "spawnd::worker_backend",
+      "file": "src/worker_backend.rs",
+      "line": 735,
+      "field": "error",
+      "source": "tracing::debug!(%session_id, error = %message, \"worker error\")",
+      "why": "Only the unreadable_history branch: local worker segment-path/OS-not-found or fixed disabled-history explanation. Other frame causes use the unlisted WARN callsite."
+    },
+    {
+      "target": "spawnd::pty",
+      "file": "src/pty.rs",
+      "line": 1225,
+      "field": "reason",
+      "source": "tracing::warn!(\n                %session_id,\n                reason = %error,\n                \"session history truncated: older scrollback is gone from disk; viewers get the newest history still readable\"\n            )",
+      "why": "ViewerHistory::report is called only after unreadable_history classifies a local worker missing segment or disabled history; preserves the path and OS error at WARN and subsequent DEBUG."
+    },
+    {
+      "target": "spawnd::pty",
+      "file": "src/pty.rs",
+      "line": 1230,
+      "field": "reason",
+      "source": "tracing::warn!(\n                %session_id,\n                reason = %error,\n                \"session history unreadable: viewers open on the live terminal with no history\"\n            )",
+      "why": "ViewerHistory::report is called only after unreadable_history classifies a local worker missing segment or disabled history; preserves the path and OS error at WARN and subsequent DEBUG."
+    },
+    {
+      "target": "spawnd::pty",
+      "file": "src/pty.rs",
+      "line": 1236,
+      "field": "reason",
+      "source": "tracing::debug!(%session_id, reason = %error, truncated, \"session history still degraded\")",
+      "why": "ViewerHistory::report is called only after unreadable_history classifies a local worker missing segment or disabled history; preserves the path and OS error at WARN and subsequent DEBUG."
+    },
+    {
+      "target": "spawnd::rtc",
+      "file": "src/rtc.rs",
+      "line": 4850,
+      "field": "error",
+      "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
+      "why": "Direct tokio::fs::write io::Error, not a parser or a worker spawn error; path is a separate allowed field."
+    }
+  ]
+}

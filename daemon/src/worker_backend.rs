@@ -728,6 +728,16 @@ fn fail_pending_replays(pending: &PendingReplays) {
     }
 }
 
+// Keep the worker's full cause on stderr. Only the history branch is admitted
+// by the support policy; other frame errors may contain commands or JSON values.
+pub(crate) fn log_worker_error(session_id: Uuid, message: &str) {
+    if pty::unreadable_history(message).is_some() {
+        tracing::debug!(%session_id, error = %message, "worker error");
+    } else {
+        tracing::warn!(%session_id, error = %message, "worker error");
+    }
+}
+
 /// framed reads → outbox (output), replay responses, exit report.
 async fn run_reader(
     mut read_half: endpoint::SupervisorReadHalf,
@@ -844,11 +854,7 @@ async fn run_reader(
                     // History the worker can no longer read is reported once
                     // per session by the viewer replay that works around it
                     // (`SessionHandle::viewer_replay`), not on every request.
-                    if pty::unreadable_history(&err.message).is_some() {
-                        tracing::debug!(%session_id, message = %err.message, "worker error");
-                    } else {
-                        tracing::warn!(%session_id, message = %err.message, "worker error");
-                    }
+                    log_worker_error(session_id, &err.message);
                     if let Some(waiter) = pending.lock().expect("pending lock").pop_front() {
                         let _ = waiter.send(Err(anyhow::Error::new(
                             pty::WorkerReplayRefused::new(err.message),

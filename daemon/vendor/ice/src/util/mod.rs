@@ -33,7 +33,12 @@ pub fn assert_inbound_username(m: &Message, expected_username: &str) -> Result<(
     username.get_from(m)?;
 
     if username.to_string() != expected_username {
-        return Err(Error::ErrMismatchUsername);
+        return Err(Error::Other(format!(
+            "{:?} expected({}) actual({})",
+            Error::ErrMismatchUsername,
+            expected_username,
+            username,
+        )));
     }
 
     Ok(())

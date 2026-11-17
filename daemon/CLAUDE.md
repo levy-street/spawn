@@ -66,7 +66,8 @@ src/
                  (`Ui`), panels, logo, and the single-line `Spinner`
   support_log.rs the support log: a second, bounded, sanitised record the
                  daemon writes for itself — see "The support log"; its tests
-                 live in support_log_tests.rs
+                 live in support_log_tests.rs; support_log_policy.json is the single
+                 field/error admission policy shared with the guard
   state.rs       atomic local daemon heartbeat contract (`state.json`)
   status.rs      human/JSON status across local account instances, each
                  described by the daemon running for it, never by the command
@@ -581,12 +582,14 @@ fsync, and the offer path waits on the locks it would run under.
 collection or transmission; the device-signed consent and collection path come
 later. `spawnd status` names its file.
 
-- **Storage.** `support/support-v2.jsonl` and `support-v2.jsonl.1` under the
+- **Storage.** `support/support-v3.jsonl` and `support-v3.jsonl.1` under the
   instance log directory, rotated at 4 MiB each. These two names occupy at most
   8 MiB; a reader holding a replaced file can retain additional disk storage.
-  Startup unlinks the unversioned legacy pair under the rotation lock. An older
-  overlapping process cannot write into the versioned pair. `reset` and
-  `exorcise` remove the folder.
+  Startup tries the rotation lock once without waiting. If busy, startup
+  continues without a support log. With the lock held it unlinks both the
+  unversioned and v2 pairs, including links without following them. Only v3 is
+  read or written; older overlapping processes cannot contaminate that pair.
+  `reset` and `exorcise` remove the folder.
 - **Directories.** On Unix, `platform::open_support_dir` opens the immediate
   parent with `O_NOFOLLOW`, verifies its owner and that group/others cannot
   write it, then creates/opens the support leaf relative to that handle with
@@ -600,23 +603,54 @@ later. `spawnd status` names its file.
   repaired by this support-folder opener. The same ancestor trust applies.
 - **Filtering.** Only `run` and `login` install the layer; workers do not.
   The stderr formatter retains its formatting options and per-layer
-  `RUST_LOG`/verbosity filter, but byte-for-byte equivalence is not claimed
-  (individual unsafe statements have changed). The support layer admits
+  `RUST_LOG`/verbosity filter. The support layer admits
   `spawnd` INFO, diagnostics DEBUG, and foreign WARN, events only. A restrictive
   `RUST_LOG` does not reduce this: the second layer can raise the daemon-wide
   maximum level, causing additional event arguments to be evaluated.
-- **Contents.** Each JSON event has `{t, level, target, at, msg, fields}`.
-  Withheld names and their `_`/`.` parts apply to every type, including numbers
-  and booleans, without formatting; byte slices are always withheld. Counters
-  use explicit safe names such as `replay_size`, `count` and `length`.
-  Other strings lose controls and undergo heuristic redaction of Bearer/JWT,
-  long mixed-case base64, secret-looking assignments, URL userinfo and entire
-  queries/fragments, and common join-panic renderings. This is a backstop, not
-  proof that arbitrary text is safe: it misses ordinary short secrets and can
-  over-redact mixed-case paths. Content-bearing errors and peer strings must
-  be withheld at their source. The panic hook records location and thread
-  name, skips recording during a support-layer failure, and chains the existing
-  local hook; it does not record the payload.
+- **Contents.** Third-party events retain exactly `{t, level, target, at}`;
+  their message and fields are never visited for content. `at` is the source
+  file and line, including normalized source locations from the `log` bridge.
+  Native `spawnd` events also have `fields`, but **no event message text**.
+  `tracing` passes `fmt::Arguments` through `Visit::record_debug` as `&dyn Debug`;
+  that interface cannot expose `as_str()` or safely downcast, and metadata has
+  no message literal. Comparing rendered strings cannot prove provenance.
+  The strict fallback therefore drops static and dynamic messages alike,
+  including explicit `message` fields and messages delivered through other
+  visitor methods. Fixed internal dropped-event and panic markers have their
+  own constant messages. Bridged `log` records retain metadata only, even
+  when they name a `spawnd` target.
+- **Admission policy.** `src/support_log_policy.json` is the only field and
+  error-callsite list. Each field has a decision and type/origin justification.
+  Unknown names and `withheld` entries become `<withheld>` for every type,
+  without formatting. `scalar` admits only numeric/boolean visitor values;
+  formatting a number with `?` or `%` does not admit it as a scalar. `id` checks
+  UUID/hex components, `version` checks a bounded dotted numeric version with
+  an ASCII suffix, and `choice` checks explicitly listed enum/static values.
+  `text` is reserved for reviewed local filesystem path fields. Byte slices
+  are always withheld. `error` defaults to withheld; exact target/file/line
+  exceptions retain the worker's classified missing-history error, the three
+  history report callsites (`reason`), and the direct replay-dump filesystem
+  write error. Credential/keyring JSON, Codex TOML, manifest, SDP/candidate,
+  STUN/TURN and general worker-start errors have no text exception.
+  `reason="worker replay barrier failed"` is an admitted fixed choice.
+  Allowed text still passes through bounded control stripping and heuristic
+  Bearer/JWT, token-shape, URL userinfo/query/fragment and panic redaction.
+  This second defence misses ordinary short secrets and can over-redact paths;
+  it is not the admission rule. The panic hook records location and the
+  runtime thread ID, never the payload or caller-supplied thread name, then
+  chains the existing local hook. It skips support recording during a
+  support-layer failure.
+- **Changing the policy.** Read every use and value origin before adding a
+  field, choose the narrowest rule, and put its justification in the JSON.
+  For an error exception, review the whole error chain and add its exact
+  target, source file, line, field, full tracing statement and origin note.
+  A moved/changed listed statement requires reviewing/updating that entry.
+  A new field or error callsite is withheld until admitted explicitly. Do not
+  rename a sensitive field to an admitted path name. The guard checks policy
+  shape, exact error callsites, message exclusion, foreign-event visitation,
+  scalar/text gates, nonblocking startup and deletion-only legacy names.
+  Its mutation self-tests exercise those refusals. It is a literal source
+  guard, not data-flow analysis; origin justifications still need review.
 - **Work and failures.** Strings are bounded before copying/scanning (2 KiB
   raw, incomplete trailing token discarded), then capped at 512 characters.
   At most 16 fields are formatted/retained and an event is capped at 2 KiB. Queue slots
@@ -638,23 +672,25 @@ later. `spawnd status` names its file.
 The content-handling modules (`host_files.rs`, `host_control.rs`,
 `host_preview.rs`, `upload.rs`, `host_transcripts.rs`, `activity.rs`,
 `sessions.rs`, `sessiond/emulator.rs`, `sessiond/scrollback.rs`) make no
-tracing calls. Anything carrying terminal/input/file/clipboard content,
-command arguments, environment values or credentials uses withheld fields
-or is not logged. Credential JSON errors retain category and position only;
-worker start/shutdown errors forwarded to the supervisor retain a fixed
-category and an OS code when available. The vendored SCTP panic statement
-omits the payload; ICE username errors omit credentials, and candidate
-warnings use parsed socket addresses instead of peer-supplied strings.
+tracing calls. Ordinary stderr retains worker frame causes, channel labels,
+credential/JSON explanations and the original vendored diagnostics. The
+Codex TOML parser alone keeps category/location instead of the source line:
+that protects the ordinary local log too. Vendor crates have no support-log
+patches.
 
 Canaries use short punctuated markers asserted to survive `sanitize`, with
 negative controls that deliberately log string, lossy string, hex, base64 and
-decimal byte Debug forms and require detection. The real worker test types,
-echoes and replays its marker, enabling the replay dump in diagnostics builds;
+decimal byte Debug forms through an admitted path field and require detection.
+Construction tests put those markers in dynamic messages, unknown fields,
+third-party WARNs and unlisted errors; they also require rejected formatters
+never to run, unknown numeric/boolean values to be withheld, and stderr to
+retain its original detail. Real history report/worker error callsites retain
+missing-segment paths and OS errors. The real worker canary types, echoes and
+replays its marker, enabling the replay dump in diagnostics builds;
 Codex-config and panic tests use the same detector. Global tracing/capture
 still shares the test process. `scripts/check-support-log.sh --self-test`
-pins filenames, no folder listing/content-path reads, fixed filters and the
-absence of tracing in content modules; it is a textual guard, not data-flow
-analysis.
+also pins filenames, no folder listing/content-path reads, fixed filters and
+the absence of tracing in content modules.
 
 ## A skilled window's home
 

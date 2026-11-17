@@ -37,9 +37,3 @@ arguments so the vendored crate passes the workspace's current Clippy gate.
 Clippy flags the `#[must_use]` that `async_trait` adds to every boxed future
 it generates, which would fail the workspace Clippy gate; the allowance
 changes no code.
-
-Support-log safety: `util::assert_inbound_username` returns the fixed mismatch
-category, never expected/received ICE usernames. The agent logs a fixed invalid
-username category, and its candidate close/inbound-build warnings use parsed
-socket addresses rather than candidate Display text. The username regression
-checks that the returned error contains neither credential fragment.

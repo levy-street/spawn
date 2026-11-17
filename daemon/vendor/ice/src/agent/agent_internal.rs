@@ -664,7 +664,7 @@ impl AgentInternal {
                         log::warn!(
                             "[{}]: Failed to close candidate {}: {}",
                             self.get_name(),
-                            c.addr(),
+                            c,
                             err
                         );
                     }
@@ -681,7 +681,7 @@ impl AgentInternal {
                         log::warn!(
                             "[{}]: Failed to close candidate {}: {}",
                             self.get_name(),
-                            c.addr(),
+                            c,
                             err
                         );
                     }
@@ -766,8 +766,8 @@ impl AgentInternal {
             log::warn!(
                 "[{}]: Failed to handle inbound ICE from: {} to: {} error: {}",
                 self.get_name(),
-                local.addr(),
-                remote.addr(),
+                local,
+                remote,
                 err
             );
         } else {
@@ -903,11 +903,12 @@ impl AgentInternal {
                 let ufrag_pwd = self.ufrag_pwd.lock().await;
                 let username =
                     ufrag_pwd.local_ufrag.clone() + ":" + ufrag_pwd.remote_ufrag.as_str();
-                if assert_inbound_username(m, &username).is_err() {
+                if let Err(err) = assert_inbound_username(m, &username) {
                     log::warn!(
-                        "[{}]: discard message from ({}): invalid STUN username",
+                        "[{}]: discard message from ({}), {}",
                         self.get_name(),
-                        remote
+                        remote,
+                        err
                     );
                     return;
                 } else if let Err(err) =

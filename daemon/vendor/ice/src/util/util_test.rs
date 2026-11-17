@@ -29,17 +29,3 @@ async fn test_local_interfaces() -> Result<()> {
     );
     Ok(())
 }
-
-#[test]
-fn username_mismatch_never_returns_credentials() {
-    let mut message = Message::new();
-    message
-        .build(&[Box::new(Username::new(
-            ATTR_USERNAME,
-            "peer!private".into(),
-        ))])
-        .unwrap();
-    let error = assert_inbound_username(&message, "local!private").unwrap_err();
-    assert_eq!(error, Error::ErrMismatchUsername);
-    assert!(!format!("{error:?}").contains("private"));
-}
