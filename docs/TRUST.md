@@ -250,6 +250,11 @@ folder, and never reads ordinary daemon output or terminal storage. A typed
 header adds only the documented state counters, classified error kind/time and
 parsed build identity; it never adds general state-file text.
 
+The support log route is the only route where the server accepts a body from a
+machine for storage, and it carries only the bundle described above.
+`scripts/check-no-server-agent-upload.sh` names it as the single exception to
+the rule that keeps agent upload routes off the server.
+
 The owner decides through a statement signed by an approved device. Each host
 requires an account proven by its own retained device approvals; a server-named
 account never enables support sharing. Unknown account disables sharing until

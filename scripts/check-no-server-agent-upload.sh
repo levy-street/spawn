@@ -723,12 +723,22 @@ run_guard() {
     return 1
   fi
 
+  # This route stores only the machine's own support log with the owner's
+  # signed consent. Files sent to an agent never use it. Review docs/TRUST.md
+  # before widening this allowance.
+  local support_log_file="server/spawn_server/routes/support_log.py"
+  local support_log_route='@router.post("/uploads/{request_id}", status_code=204)'
+  required_exact_line_once "$support_log_file" "$support_log_route" || return 1
+
   local matches match rejected=""
   matches="$(rg_matches \
     'bytes_b64|\bAgentUpload\b|UploadResolution|request_upload|resolve_upload|agent\.upload(ed)?|upload\.(saved|error|legacy)|@router\.(post|put|patch)[^\n]*upload|/[{]?agent[^"]*/upload' \
     "${server[@]}")" || return $?
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
+    if [[ "${match%%:*}" == "$support_log_file" && "${match#*:*:}" == "$support_log_route" ]]; then
+      continue
+    fi
     allowed_server_sentinel "$match" || rejected+="$match"$'\n'
   done <<<"$matches"
   if [[ -n "$rejected" ]]; then
@@ -795,6 +805,9 @@ self_test() {
     "$fixture/web/src/lib"
   git -C "$fixture" init -q
   printf '%s\n' 'pass' >"$fixture/server/spawn_server/routes/agents.py"
+  local support_log_file="server/spawn_server/routes/support_log.py"
+  local support_log_route='@router.post("/uploads/{request_id}", status_code=204)'
+  cp "$source_root/$support_log_file" "$fixture/$support_log_file"
   printf '%s\n' \
     'if ftype == "upload":' \
     '    log.warning("retired server-visible agent upload frame; closing")' \
@@ -863,6 +876,7 @@ self_test() {
 
   local cases=(
     'server/spawn_server/routes/new.py|@router.post("/{agent_id}/upload")'
+    "server/spawn_server/routes/new.py|$support_log_route"
     'server/spawn_server/ws/new.py|if frame["type"] == "agent.upload": pass'
     'server/spawn_server/broker_moved.py|request_upload(frame)'
     'server/spawn_server/schema_moved.py|class AgentUpload: pass'
@@ -888,6 +902,25 @@ self_test() {
     fi
     rm "$fixture/$path"
   done
+
+  local extra_route
+  for extra_route in '@router.post("/uploads/extra", status_code=204)' "$support_log_route"; do
+    printf '%s\n' "$extra_route" >>"$fixture/$support_log_file"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: reused support log allowance passed: %s\n' "$extra_route" >&2
+      return 1
+    fi
+    cp "$source_root/$support_log_file" "$fixture/$support_log_file"
+  done
+
+  sed 's|^@router\.post("/uploads/|@router.put("/uploads/|' \
+    "$source_root/$support_log_file" >"$fixture/$support_log_file"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' "no-server-agent-upload self-test: changed support log decorator passed" >&2
+    return 1
+  fi
+  cp "$source_root/$support_log_file" "$fixture/$support_log_file"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   local rtc_original
   rtc_original="$(<"$fixture/daemon/src/rtc.rs")"
