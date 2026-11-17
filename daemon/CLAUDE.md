@@ -67,7 +67,8 @@ src/
   support_log.rs the support log: a second, bounded, sanitised record the
                  daemon writes for itself — see "The support log"; its tests
                  live in support_log_tests.rs; support_log_policy.json is the single
-                 field/error admission policy shared with the guard
+                 field/error admission policy and reviewed path-site inventory
+                 shared with the guard
   state.rs       atomic local daemon heartbeat contract (`state.json`)
   status.rs      human/JSON status across local account instances, each
                  described by the daemon running for it, never by the command
@@ -607,7 +608,11 @@ later. `spawnd status` names its file.
   `spawnd` INFO, diagnostics DEBUG, and foreign WARN, events only. A restrictive
   `RUST_LOG` does not reduce this: the second layer can raise the daemon-wide
   maximum level, causing additional event arguments to be evaluated.
-- **Contents.** Third-party events retain exactly `{t, level, target, at}`;
+- **Contents.** Every record, including foreign events and internal markers,
+  carries `build="<compiled version>/<daemon tree>"`: the producer's exact
+  `version::BUILD_VERSION` and `DAEMON_TREE`, including variant/dirty suffixes.
+  These are the CLI/release identities, not the reader's build. Third-party
+  events retain exactly `{t, build, level, target, at}`;
   their message and fields are never visited for content. `at` is the source
   file and line, including normalized source locations from the `log` bridge.
   Native `spawnd` events also have `fields`, but **no event message text**.
@@ -645,10 +650,17 @@ later. `spawnd status` names its file.
   For an error exception, review the whole error chain and add its exact
   target, source file, line, field, full tracing statement and origin note.
   A moved/changed listed statement requires reviewing/updating that entry.
+  For `path`, `dir`, `launch`, `shell` and `codex_home`, also review the value's
+  origin and list its file, line, field and full statement in `path_sites`.
   A new field or error callsite is withheld until admitted explicitly. Do not
-  rename a sensitive field to an admitted path name. The guard checks policy
-  shape, exact error callsites, message exclusion, foreign-event visitation,
-  scalar/text gates, nonblocking startup and deletion-only legacy names.
+  rename a sensitive field to an admitted path name. The guard inventories
+  production tracing fields (including shorthand/imported macros and all
+  platform branches), requiring a policy decision for each and an exact
+  reviewed path callsite. Explicit test items and the two separate test
+  modules are excluded; unsupported tracing syntax needs guard review.
+  It also checks policy shape, exact error callsites, message exclusion,
+  foreign-event visitation, scalar/text gates, nonblocking startup and
+  deletion-only legacy names.
   Its mutation self-tests exercise those refusals. It is a literal source
   guard, not data-flow analysis; origin justifications still need review.
 - **Work and failures.** Strings are bounded before copying/scanning (2 KiB
@@ -656,6 +668,8 @@ later. `spawnd status` names its file.
   At most 16 fields are formatted/retained and an event is capped at 2 KiB. Queue slots
   are reserved before formatting; a full queue drops/counts without visiting
   fields. The layer catches/counts unwinding panics, including from formatters.
+  A malformed embedded policy is cached as an empty policy: all fields are
+  withheld, with one fixed internal error marker and no parse retry or panic.
   Formatting output is bounded, but arbitrary `Debug` code can still compute
   or allocate before writing; aborts/OOM are not recoverable unwind failures.
   A dedicated writer holds the cross-process lock for append/rotation. Failed
@@ -668,6 +682,8 @@ later. `spawnd status` names its file.
   with leaf links refused, and never lists the folder. It is not yet a flushed
   snapshot: Windows reads through the writer, concurrent rotation/read tests,
   ordering semantics and a total collection cap remain collection work.
+  The header's `reader_version`/`reader_variant` describe the reader only;
+  each line's `build` identifies its producer even across overlapping updates.
 
 The content-handling modules (`host_files.rs`, `host_control.rs`,
 `host_preview.rs`, `upload.rs`, `host_transcripts.rs`, `activity.rs`,

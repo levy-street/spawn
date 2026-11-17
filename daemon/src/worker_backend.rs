@@ -734,7 +734,7 @@ pub(crate) fn log_worker_error(session_id: Uuid, message: &str) {
     if pty::unreadable_history(message).is_some() {
         tracing::debug!(%session_id, error = %message, "worker error");
     } else {
-        tracing::warn!(%session_id, error = %message, "worker error");
+        tracing::warn!(%session_id, message = %message, "worker error");
     }
 }
 

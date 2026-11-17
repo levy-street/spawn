@@ -20,9 +20,11 @@
 #      calls at all, so nothing they hold can become an event.
 #   6. Field rules come from one policy, errors require exact reviewed
 #      callsites, messages are omitted and foreign values are never visited.
+#   7. Every production tracing field has a policy decision. Filesystem path
+#      fields additionally require an exact reviewed statement and location.
 #
-# Deliberately a literal-source check, per docs/GUARD_POLICY.md: it greps for
-# code markers on non-comment lines, never prose.
+# Deliberately a literal-source check, per docs/GUARD_POLICY.md: code markers
+# and tracing token trees, never prose or value-origin inference.
 set -euo pipefail
 
 script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -134,7 +136,7 @@ def require(ok, message):
 source = Path("daemon/src/support_log.rs").read_text()
 policy = json.loads(Path("daemon/src/support_log_policy.json").read_text())
 require('include_str!("support_log_policy.json")' in source, "runtime must use the reviewed policy")
-require(set(policy) == {"fields", "error_sites"}, "unexpected policy section")
+require(set(policy) == {"fields", "error_sites", "path_sites"}, "unexpected policy section")
 for name, rule in policy["fields"].items():
     require(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name), "invalid field name")
     require(rule["kind"] in {"withheld", "scalar", "text", "id", "choice", "version"}, "unknown field rule")
@@ -154,6 +156,117 @@ for site in policy["error_sites"]:
     start = sum(len(line) for line in text.splitlines(keepends=True)[:site["line"] - 1])
     offset = text[start:].splitlines()[0].find("tracing::")
     require(offset >= 0 and text[start + offset:].startswith(site["source"]), f"review moved/changed error callsite {key}")
+
+# Inventory literal Rust token trees, not text inside comments or strings.
+# Keep all platform/feature branches; skip only explicit test items and the
+# two out-of-line test modules. Unknown tracing syntax fails for review.
+token = re.compile(r'\s+|//[^\n]*|/\*|(?:br|r)(?P<hashes>\#*)".*?"(?P=hashes)|b?"(?:\\.|[^"\\])*"|b?\'(?:\\.|[^\'\\])\'|(?:r\#)?[A-Za-z_][A-Za-z_0-9]*|::|.', re.S)
+macros = {"trace", "debug", "info", "warn", "error", "event", "span"}
+macros |= {name + "_span" for name in ("trace", "debug", "info", "warn", "error")}
+path_names = {"path", "dir", "launch", "shell", "codex_home"}
+
+def tokens(text):
+    result, pos = [], 0
+    while pos < len(text):
+        match = token.match(text, pos)
+        value, start = match.group(), pos
+        pos = match.end()
+        if value == "/*":
+            depth = 1
+            while depth:
+                comment = re.search(r'/\*|\*/', text[pos:])
+                require(comment is not None, "unterminated Rust comment")
+                depth += 1 if comment.group() == "/*" else -1
+                pos += comment.end()
+        elif not value.isspace() and not value.startswith("//"):
+            result.append((value, start, pos))
+    return result
+
+def inventory(text):
+    ts = tokens(text)
+    words = [t[0] for t in ts]
+    ends, stack = {}, []
+    for i, word in enumerate(words):
+        if word in {"(", "[", "{"}:
+            stack.append(i)
+        elif word in {")", "]", "}"}:
+            require(bool(stack), "unbalanced Rust token tree")
+            start = stack.pop()
+            require(words[start] + word in {"()", "[]", "{}"}, "mismatched Rust delimiters")
+            ends[start] = i
+    require(not stack, "unbalanced Rust token tree")
+
+    def args(start, end):
+        part, i = start, start
+        while i < end:
+            if words[i] == ",":
+                if part < i:
+                    yield words[part:i]
+                part = i + 1
+            i = ends[i] + 1 if i in ends else i + 1
+        if part < end:
+            yield words[part:end]
+
+    i = 0
+    while i < len(words):
+        if words[i:i+7] == ["#", "[", "cfg", "(", "test", ")", "]"] or words[i:i+4] == ["#", "[", "test", "]"]:
+            i = ends[i+1] + 1
+            # Attributes, signatures and initializers may contain token trees.
+            while i < len(words) and words[i] not in {"{", ";", ","}:
+                i = ends[i] + 1 if i in ends else i + 1
+            i = ends[i] + 1 if i in ends else i + 1
+            continue
+        if words[i:i+2] == ["use", "tracing"]:
+            end = words.index(";", i)
+            require("as" not in words[i:end], "tracing import aliases require guard support")
+        if words[i] not in macros or words[i+1:i+3] not in (["!", "("], ["!", "{"], ["!", "["]):
+            i += 1
+            continue
+        # Bare imported macros and tracing-qualified macros are covered.
+        if i >= 2 and words[i-1] == "::" and words[i-2] != "tracing":
+            i += 1
+            continue
+        start = i - 2 if i >= 2 and words[i-1] == "::" else i
+        end = ends[i+2]
+        fields = set()
+        span_name = words[i] == "span" or words[i].endswith("_span")
+        for arg in args(i+3, end):
+            if len(arg) > 1 and arg[1] == ":" and arg[0] in {"target", "parent", "name"}:
+                continue
+            if words[i] in {"event", "span"} and re.fullmatch(r'(?:tracing::)?Level::(?:TRACE|DEBUG|INFO|WARN|ERROR)', "".join(arg)):
+                continue
+            if re.match(r'^(?:r\#*)?"', arg[0]) and (len(arg) == 1 or arg[1] != "="):
+                if span_name:
+                    span_name = False
+                    continue
+                fields.add("message")
+                break  # Subsequent arguments belong to the format string.
+            field = re.match(r'^[%?]?([A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*)(?:=|$)', "".join(arg))
+            require(field is not None, "review unsupported tracing field syntax")
+            fields.add(field[1])
+        yield text.count("\n", 0, ts[start][1]) + 1, text[ts[start][1]:ts[end][2]], fields
+        i += 1  # Also inventory tracing calls nested inside field expressions.
+
+reviewed_paths = {}
+for site in policy["path_sites"]:
+    key = (site["file"], site["line"], site["field"])
+    require(key not in reviewed_paths, "duplicate path callsite")
+    require(site["field"] in path_names and bool(site.get("why")), "path callsite needs an origin review")
+    reviewed_paths[key] = site["source"]
+found_paths = {}
+for path in sorted(Path("daemon/src").rglob("*.rs")):
+    if path.name in {"support_log_tests.rs", "update_tests.rs"}:
+        continue  # Both are included only by #[cfg(test)] modules.
+    text = path.read_text()
+    for line, statement, fields in inventory(text):
+        missing = fields - policy["fields"].keys()
+        require(not missing, f"unreviewed tracing fields at {path}:{line}: {sorted(missing)}")
+        for field in fields & path_names:
+            key = (str(path.relative_to("daemon")), line, field)
+            require(reviewed_paths.get(key) == statement, f"review new/moved/changed path callsite {key}")
+            found_paths[key] = statement
+require(found_paths == reviewed_paths, "remove or review stale path callsites")
+
 # The only legacy-name occurrences are the deletion-only array.
 legacy = ['"support.jsonl"', '"support.jsonl.1"', '"support-v2.jsonl"', '"support-v2.jsonl.1"']
 cleanup = source.split('fn discard_legacy', 1)[1].split('/// Append', 1)[0]
@@ -187,13 +300,8 @@ self_test() {
   fixture="$(mktemp -d)"
   trap 'rm -rf "$fixture"' RETURN
 
-  mkdir -p "$fixture/daemon/src/sessiond"
-  for file in daemon/src/worker_backend.rs daemon/src/pty.rs daemon/src/rtc.rs; do
-    cp "$file" "$fixture/$file"
-  done
-  for file in "$MODULE" "$POLICY" "$MAIN" "${CONTENT_MODULES[@]}"; do
-    cp "$file" "$fixture/$file"
-  done
+  mkdir -p "$fixture/daemon"
+  cp -R daemon/src "$fixture/daemon/src"
   SUPPORT_LOG_GUARD_ROOT="$fixture" "$script_path" >/dev/null ||
     fail "self-test: an unmodified copy did not pass"
 
@@ -256,6 +364,21 @@ PY_REPLACE
   mutate_module '.try_lock()' '.lock()'
   expect_failure "blocking startup on the support lock"
 
+  printf '%s\n' 'tracing::warn!(new_support_field = 1, "inventory");' >>"$fixture/$MODULE"
+  expect_failure "a field without a policy decision"
+
+  printf '%s\n' 'warn!(' '    %new_support_field,' '    "inventory"' ');' >>"$fixture/$MODULE"
+  expect_failure "an imported multiline shorthand field without a decision"
+
+  printf '%s\n' 'tracing::warn!(count = { tracing::warn!(new_support_field = 1); 1 });' >>"$fixture/$MODULE"
+  expect_failure "an undecided field in a nested tracing call"
+
+  printf '%s\n' 'tracing::warn!(path = %value, "unreviewed path origin");' >>"$fixture/$MODULE"
+  expect_failure "a new callsite using a reviewed path name"
+
+  printf '%s\n' 'warn!(%shell, "unreviewed shell origin");' >>"$fixture/$MODULE"
+  expect_failure "an imported shorthand path callsite"
+
   local original_policy
   original_policy="$(cat "$fixture/$POLICY")"
   python3 -I - "$fixture/$POLICY" <<'PY_MUTATE'
@@ -268,6 +391,28 @@ path.write_text(json.dumps(policy))
 PY_MUTATE
   expect_failure "a stale error callsite entry"
   printf '%s\n' "$original_policy" >"$fixture/$POLICY"
+
+  python3 -I - "$fixture/$POLICY" <<'PY_MUTATE'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+policy = json.loads(path.read_text())
+policy["path_sites"][0]["line"] += 1
+path.write_text(json.dumps(policy))
+PY_MUTATE
+  expect_failure "a stale path callsite entry"
+  printf '%s\n' "$original_policy" >"$fixture/$POLICY"
+
+  # Strings/comments are not callsites; test-only unknown fields are deliberate.
+  cat >>"$fixture/$MODULE" <<'RUST'
+const DECOY: &str = r#"tracing::warn!(undecided_field = 1, path = value);"#;
+/* outer /* tracing::warn!(undecided_field = 1); */ comment */
+#[cfg(test)]
+fn inventory_fixture() { tracing::warn!(undecided_field = 1, path = value); }
+RUST
+  SUPPORT_LOG_GUARD_ROOT="$fixture" "$script_path" >/dev/null ||
+    fail "self-test: strings, comments or test-only fields entered the inventory"
+  printf '%s\n' "$original" >"$fixture/$MODULE"
 
   # A comment may name what the module avoids.
   printf '%s\n' '// never a read_dir, never a scrollback segment' >>"$fixture/$MODULE"

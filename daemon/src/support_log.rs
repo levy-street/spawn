@@ -82,10 +82,15 @@ const WITHHELD: &str = "<withheld>";
 const REDACTED: &str = "<redacted>";
 const DROPPED_TARGET: &str = "spawnd::support_log";
 const DROPPED_MESSAGE: &str = "support log events dropped";
+const BUILD_ID: &str = concat!(
+    env!("SPAWND_BUILD_VERSION"),
+    "/",
+    env!("SPAWND_DAEMON_TREE")
+);
 
 // One reviewed policy for both the runtime and scripts/check-support-log.sh.
 // Missing names, unknown kinds, changed callsites and message text fail closed.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct Policy {
     fields: std::collections::BTreeMap<String, FieldRule>,
     error_sites: Vec<ErrorSite>,
@@ -106,11 +111,26 @@ struct ErrorSite {
     field: String,
 }
 
-fn policy() -> &'static Policy {
+fn policy(log: &SupportLog) -> &'static Policy {
     static POLICY: OnceLock<Policy> = OnceLock::new();
-    POLICY.get_or_init(|| {
-        serde_json::from_str(include_str!("support_log_policy.json"))
-            .expect("support log policy is checked by the guard")
+    cached_policy(&POLICY, include_str!("support_log_policy.json"), log)
+}
+
+fn cached_policy<'a>(cache: &'a OnceLock<Policy>, source: &str, log: &SupportLog) -> &'a Policy {
+    cache.get_or_init(|| {
+        serde_json::from_str(source).unwrap_or_else(|_| {
+            // Cache the empty policy too. Never panic, retry parsing, or record
+            // the parser error (which can contain policy input) on later events.
+            log.push(render_line(
+                &now_rfc3339_millis(),
+                "ERROR",
+                DROPPED_TARGET,
+                "",
+                "support log policy invalid; all fields withheld",
+                Vec::new(),
+            ));
+            Policy::default()
+        })
     })
 }
 
@@ -295,7 +315,11 @@ impl SupportLog {
     where
         S: Subscriber,
     {
-        SupportLayer { log: self.clone() }.with_filter(SupportFilter)
+        SupportLayer {
+            log: self.clone(),
+            policy: policy(self),
+        }
+        .with_filter(SupportFilter)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -315,17 +339,20 @@ impl SupportLog {
         if self.inner.block_when_full {
             return Some(Permit(None));
         }
-        match self
-            .inner
-            .slots
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-        {
-            Ok(_) => Some(Permit(Some(Arc::clone(&self.inner.slots)))),
-            Err(_) => {
-                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                None
+        let mut slots = self.inner.slots.load(Ordering::Relaxed);
+        while let Some(remaining) = slots.checked_sub(1) {
+            match self.inner.slots.compare_exchange_weak(
+                slots,
+                remaining,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Permit(Some(Arc::clone(&self.inner.slots)))),
+                Err(actual) => slots = actual,
             }
         }
+        self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
     fn push(&self, line: Vec<u8>) {
@@ -407,6 +434,7 @@ impl SupportLog {
 /// filter; it re-checks the fixed rule on every event regardless.
 pub(crate) struct SupportLayer {
     log: SupportLog,
+    policy: &'static Policy,
 }
 
 impl<S> Layer<S> for SupportLayer
@@ -429,6 +457,7 @@ where
             // Log bridge normalization reads only its source metadata.
             let mut collector = Collector {
                 meta,
+                policy: self.policy,
                 fields: Vec::new(),
             };
             if is_spawnd(meta.target()) && normalized.is_none() {
@@ -464,6 +493,7 @@ enum FieldValue {
 
 struct Collector<'a> {
     meta: &'a Metadata<'a>,
+    policy: &'a Policy,
     fields: Vec<(&'static str, FieldValue)>,
 }
 
@@ -479,7 +509,7 @@ impl Collector<'_> {
     }
 
     fn error_allowed(&self, name: &str) -> bool {
-        policy().error_sites.iter().any(|site| {
+        self.policy.error_sites.iter().any(|site| {
             site.field == name
                 && site.target == self.meta.target()
                 && self.meta.file().map(Path::new) == Some(Path::new(&site.file))
@@ -489,7 +519,7 @@ impl Collector<'_> {
 
     fn text_allowed(&self, name: &str) -> bool {
         self.error_allowed(name)
-            || policy().fields.get(name).is_some_and(|rule| {
+            || self.policy.fields.get(name).is_some_and(|rule| {
                 matches!(rule.kind.as_str(), "text" | "id" | "choice" | "version")
             })
     }
@@ -498,7 +528,8 @@ impl Collector<'_> {
         // Validate before sanitising; a truncated value must not acquire a
         // permitted shape. Arbitrary text is admitted only by reviewed origin.
         let allowed = self.error_allowed(name)
-            || policy()
+            || self
+                .policy
                 .fields
                 .get(name)
                 .is_some_and(|rule| match rule.kind.as_str() {
@@ -549,7 +580,8 @@ impl Collector<'_> {
         if !self.keep(field) {
             return;
         }
-        let value = if policy()
+        let value = if self
+            .policy
             .fields
             .get(field.name())
             .is_some_and(|rule| rule.kind == "scalar")
@@ -1045,6 +1077,7 @@ impl Serialize for FieldsOut<'_> {
 #[derive(Serialize)]
 struct LineOut<'a> {
     t: &'a str,
+    build: &'static str,
     level: &'a str,
     target: &'a str,
     at: &'a str,
@@ -1072,6 +1105,7 @@ fn render_line(
     loop {
         let line = LineOut {
             t,
+            build: BUILD_ID,
             level,
             target,
             at,
@@ -1328,8 +1362,8 @@ fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
 pub(crate) struct BundleHeader {
     pub kind: &'static str,
     pub format: u32,
-    pub version: String,
-    pub variant: &'static str,
+    pub reader_version: String,
+    pub reader_variant: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
     pub instance: String,
@@ -1461,8 +1495,8 @@ pub(crate) fn read_window(
     let header = BundleHeader {
         kind: "spawnd-support-log",
         format: 2,
-        version: crate::version::build_version(),
-        variant: if crate::version::DIAGNOSTICS_BUILD {
+        reader_version: crate::version::build_version(),
+        reader_variant: if crate::version::DIAGNOSTICS_BUILD {
             "diagnostics"
         } else {
             "release"

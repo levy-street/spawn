@@ -122,20 +122,23 @@ async fn main() -> anyhow::Result<()> {
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
-            match login::run(cli.server.clone(), args).await {
-                Err(error) => Err(error),
-                Ok(_) if no_run => Ok(()),
-                Ok(_) => {
-                    tracing::info!("login complete; transitioning to run");
-                    run::run(
-                        cli.server.clone(),
-                        cli::RunArgs {
-                            background_service: false,
-                        },
-                    )
-                    .await
+            login::run(cli.server.clone(), args)
+                .await
+                .map_err(|error| flush_login_error(error, support.as_ref()))?;
+            if no_run {
+                if let Some(log) = &support {
+                    log.flush(std::time::Duration::from_millis(500));
                 }
+                return Ok(());
             }
+            tracing::info!("login complete; transitioning to run");
+            run::run(
+                cli.server.clone(),
+                cli::RunArgs {
+                    background_service: false,
+                },
+            )
+            .await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
         Command::BuildInfo => {
@@ -191,6 +194,34 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     result
+}
+
+// Login errors must return through main's Result, before the shared handlers:
+// cancellation is a failure and Rust prints the original error's Debug text.
+fn flush_login_error(
+    error: anyhow::Error,
+    support: Option<&support_log::SupportLog>,
+) -> anyhow::Error {
+    if let Some(log) = support {
+        log.flush(std::time::Duration::from_millis(500));
+    }
+    error
+}
+
+#[test]
+fn login_errors_keep_the_original_failure_status_and_stderr_text() {
+    use std::process::{ExitCode, Termination};
+
+    for error in [
+        anyhow::Error::from(login::LoginInterrupted),
+        login::user_error("approval refused"),
+        anyhow::anyhow!("connection failed").context("login failed"),
+    ] {
+        let original_text = format!("{error:?}");
+        let result: anyhow::Result<()> = Err(flush_login_error(error, None));
+        assert_eq!(format!("{:?}", result.as_ref().unwrap_err()), original_text);
+        assert_eq!(result.report(), ExitCode::FAILURE);
+    }
 }
 
 #[cfg(windows)]

@@ -9,7 +9,10 @@ fn read_lines(dir: &Path) -> Vec<serde_json::Value> {
     for name in [PREVIOUS, CURRENT] {
         if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
             for line in text.lines() {
-                lines.push(serde_json::from_str(line).expect("each line is JSON"));
+                let line: serde_json::Value =
+                    serde_json::from_str(line).expect("each line is JSON");
+                assert_eq!(line["build"], BUILD_ID);
+                lines.push(line);
             }
         }
     }
@@ -113,7 +116,7 @@ fn log_crate_records_are_capped_at_warn_by_their_own_target() {
     assert_eq!(lines[0]["target"], "webrtc_ice::agent");
     assert_eq!(lines[0]["at"], "src/agent/mod.rs:7");
     assert!(lines[0].get("fields").is_none());
-    assert_eq!(lines[0].as_object().unwrap().len(), 4);
+    assert_eq!(lines[0].as_object().unwrap().len(), 5);
 }
 
 #[test]
@@ -251,10 +254,54 @@ fn the_sanitizer_strips_controls_and_redacts_secrets() {
 
 #[test]
 fn unknown_names_and_error_sites_are_closed_by_default() {
-    assert!(!policy().fields.contains_key("future_field"));
-    assert_eq!(policy().fields["error"].kind, "withheld");
-    assert_eq!(policy().fields["session_id"].kind, "id");
-    assert_eq!(policy().fields["replay_bytes"].kind, "scalar");
+    let policy: Policy = serde_json::from_str(include_str!("support_log_policy.json")).unwrap();
+    assert!(!policy.fields.contains_key("future_field"));
+    assert_eq!(policy.fields["error"].kind, "withheld");
+    assert_eq!(policy.fields["session_id"].kind, "id");
+    assert_eq!(policy.fields["replay_bytes"].kind, "scalar");
+}
+
+#[test]
+fn invalid_policy_is_cached_closed_with_one_internal_marker() {
+    static CACHE: OnceLock<Policy> = OnceLock::new();
+    struct MustNotFormat;
+    impl fmt::Debug for MustNotFormat {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("invalid policy admitted a formatter");
+        }
+    }
+    let tmp = capture::private_tempdir();
+    let log = SupportLog::open_with(&tmp.path().join(DIR_NAME), 32, true).unwrap();
+    let closed = cached_policy(&CACHE, "malformed policy", &log);
+    // Even a later valid input cannot retry initialization or admit anything.
+    let again = cached_policy(&CACHE, include_str!("support_log_policy.json"), &log);
+    assert!(std::ptr::eq(closed, again));
+    assert!(closed.fields.is_empty() && closed.error_sites.is_empty());
+    let layer = SupportLayer {
+        log: log.clone(),
+        policy: closed,
+    };
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        tracing::warn!(path = ?MustNotFormat, count = 7, "first");
+        tracing::warn!(error = ?MustNotFormat, reason = ?MustNotFormat, "second");
+    });
+    assert!(log.flush(Duration::from_secs(10)));
+    assert_eq!(log.dropped(), 0);
+    let lines = read_lines(log.dir());
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[0]["msg"],
+        "support log policy invalid; all fields withheld"
+    );
+    assert_eq!(lines[0]["level"], "ERROR");
+    for line in &lines[1..] {
+        assert!(line.get("msg").is_none());
+        assert!(line["fields"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == WITHHELD));
+    }
 }
 
 #[test]
@@ -432,9 +479,10 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
     assert!(capped.lines.last().unwrap().contains("line-004099"));
     assert_eq!(capped.header.instance, "abcd1234");
     assert_eq!(capped.header.kind, "spawnd-support-log");
+    assert_eq!(capped.header.reader_version, crate::version::BUILD_VERSION);
     assert_eq!(capped.header.os, std::env::consts::OS);
     assert_eq!(
-        capped.header.variant,
+        capped.header.reader_variant,
         if crate::version::DIAGNOSTICS_BUILD {
             "diagnostics"
         } else {
@@ -444,6 +492,39 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
     // A missing folder is an empty bundle, not an error.
     let missing = read_window(&tmp.path().join("none"), "x", 0, i64::MAX, 1 << 20).unwrap();
     assert!(missing.lines.is_empty());
+}
+
+#[test]
+fn reader_preserves_each_producers_build_identity() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    let current = render_line(
+        "2026-01-01T00:00:00.000Z",
+        "INFO",
+        "spawnd",
+        "src/main.rs:1",
+        "",
+        Vec::new(),
+    );
+    let mut older: serde_json::Value = serde_json::from_slice(&current).unwrap();
+    older["build"] = "0.1.0+g000000000000/0000000000000000000000000000000000000000".into();
+    let mut older_bytes = serde_json::to_vec(&older).unwrap();
+    older_bytes.push(b'\n');
+    store.append(&older_bytes).unwrap();
+    store.append(&current).unwrap();
+    let bundle = read_window(&path, "", 0, i64::MAX, 4096).unwrap();
+    assert_eq!(bundle.lines.len(), 2);
+    let lines: Vec<serde_json::Value> = bundle
+        .lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["build"], older["build"]);
+    assert_eq!(lines[1]["build"], BUILD_ID);
+    let header = serde_json::to_value(bundle.header).unwrap();
+    assert_eq!(header["reader_version"], crate::version::BUILD_VERSION);
+    assert!(header.get("version").is_none());
 }
 
 #[test]
@@ -471,6 +552,7 @@ fn a_panic_records_location_and_runtime_thread_id_never_payload_or_name() {
     let record: serde_json::Value = serde_json::from_str(record).unwrap();
     assert_eq!(record["target"], "spawnd::panic");
     assert_eq!(record["level"], "ERROR");
+    assert_eq!(record["build"], BUILD_ID);
     assert!(record["at"]
         .as_str()
         .unwrap()
@@ -763,7 +845,7 @@ fn construction_withholds_dynamic_messages_unknown_fields_and_unlisted_errors() 
     for line in &lines {
         assert!(line.get("msg").is_none());
         if !is_spawnd(line["target"].as_str().unwrap()) {
-            assert_eq!(line.as_object().unwrap().len(), 4);
+            assert_eq!(line.as_object().unwrap().len(), 5);
         }
     }
     assert_eq!(lines[8]["fields"]["future_number"], WITHHELD);
@@ -786,7 +868,7 @@ fn construction_withholds_dynamic_messages_unknown_fields_and_unlisted_errors() 
     });
     assert!(log.flush(Duration::from_secs(10)));
     let lines = read_lines(log.dir());
-    assert_eq!(lines.last().unwrap().as_object().unwrap().len(), 4);
+    assert_eq!(lines.last().unwrap().as_object().unwrap().len(), 5);
     capture::assert_absent(
         &std::fs::read_to_string(log.dir().join(CURRENT)).unwrap(),
         &marker,
@@ -821,6 +903,7 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
     let sink = Sink::default();
     let writer = sink.clone();
     let stderr = tracing_subscriber::fmt::layer()
+        .without_time()
         .with_ansi(false)
         .with_writer(move || writer.clone());
     tracing::subscriber::with_default(
@@ -829,20 +912,29 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
             .with(log.layer()),
         || {
             crate::worker_backend::log_worker_error(uuid::Uuid::new_v4(), error);
-            crate::worker_backend::log_worker_error(uuid::Uuid::new_v4(), &marker);
+            let session_id = uuid::Uuid::new_v4();
+            crate::worker_backend::log_worker_error(session_id, &marker);
+            // Master's exact WARN statement, with the same metadata and value.
+            tracing::warn!(target: "spawnd::worker_backend", %session_id, message = %marker, "worker error");
         },
     );
     assert!(log.flush(Duration::from_secs(10)));
     let lines = read_lines(log.dir());
     if crate::version::DIAGNOSTICS_BUILD {
         assert_eq!(lines[0]["fields"]["error"], error);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
     } else {
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
     }
-    assert_eq!(lines.last().unwrap()["fields"]["error"], WITHHELD);
+    assert!(lines.last().unwrap()["fields"].get("message").is_none());
+    assert!(lines.last().unwrap()["fields"].get("error").is_none());
     let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(stderr.contains(error) && stderr.contains(&marker));
+    let stderr_lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(
+        stderr_lines[stderr_lines.len() - 2],
+        stderr_lines[stderr_lines.len() - 1]
+    );
     capture::assert_absent(
         &std::fs::read_to_string(log.dir().join(CURRENT)).unwrap(),
         &marker,

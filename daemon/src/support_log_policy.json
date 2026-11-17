@@ -225,6 +225,10 @@
       "kind": "scalar",
       "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
     },
+    "message": {
+      "kind": "withheld",
+      "why": "Event messages, including explicit message fields, are never recorded."
+    },
     "mode": {
       "kind": "withheld",
       "why": "Unreviewed text, peer/file content, command, or opaque Debug value."
@@ -611,6 +615,120 @@
       "field": "error",
       "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
       "why": "Direct tokio::fs::write io::Error, not a parser or a worker spawn error; path is a separate allowed field."
+    }
+  ],
+  "path_sites": [
+    {
+      "file": "src/codex_home.rs",
+      "line": 224,
+      "field": "codex_home",
+      "source": "tracing::info!(\n            codex_home = %plan.codex_home.display(),\n            \"Codex keeps its sign-in outside auth.json (a keyring or ephemeral store, keyed by CODEX_HOME); this window keeps no auth.json\"\n        )",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 249,
+      "field": "path",
+      "source": "tracing::info!(\n                        path = %dest.display(),\n                        \"kept this window's own Codex state rather than linking the user's\"\n                    )",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 257,
+      "field": "path",
+      "source": "tracing::warn!(\n                    path = %dest.display(),\n                    %error,\n                    \"could not link the user's Codex state into this window\"\n                )",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 287,
+      "field": "path",
+      "source": "tracing::warn!(path = %path.display(), %error, \"could not read the user's Codex config\")",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 293,
+      "field": "path",
+      "source": "tracing::warn!(path = %path.display(), %error, \"could not read the user's Codex config\")",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 297,
+      "field": "path",
+      "source": "tracing::warn!(path = %path.display(), \"the user's Codex config is too large to merge\")",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/codex_home.rs",
+      "line": 644,
+      "field": "path",
+      "source": "tracing::info!(\n                    path = %dest.display(),\n                    \"removed this window's own copy of a Codex file the user does not have\"\n                )",
+      "why": "Local window/config/mirror path or source CODEX_HOME; never config-file contents."
+    },
+    {
+      "file": "src/install.rs",
+      "line": 1213,
+      "field": "launch",
+      "source": "tracing::info!(\n        release = release.id(),\n        launch = %launch_path(&layout, config_dir).display(),\n        \"this instance now runs from the release store\"\n    )",
+      "why": "Local immutable-release executable launch path."
+    },
+    {
+      "file": "src/possess.rs",
+      "line": 682,
+      "field": "dir",
+      "source": "tracing::warn!(%error, dir = %dir.display(), \"deregistering host\")",
+      "why": "Local instance configuration directory used for deregistration."
+    },
+    {
+      "file": "src/possess.rs",
+      "line": 688,
+      "field": "dir",
+      "source": "tracing::warn!(%error, dir = %dir.display(), \"resolving the server to deregister from\")",
+      "why": "Local instance configuration directory used for deregistration."
+    },
+    {
+      "file": "src/rtc.rs",
+      "line": 4849,
+      "field": "path",
+      "source": "tracing::debug!(path = %path.display(), \"replay dumped for diagnostics\")",
+      "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."
+    },
+    {
+      "file": "src/rtc.rs",
+      "line": 4850,
+      "field": "path",
+      "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
+      "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."
+    },
+    {
+      "file": "src/run.rs",
+      "line": 4112,
+      "field": "shell",
+      "source": "tracing::warn!(\n                shell = %shell.display(),\n                mode,\n                \"the user's shell did not say its PATH in time and was stopped; what it would have added is not used\"\n            )",
+      "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
+    },
+    {
+      "file": "src/run.rs",
+      "line": 4359,
+      "field": "path",
+      "source": "tracing::info!(path = %path.display(), \"created the user's Codex home\")",
+      "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
+    },
+    {
+      "file": "src/run.rs",
+      "line": 4361,
+      "field": "path",
+      "source": "tracing::warn!(\n            path = %path.display(),\n            %error,\n            \"could not create the user's Codex home; this window's Codex keeps its own\"\n        )",
+      "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
+    },
+    {
+      "file": "src/update.rs",
+      "line": 487,
+      "field": "path",
+      "source": "tracing::warn!(\n            stage = \"precondition\",\n            path = %path.display(),\n            \"downgrade consent has expired; touch the file again to re-arm it\"\n        )",
+      "why": "Local downgrade-consent file path."
     }
   ]
 }
