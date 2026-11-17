@@ -416,16 +416,16 @@ async fn subscribe_history(
 
 /// Adopt an already-running worker (spawnd restart / lazy attach). Returns
 /// `Ok(None)` when no live worker socket exists for this session.
-pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
+async fn adopt_worker(session_id: Uuid, marker_seen: bool) -> Result<Option<pty::Launched>> {
     let dir = worker_dir()?;
     let worker_endpoint = session_endpoint(&dir, session_id)?;
-    if !endpoint::endpoint_exists(&worker_endpoint) {
+    if !marker_seen && !endpoint::endpoint_exists(&worker_endpoint) {
         return Ok(None);
     }
     let mut stream = match connect_with_retry(&worker_endpoint, ADOPT_CONNECT_TIMEOUT).await {
         Ok(s) => s,
         Err(_) => {
-            cleanup_crashed_worker_endpoints(&worker_endpoint);
+            cleanup_crashed_worker_endpoints(&worker_endpoint)?;
             return Ok(None);
         }
     };
@@ -438,7 +438,7 @@ pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
             &wire::Shutdown { signal: None },
         )
         .await;
-        return Ok(None);
+        bail!("worker awaiting start has not confirmed shutdown");
     }
     tracing::info!(%session_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
     subscribe_history(&mut stream, &hello).await?;
@@ -899,11 +899,30 @@ async fn connect_with_retry(
     endpoint::connect_main(worker_endpoint, tokio::time::Instant::now() + timeout).await
 }
 
-fn cleanup_crashed_worker_endpoints(worker_endpoint: &endpoint::Endpoint) {
-    let Ok(LockAttempt::Acquired(lock)) = endpoint::try_reserve_stale(worker_endpoint) else {
-        return;
+/// Include reservations without a published endpoint. A worker inherits its
+/// reservation before binding, and its previous supervisor may have died there.
+pub fn startup_worker_markers() -> (Vec<Uuid>, bool) {
+    let Ok(dir) = worker_dir() else {
+        return (Vec::new(), false);
     };
-    let _ = endpoint::remove_stale(worker_endpoint, &lock);
+    endpoint::scan_worker_markers(&dir, &endpoint::config_root_tag(), true)
+}
+
+pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
+    adopt_worker(session_id, false).await
+}
+
+/// Startup already saw this endpoint. Even if it disappears before connect,
+/// require the worker reservation before declaring it dead.
+pub async fn adopt_candidate(session_id: Uuid) -> Result<Option<pty::Launched>> {
+    adopt_worker(session_id, true).await
+}
+
+fn cleanup_crashed_worker_endpoints(worker_endpoint: &endpoint::Endpoint) -> Result<()> {
+    let LockAttempt::Acquired(lock) = endpoint::try_reserve_stale(worker_endpoint)? else {
+        bail!("worker reservation is still held");
+    };
+    endpoint::remove_stale(worker_endpoint, &lock)
 }
 
 async fn read_hello(
@@ -936,7 +955,7 @@ async fn read_hello(
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::net::UnixStream;
 
@@ -1230,14 +1249,18 @@ mod tests {
 
     /// Point the worker overrides at a short private directory and the built
     /// worker for one test; restores both when dropped.
-    struct WorkerEnv {
+    pub(crate) struct WorkerEnv {
         old_dir: Option<std::ffi::OsString>,
         old_bin: Option<std::ffi::OsString>,
         dir: tempfile::TempDir,
     }
 
     impl WorkerEnv {
-        fn install(with_bin: bool) -> Self {
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+
+        pub(crate) fn install(with_bin: bool) -> Self {
             let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
             let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
             let dir = tempfile::Builder::new()
@@ -1309,7 +1332,7 @@ mod tests {
 
         std::fs::remove_file(&lock).unwrap();
         // What `adopt` does after a connection attempt fails.
-        cleanup_crashed_worker_endpoints(&worker_endpoint);
+        assert!(cleanup_crashed_worker_endpoints(&worker_endpoint).is_err());
         assert!(
             socket_exists(session_id),
             "a live worker's socket was removed as stale"

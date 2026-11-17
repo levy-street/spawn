@@ -260,12 +260,14 @@ interface OverlayOverrides {
   focused?: boolean;
   onDismiss?: () => void;
   onKill?: () => Promise<void>;
+  status?: SessionOut["status"];
+  onRestart?: () => Promise<{ kind: "restarted"; plan: { kind: "shell" } }>;
 }
 
-async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
+function overlayElement(overrides: boolean | OverlayOverrides = false) {
   const options: OverlayOverrides =
     typeof overrides === "boolean" ? { focused: overrides } : overrides;
-  await render(
+  return (
     <SafeAreaProvider
       initialMetrics={{
         frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -279,16 +281,43 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
           onDismiss={options.onDismiss ?? jest.fn()}
           onKill={options.onKill ?? jest.fn(async () => undefined)}
           onRename={jest.fn(async () => undefined)}
-          onRestart={jest.fn(async () => ({
-            kind: "restarted" as const,
-            plan: { kind: "shell" as const },
-          }))}
-          session={session}
+          onRestart={
+            options.onRestart ??
+            jest.fn(async () => ({
+              kind: "restarted" as const,
+              plan: { kind: "shell" as const },
+            }))
+          }
+          session={{ ...session, status: options.status ?? session.status }}
         />
       </ThemeProvider>
-    </SafeAreaProvider>,
+    </SafeAreaProvider>
   );
 }
+
+function renderOverlay(overrides: boolean | OverlayOverrides = false) {
+  return render(overlayElement(overrides));
+}
+
+test.each([true, false])("ends attachment and offers Restart (already open: %s)", async (open) => {
+  const onRestart = jest.fn(async () => ({
+    kind: "restarted" as const,
+    plan: { kind: "shell" as const },
+  }));
+  const ended = { status: "killed", onRestart };
+  const view = await renderOverlay(open ? {} : ended);
+  if (open) {
+    await act(() => mockTerminalSurfaceProps.onStateChange?.("connecting"));
+    expect(screen.getByTestId("terminal")).toBeOnTheScreen();
+    await view.rerender(overlayElement(ended));
+  }
+  expect(screen.queryByTestId("terminal")).toBeNull();
+  expect(screen.getByText("Shell exited")).toBeOnTheScreen();
+  await fireEvent.press(screen.getByText("Restart"));
+  expect(onRestart).toHaveBeenCalledTimes(1);
+  await view.rerender(overlayElement({ status: "starting" }));
+  expect(screen.getByTestId("terminal")).toBeOnTheScreen();
+});
 
 describe("a window that moves to another host while its terminal is open", () => {
   beforeEach(() => {

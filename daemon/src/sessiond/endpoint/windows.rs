@@ -664,7 +664,9 @@ pub(super) fn remove_stale(endpoint: &Endpoint, held: &Reservation) -> Result<()
         Err(error) if is_not_found(&error) => return Ok(()),
         Err(error) => return Err(error).context("inspecting stale endpoint marker"),
     };
-    marker.cleanup()?;
+    if !marker.cleanup()? && marker.path.try_exists()? {
+        bail!("worker endpoint marker changed during cleanup");
+    }
     Ok(())
 }
 
@@ -1094,22 +1096,6 @@ fn validate_process_user(pid: u32) -> Result<()> {
 
 pub(super) fn endpoint_exists(endpoint: &Endpoint) -> bool {
     open_marker(endpoint).is_ok()
-}
-
-pub(super) fn discover_ids(dir: &Path, tag: &str) -> Vec<Uuid> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let id = Uuid::parse_str(name.strip_suffix(".endpoint")?).ok()?;
-            let endpoint = super::endpoint_for(dir, tag, id).ok()?;
-            endpoint_exists(&endpoint).then_some(id)
-        })
-        .collect()
 }
 
 pub(super) async fn send_lifecycle(

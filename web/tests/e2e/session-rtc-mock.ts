@@ -503,6 +503,7 @@ export async function installSessionRtcMock(
       (
         window as unknown as {
           __spawnRtcTest: {
+            attachmentCount: () => number;
             ptyReady: () => boolean;
             sendPty: (text: string, connectionIndex?: number) => boolean;
             replyReplay: (text: string) => void;
@@ -522,6 +523,7 @@ export async function installSessionRtcMock(
           };
         }
       ).__spawnRtcTest = {
+        attachmentCount: () => state.ptyChannels.length,
         ptyReady() {
           return (
             state.activePtyChannel?.readyState === "open" &&

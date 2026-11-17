@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -1194,17 +1195,14 @@ async def _validate_durable_host_owner(conn: DaemonConn) -> bool:
     return valid
 
 
-def _session_owner_exists(conn: DaemonConn) -> Any:
+def _session_owner_exists(conn: DaemonConn, *, lock: bool = False) -> Any:
     generation = conn.host_generation
-    return (
-        select(Host.id)
-        .where(
-            Host.id == conn.host_id,
-            Host.daemon_connection_id == conn.id,
-            Host.daemon_generation == generation,
-        )
-        .exists()
+    owner = select(Host.id).where(
+        Host.id == conn.host_id,
+        Host.daemon_connection_id == conn.id,
+        Host.daemon_generation == generation,
     )
+    return (owner.with_for_update() if lock else owner).exists()
 
 
 async def _redis_owner_is_current(conn: DaemonConn) -> bool:
@@ -1952,10 +1950,58 @@ def _reported_session_ids(reported: object) -> list[str]:
     return ids
 
 
+def _complete_session_inventory(flag: object, reported: object) -> bool:
+    if flag is not True or not isinstance(reported, list):
+        return False
+    # The daemon serializes UUIDs in canonical form. A malformed list can
+    # still contribute individual known IDs, but cannot prove any absence.
+    try:
+        return all(isinstance(sid, str) and str(uuid.UUID(sid)) == sid for sid in reported)
+    except ValueError:
+        return False
+
+
+@dataclasses.dataclass
+class WorkerDecision:
+    adopt: list[str] = dataclasses.field(default_factory=list)
+    stop: list[str] = dataclasses.field(default_factory=list)
+    unclaimed: list[str] = dataclasses.field(default_factory=list)
+    restore: list[str] = dataclasses.field(default_factory=list)
+    ended: dict[str, str | None] = dataclasses.field(default_factory=dict)
+
+
+def _exit_values(code: int | None, killed: bool, *, host_restart: bool = False) -> dict:
+    now = _utcnow()
+    return {
+        "status": "killed" if killed else "exited",
+        "exit_code": code,
+        "exited_at": now,
+        "foreground_command": None,
+        "ended_by_host_restart_at": now if host_restart else None,
+    }
+
+
+async def _notify_session_exit(
+    conn: DaemonConn,
+    owner_id: str,
+    sid: str,
+    code: int | None,
+    signal: str | None,
+    died_alert: dict[str, object] | None,
+) -> bool:
+    published = await _publish_session_event_if_owner(
+        conn, sid, {"type": "session.exit", "exit_code": code, "signal": signal}
+    )
+    if died_alert is not None:
+        await _publish_user_alert(conn, owner_id, died_alert)
+    await publish_data_changed(owner_id, "sessions", sid)
+    return published
+
+
 async def _sort_existing_sessions(
     session: AsyncSession, host: Host, reported: list[str]
-) -> tuple[list[str], list[str], list[str]]:
-    """Split a registering daemon's live workers into (adopt, stop, unclaimed).
+) -> WorkerDecision:
+    """Decide which reported workers to adopt, restore or stop.
 
     `existing_sessions` is the daemon's word for what still runs on it; each
     session row is the server's word for where its window runs. The two part
@@ -1966,6 +2012,8 @@ async def _sort_existing_sessions(
     - adopt: rows bound to this host. Routing reattaches them.
     - stop: adopted rows the server already stopped ("killed"), and rows that
       now name another of the owner's hosts — that window runs there now.
+    - restore: adopted rows marked as ended by an earlier inventory. A live
+      report reverses that decision even from a daemon without the flag.
     - unclaimed: ids with no row in this account. They are left running, and
       their count and first ids go to the server log only; no device is told.
       After a database restore a missing row may be a window created since
@@ -1973,40 +2021,44 @@ async def _sort_existing_sessions(
       shell. Another account's row is never acted on either.
 
     The rows are trusted as they stand. That covers a restore only for rows
-    the backup lacks: a restored row that says "killed", or names another
+    the backup lacks: a restored row the owner stopped, or one naming another
     host, is stopped here even when the window was restarted, restored or
     moved back after the backup was taken, because nothing compares the
     worker's age with the row's.
     """
-    adopt: list[str] = []
-    stop: list[str] = []
-    unclaimed: list[str] = []
+    decision = WorkerDecision()
     for sid in reported:
-        session_row = await session.get(Session, sid)
-        if session_row is not None and session_row.host_id == host.id:
-            adopt.append(sid)
-            if session_row.status == "killed":
-                stop.append(sid)
-        elif session_row is not None and session_row.owner_user_id == host.owner_user_id:
-            stop.append(sid)
+        row = await session.get(Session, sid)
+        if row is None or row.owner_user_id != host.owner_user_id:
+            decision.unclaimed.append(sid)
+        elif row.host_id != host.id:
+            decision.stop.append(sid)
         else:
-            unclaimed.append(sid)
-    return adopt, stop, unclaimed
+            decision.adopt.append(sid)
+            if row.status == "killed":
+                if row.ended_by_host_restart_at is None:
+                    decision.stop.append(sid)
+                else:
+                    decision.restore.append(sid)
+    return decision
 
 
 async def _read_workers_to_stop(
-    conn: DaemonConn, host: Host, reported: list[str], known: set[str]
-) -> tuple[list[str], list[str]] | None:
-    """(stop, unclaimed) for the reported workers, read from the rows as they
-    are now; None when this connection no longer owns its host or the read
-    failed."""
+    conn: DaemonConn,
+    host: Host,
+    reported: list[str],
+    known: set[str],
+    missing: dict[str, str | None],
+) -> WorkerDecision | None:
+    """Re-read stop rules before acknowledging the registration."""
+    if not reported:
+        return WorkerDecision(ended=missing)
     try:
         async with _bounded_host_ownership_session() as session:
-            owner = await _lock_durable_host_owner(session, conn)
-            stop: list[str] = []
-            unclaimed: list[str] = []
-            if owner:
-                _, stop, unclaimed = await _sort_existing_sessions(session, host, reported)
+            if not await _lock_durable_host_owner(session, conn):
+                return None
+            decision = await _sort_existing_sessions(session, host, reported)
+            decision.ended = missing
             await session.rollback()
     except (TimeoutError, SQLAlchemyError) as exc:
         log.warning(
@@ -2016,19 +2068,71 @@ async def _read_workers_to_stop(
             exc,
         )
         return None
-    if not owner:
-        # A newer connection owns the host now; its registration decides.
-        return None
     # A row this registration saw a moment ago and that is gone now was
     # deleted while the host registered, when its kill had no daemon to reach.
-    stop.extend(sid for sid in unclaimed if sid in known)
-    return stop, [sid for sid in unclaimed if sid not in known]
+    decision.stop.extend(sid for sid in decision.unclaimed if sid in known)
+    decision.unclaimed = [sid for sid in decision.unclaimed if sid not in known]
+    return decision
+
+
+async def _apply_worker_inventory(conn: DaemonConn, host: Host, decision: WorkerDecision) -> None:
+    """Only a delivered registration can change a window. Recheck every write
+    against the durable owner and the window's current status and host."""
+    if not decision.ended and not decision.restore:
+        return
+    try:
+        async with _bounded_host_ownership_session() as session:
+            scope = (Session.host_id == host.id, Session.owner_user_id == host.owner_user_id)
+            missing = decision.ended
+            if missing:
+                # With no reported workers there is no stop-list owner read.
+                # Fence the bulk write itself against generation promotion.
+                ended = await session.scalars(
+                    update(Session)
+                    .where(
+                        *scope,
+                        Session.id.in_(missing),
+                        Session.status == "running",
+                        _session_owner_exists(conn, lock=True),
+                    )
+                    .values(**_exit_values(None, True, host_restart=True))
+                    .returning(Session.id)
+                )
+                decision.ended = {sid: missing[sid] for sid in ended}
+            if decision.restore:
+                restored = await session.scalars(
+                    update(Session)
+                    .where(
+                        *scope,
+                        Session.id.in_(decision.restore),
+                        Session.status == "killed",
+                        Session.ended_by_host_restart_at.is_not(None),
+                        _session_owner_exists(conn, lock=True),
+                    )
+                    .values(
+                        status="running",
+                        ended_by_host_restart_at=None,
+                        exited_at=None,
+                        exit_code=None,
+                    )
+                    .returning(Session.id)
+                )
+                decision.restore = list(restored)
+            await session.commit()
+    except (TimeoutError, SQLAlchemyError) as exc:
+        decision.ended.clear()
+        decision.restore.clear()
+        log.warning("host=%s: worker inventory left for its next registration: %s", host.id, exc)
 
 
 @asynccontextmanager
 async def _decide_workers_to_stop(
-    conn: DaemonConn, host: Host, reported: list[str], known: set[str]
-) -> AsyncIterator[list[str]]:
+    conn: DaemonConn,
+    host: Host,
+    reported: list[str],
+    known: set[str],
+    missing: dict[str, str | None],
+) -> AsyncIterator[WorkerDecision]:
     """Decide which reported workers missed their kill while this host was
     away, and hold `conn.lifecycle_lock` until the caller has sent `registered`
     and then those kills (`_stop_workers_left_running`).
@@ -2053,13 +2157,14 @@ async def _decide_workers_to_stop(
     `registered` and these kills, and the daemon, which handles lifecycle
     frames in order, stops the old worker and not the new one.
 
-    Yields no ids when nothing was reported, when launches held the lock too
+    An empty complete inventory can end missing workers. An empty partial
+    inventory skips this work. No changes are made when launches held the lock too
     long, when this connection no longer owns its host (a newer
     registration decides), or when the read failed; those workers are left
     for the host's next registration.
     """
     acquired = False
-    if reported:
+    if reported or missing:
         try:
             async with asyncio.timeout(HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS):
                 await conn.lifecycle_lock.acquire()
@@ -2071,10 +2176,11 @@ async def _decide_workers_to_stop(
                 host.id,
             )
     try:
-        stop: list[str] = []
-        decided = await _read_workers_to_stop(conn, host, reported, known) if acquired else None
+        decided = (
+            await _read_workers_to_stop(conn, host, reported, known, missing) if acquired else None
+        )
         if decided is not None:
-            stop, unclaimed = decided
+            unclaimed = decided.unclaimed
             if unclaimed:
                 # Server log only: no frame or field carries this count to a
                 # device yet.
@@ -2085,7 +2191,7 @@ async def _decide_workers_to_stop(
                     len(unclaimed),
                     unclaimed[:_UNCLAIMED_SESSION_LOG_IDS],
                 )
-        yield stop
+        yield decided or WorkerDecision()
     finally:
         if acquired:
             conn.lifecycle_lock.release()
@@ -2362,19 +2468,36 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         else:
                             await _close_daemon_consistency_failure(conn)
                         break
-                    reported_existing = _reported_session_ids(obj.get("existing_sessions"))
+                    inventory = obj.get("existing_sessions")
+                    reported_existing = _reported_session_ids(inventory)
+                    complete = _complete_session_inventory(
+                        obj.get("existing_sessions_complete"), inventory
+                    )
+                    missing: dict[str, str | None] = {}
                     valid_existing: list[str] = []
                     known_existing: set[str] = set()
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
                         durable_owner = await _lock_durable_host_owner(session, conn)
                         if durable_owner:
-                            (
-                                valid_existing,
-                                stale_existing,
-                                _,
-                            ) = await _sort_existing_sessions(session, host, reported_existing)
-                            known_existing = {*valid_existing, *stale_existing}
+                            workers = await _sort_existing_sessions(
+                                session, host, reported_existing
+                            )
+                            valid_existing = workers.adopt
+                            known_existing = {*workers.adopt, *workers.stop}
+                            if complete:
+                                # Only rows already acknowledged when this registration
+                                # read its inventory can become candidates. Nothing is
+                                # written until the generation has been accepted.
+                                rows = await session.execute(
+                                    select(Session.id, Session.foreground_command).where(
+                                        Session.host_id == host.id,
+                                        Session.owner_user_id == host.owner_user_id,
+                                        Session.status == "running",
+                                        Session.id.not_in(reported_existing),
+                                    )
+                                )
+                                missing = dict(rows.all())
                         await session.rollback()
 
                     registration_accepted = False
@@ -2441,11 +2564,32 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # routable, and before `registered` ends the
                         # registration; sent after it (see the function).
                         async with _decide_workers_to_stop(
-                            conn, host, reported_existing, known_existing
-                        ) as left_running:
+                            conn, host, reported_existing, known_existing, missing
+                        ) as decision:
                             await _bounded_send_text(conn, registered_payload)
                             registered = True
-                            await _stop_workers_left_running(conn, host, left_running)
+                            await _stop_workers_left_running(conn, host, decision.stop)
+                            await _apply_worker_inventory(conn, host, decision)
+                        for sid, command in decision.ended.items():
+                            await _notify_session_exit(
+                                conn,
+                                host.owner_user_id,
+                                sid,
+                                None,
+                                "worker_lost",
+                                session_died_payload(
+                                    sid, command, exit_code=None, signal="worker_lost"
+                                ),
+                            )
+                        for sid in decision.restore:
+                            if sid not in valid_existing:
+                                await broker.attach_session_to_daemon(
+                                    sid, conn, expected_host_generation=generation
+                                )
+                            await _publish_session_event_if_owner(
+                                conn, sid, {"type": "session.status", "status": "running"}
+                            )
+                            await publish_data_changed(host.owner_user_id, "sessions", sid)
                         await publish_data_changed(host.owner_user_id, "hosts", host.id)
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
@@ -2558,7 +2702,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         Session.host_id == host.id,
                                         _session_owner_exists(conn),
                                     )
-                                    .values(status="running")
+                                    .values(
+                                        status="running",
+                                        ended_by_host_restart_at=None,
+                                        exited_at=None,
+                                    )
                                     .execution_options(synchronize_session=False)
                                 )
                                 started = result.rowcount == 1
@@ -2796,7 +2944,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 # asked for it, so it is not news, and the row
                                 # stays "killed" however the shell went. A
                                 # crash reaches here from "running".
-                                stopped_by_server = session_row.status == "killed"
+                                already_ended = session_row.status == "killed"
+                                stopped_by_server = (
+                                    already_ended and session_row.ended_by_host_restart_at is None
+                                )
                                 # How long this circle stayed open. Read here
                                 # for the same reason: after the update the row
                                 # is still present, but this is the one place
@@ -2814,12 +2965,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         Session.host_id == host.id,
                                         _session_owner_exists(conn),
                                     )
-                                    .values(
-                                        status="killed" if sig or stopped_by_server else "exited",
-                                        exit_code=code,
-                                        exited_at=_utcnow(),
-                                        foreground_command=None,
-                                    )
+                                    .values(**_exit_values(code, bool(sig) or stopped_by_server))
                                     .execution_options(synchronize_session=False)
                                 )
                                 exited = result.rowcount == 1
@@ -2830,7 +2976,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     # the same update nulls foreground_command,
                                     # so `is_agent_finish` sees a status that
                                     # has left "running" and stays silent.
-                                    if not stopped_by_server:
+                                    if not already_ended:
                                         died_alert = session_died_payload(
                                             sid,
                                             dying_command,
@@ -2847,25 +2993,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _close_daemon_consistency_failure(conn)
                             break
-                        published = not exited or await _publish_session_event_if_owner(
-                            conn,
-                            sid,
-                            {
-                                "type": "session.exit",
-                                "exit_code": code,
-                                "signal": sig,
-                            },
+                        published = not exited or await _notify_session_exit(
+                            conn, alert_owner_id, sid, code, sig, died_alert
                         )
                         if exited:
                             await legion.record_session_seconds(alert_owner_id, ran_seconds)
                         quiet_watch.cancel(sid)
-                        if died_alert is not None:
-                            await _publish_user_alert(conn, alert_owner_id, died_alert)
-                        if exited:
-                            # The alert above is a courtesy some accounts mute;
-                            # the data frame is what removes the pane from
-                            # every other open client either way.
-                            await publish_data_changed(alert_owner_id, "sessions", sid)
                         detached = await broker.detach_session(
                             sid,
                             expected_daemon=conn,

@@ -43,6 +43,7 @@ import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
 import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
+import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -134,6 +135,7 @@ export function TerminalOverlay({
   onKill,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
+  const ended = session.status === "killed" || session.status === "exited";
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
@@ -251,6 +253,20 @@ export function TerminalOverlay({
     () => ({ paddingBottom: Math.max(-keyboard.height.value, restingInset) }),
     [keyboard.height, restingInset],
   );
+
+  useEffect(() => {
+    if (!ended) return;
+    scrollUnsubscribeRef.current?.();
+    scrollUnsubscribeRef.current = null;
+    pendingLaunchUnsubscribeRef.current?.();
+    pendingLaunchUnsubscribeRef.current = null;
+    transportRef.current = null;
+    previousConnectionState.current = "closed";
+    setConnectionState("closed");
+    setConnectionError(null);
+    setDisplay(null);
+    setApprovalVisible(false);
+  }, [ended]);
 
   useTerminalKeepAwake(session.id, focused, connectionState);
   const changeFontSize = useTerminalFontSizeGate(
@@ -379,8 +395,8 @@ export function TerminalOverlay({
   }, [trustRefusal]);
   useEffect(() => {
     // Connected: whatever the refusal was, it is over.
-    if (connectionState === "ready") setAwaitingApproval(false);
-  }, [connectionState]);
+    if (connectionState === "ready" || ended) setAwaitingApproval(false);
+  }, [connectionState, ended]);
   const hostApproval = useHostApprovalWatch(host.id, awaitingApproval);
   useEffect(() => {
     if (!awaitingApproval || hostApproval !== "trusted") return;
@@ -554,7 +570,19 @@ export function TerminalOverlay({
       />
       <DisplayControlBar display={display} onTakeControl={takeDisplayControl} />
       <View style={[styles.surfaceFrame, { backgroundColor: theme.colors.terminalBg }]}>
-        {hostKey ? (
+        {ended ? (
+          <View style={[styles.unavailable, { gap: theme.space(2), padding: theme.space(6) }]}>
+            <Text variant="label">Shell exited</Text>
+            <Text color="mutedForeground" variant="body">
+              {session.exit_code == null
+                ? "The session stopped."
+                : `Exit code ${session.exit_code}`}
+            </Text>
+            <Button disabled={restarting} onPress={restartFromHere}>
+              {restarting ? "Restarting…" : "Restart"}
+            </Button>
+          </View>
+        ) : hostKey ? (
           // Nothing wraps the surface in a gesture any more. A long press has to
           // reach the web view for the system to answer it with its own selection
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
@@ -595,19 +623,21 @@ export function TerminalOverlay({
           </View>
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
-        <ConnectionStateOverlay
-          awaitingApproval={awaitingApproval}
-          error={connectionError}
-          hasEverBeenReady={hasEverBeenReady}
-          sharedConnectionReady={transportRef.current?.daemonState === "ready"}
-          sharedConnectionUnavailable={
-            transportRef.current?.daemonState !== undefined &&
-            transportRef.current.daemonState !== "ready"
-          }
-          onDeviceTrust={() => setApprovalVisible(true)}
-          onRetry={retry}
-          state={hostKey ? connectionState : "failed"}
-        />
+        {!ended && (
+          <ConnectionStateOverlay
+            awaitingApproval={awaitingApproval}
+            error={connectionError}
+            hasEverBeenReady={hasEverBeenReady}
+            sharedConnectionReady={transportRef.current?.daemonState === "ready"}
+            sharedConnectionUnavailable={
+              transportRef.current?.daemonState !== undefined &&
+              transportRef.current.daemonState !== "ready"
+            }
+            onDeviceTrust={() => setApprovalVisible(true)}
+            onRetry={retry}
+            state={hostKey ? connectionState : "failed"}
+          />
+        )}
         {shouldShowJumpToLatest(followState) ? (
           <View
             pointerEvents="box-none"
@@ -643,7 +673,7 @@ export function TerminalOverlay({
       </View>
       <TerminalAccessoryBar
         commands={pinnedCommands}
-        disabled={connectionState !== "ready" || !hostKey}
+        disabled={ended || connectionState !== "ready" || !hostKey}
         onAttach={() => setAttachVisible(true)}
         onCommand={runCommand}
         onDismissKeyboard={() => surfaceRef.current?.blur()}

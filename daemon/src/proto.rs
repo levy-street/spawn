@@ -244,6 +244,7 @@ pub enum Outbound {
         /// offers without triggering the old host/session discriminator trap.
         session_ice_policy: bool,
         existing_sessions: Vec<Uuid>,
+        existing_sessions_complete: bool,
         /// What this machine is — cores, memory, CPU model, GPU. Sent once, on
         /// registration, because none of it changes while the daemon runs.
         /// Absent when `SPAWND_NO_TELEMETRY` is set, and absent from every
@@ -854,6 +855,7 @@ mod daemon_update_wire_tests {
             }],
             session_ice_policy: true,
             existing_sessions: Vec::new(),
+            existing_sessions_complete: true,
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,
@@ -882,6 +884,7 @@ mod daemon_update_wire_tests {
             live_bindings: Vec::new(),
             session_ice_policy: true,
             existing_sessions: Vec::new(),
+            existing_sessions_complete: true,
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,

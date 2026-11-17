@@ -21,6 +21,7 @@ from .sessions import (
     dispatch_session_launch,
     mark_session_stopped,
     send_session_kill,
+    set_session_status,
 )
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -539,7 +540,7 @@ async def unarchive_workspace(
         host = await db.get(Host, session_row.host_id)
         if host is None or host.owner_user_id != user.id or host.status != "online":
             continue
-        session_row.status = "starting"
+        set_session_status(session_row, "starting")
         session_row.started_at = _utcnow()
         session_row.exited_at = None
         session_row.exit_code = None

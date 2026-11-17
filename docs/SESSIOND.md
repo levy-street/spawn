@@ -816,10 +816,27 @@ described in §6.2, including checkpoint and framing charges.
 |---|---|
 | **Session exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and removes Unix sockets or the Windows marker, releases its lifetime reservation, and exits; spawnd forwards `session.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
 | **Worker crashes** | the session process tree dies with it (PTY ownership on Unix; kill-on-close Job Object on Windows) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the flock/exclusive HANDLE; the next launch, or a failed adoption that acquires that reservation, ownership-checks and removes stale endpoint metadata. On Unix, if the temp cleaner had already deleted the reservation file, only a failed adoption that finds nothing bound to the lifecycle socket recovers the endpoint (§3). Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running in independent Unix process groups or detached Windows breakaway trees. On startup `rediscover_existing_sessions` scans protected `.sock` entries or `.endpoint` markers via `discover_ids`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. The same lazy path (`ensure_session_attached`) recovers a session on first use if startup discovery raced. A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
+| **spawnd restarts / upgrades** | workers keep running in independent Unix process groups or detached Windows breakaway trees. On startup `rediscover_existing_sessions` scans protected `.sock` entries or `.endpoint` markers via `startup_worker_markers`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. A kill for an unknown session also tries lazy adoption (`ensure_session_attached`). A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct session uploads. A mismatched or cwd-less worker is left untouched (its session keeps running) and surfaced in logs rather than driven with a protocol it does not speak or falling back to a server upload path. Old workers drain away as their sessions exit. |
 | **Worker binary upgrade** | applies to newly launched sessions only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`, using the platform executable suffix. |
-| **Host reboot** | workers and their session process trees die. Unix runtime-dir sockets/ciphertext evaporate with tmpfs; Windows named pipes disappear and stale protected markers are recoverable under the released reservation. |
+| **Host reboot** | workers and their session process trees die. Unix runtime-dir sockets/ciphertext evaporate with tmpfs; Windows named pipes disappear and stale protected markers are recoverable under the released reservation. Once the host registers a complete worker list, windows whose workers are gone show the ended state with Restart. |
+
+On the first connection, spawnd scans the worker directory for this instance.
+It reports `existing_sessions_complete: true` only after every worker marker
+was adopted or cleared under its reservation. A held reservation without a
+published endpoint also counts as unresolved. A scan error, an unresolved
+marker, or losing contact with a worker without confirming its exit withholds
+that assurance for the rest of the process. Launch, lazy adoption and restart
+withhold it while their outcome is pending. A reconnect takes a new snapshot
+of the same registry.
+
+After accepting that daemon's generation, the server ends only its owner's
+`running` windows on this host that are missing from a complete list.
+Creation, restart, move and workspace restore all use `starting` until the
+daemon acknowledges the shell. Devices receive the usual lost-worker exit.
+The row keeps its conversation and records why it was ended. Any later
+registration reporting that worker alive restores the window, even from an
+older daemon. A window the owner stopped still sends its worker a kill.
 
 On Unix, the only launch-time fd inheritance is the already-flocked
 reservation, exposed to that one post-fork child and immediately restored to

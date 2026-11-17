@@ -82,7 +82,7 @@ The daemon control frames implemented in `daemon/src/proto.rs` are:
 
 | Direction | Frames |
 | --- | --- |
-| daemon → server | `register` (`existing_sessions`, optional `spec`, `supports_support_log:true`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
+| daemon → server | `register` (`existing_sessions`, optional `existing_sessions_complete`, optional `spec`, `supports_support_log:true`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
 | server → daemon | `registered` (optional `support_log_consent`; absent preserves, null disables), `host.support_log_consent`, `support_log.collect`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
 
 The support websocket additions remain daemon-only: current server registration

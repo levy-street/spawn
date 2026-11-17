@@ -17,6 +17,7 @@ use spawnd::sessiond::wire::LifecycleSignal;
 pub struct SessionRegistry {
     inner: Arc<Mutex<HashMap<Uuid, RegistryEntry>>>,
     generation: Arc<AtomicU64>,
+    inventory: Arc<Mutex<WorkerInventory>>,
     /// One-shot guard for startup worker discovery. The first WS session of
     /// the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
@@ -28,6 +29,34 @@ pub struct SessionRegistry {
     /// entry itself remains behind the small synchronous lock above; this
     /// async lock is held only across replacement lifecycle awaits.
     generation_transitions: Arc<Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>>,
+}
+
+#[derive(Default)]
+struct WorkerInventory {
+    scanned: bool,
+    uncertain: bool,
+    changing: usize,
+}
+
+/// A worker might already exist before its registry entry does. Cancellation
+/// or a failed handshake leaves that question open until the process restarts.
+pub struct WorkerChange<'a> {
+    inventory: &'a Mutex<WorkerInventory>,
+    resolved: bool,
+}
+
+impl WorkerChange<'_> {
+    pub fn finish(mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for WorkerChange<'_> {
+    fn drop(&mut self) {
+        let mut inventory = self.inventory.lock().expect("worker inventory");
+        inventory.changing -= 1;
+        inventory.uncertain |= !self.resolved;
+    }
 }
 
 struct RegistryEntry {
@@ -99,6 +128,28 @@ impl SessionRegistry {
     /// return false. Used to gate one-shot worker discovery.
     pub fn claim_discovery(&self) -> bool {
         !self.discovery_done.swap(true, Ordering::SeqCst)
+    }
+
+    pub fn finish_discovery(&self, complete: bool) {
+        let mut inventory = self.inventory.lock().expect("worker inventory");
+        inventory.scanned = true;
+        inventory.uncertain |= !complete;
+    }
+
+    pub fn worker_change(&self) -> WorkerChange<'_> {
+        self.inventory.lock().expect("worker inventory").changing += 1;
+        WorkerChange {
+            inventory: &self.inventory,
+            resolved: false,
+        }
+    }
+
+    pub fn registration_inventory(&self) -> (Vec<Uuid>, bool) {
+        let inventory = self.inventory.lock().expect("worker inventory");
+        (
+            self.ids(),
+            inventory.scanned && !inventory.uncertain && inventory.changing == 0,
+        )
     }
 
     /// Guard held for the duration of a lazy worker adoption.

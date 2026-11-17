@@ -1643,3 +1643,53 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
   await expect(liveTerminalRows(page)).toContainText("new 01");
   await expect(liveTerminalRows(page)).not.toContainText("old 1");
 });
+
+for (const alreadyEnded of [false, true]) {
+  test(`worker lost ${alreadyEnded ? "before opening" : "during attachment retry"} offers Restart`, async ({
+    page,
+  }) => {
+    const row = session({ status: alreadyEnded ? "killed" : "running", agent_id: null });
+    await installSessionRtcMock(page, [], { sendReady: false });
+    const store = await mockApp(page, { sessions: [row] });
+    const devices: WebSocketRoute[] = [];
+    await page.routeWebSocket(/\/ws\/alerts/, (ws) => {
+      devices.push(ws);
+    });
+    const attempts = () =>
+      page.evaluate(() =>
+        (
+          window as unknown as { __spawnRtcTest: { attachmentCount(): number } }
+        ).__spawnRtcTest.attachmentCount(),
+      );
+    await page.clock.install();
+    await page.goto(`/sessions/${SESSION_ID}`);
+    if (!alreadyEnded) {
+      await expect.poll(attempts).toBeGreaterThan(0);
+      await page.evaluate(() =>
+        (
+          window as unknown as { __spawnRtcTest: { replaceRtcGeneration(): void } }
+        ).__spawnRtcTest.replaceRtcGeneration(),
+      );
+      Object.assign(store.sessions[0], { status: "killed", exit_code: null });
+      await expect.poll(() => devices.length).toBeGreaterThan(0);
+      for (const device of devices)
+        device.send(
+          JSON.stringify({
+            type: "data",
+            resource: "sessions",
+            id: SESSION_ID,
+            origin: null,
+            at: new Date().toISOString(),
+          }),
+        );
+    }
+    await expect(page.getByText("Shell exited", { exact: true })).toBeVisible();
+    const count = await attempts();
+    if (alreadyEnded) expect(count).toBe(0);
+    await page.clock.runFor(11000);
+    expect(await attempts()).toBe(count);
+    await page.getByRole("button", { name: "Restart", exact: true }).click();
+    await expect(page.getByText("Shell exited", { exact: true })).toHaveCount(0);
+    await expect.poll(attempts).toBeGreaterThan(count);
+  });
+}

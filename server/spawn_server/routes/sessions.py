@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from .. import auth, grid, legion, schemas
 from ..db import get_session
@@ -156,6 +157,15 @@ async def resolve_agent_id(db: AsyncSession, *, user: User, agent_id: str | None
     if agent is None or agent.owner_user_id not in (None, user.id):
         raise HTTPException(status_code=404, detail="agent not found")
     return agent.id
+
+
+def set_session_status(session_row: Session, status: str) -> None:
+    # Include both columns even when the ORM read the same value. Registration
+    # can end or restore this window between the route's read and its commit.
+    session_row.status = status
+    session_row.ended_by_host_restart_at = None
+    flag_modified(session_row, "status")
+    flag_modified(session_row, "ended_by_host_restart_at")
 
 
 async def create_session_row(
@@ -380,7 +390,7 @@ async def restart_session(
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
     now = _utcnow()
-    session_row.status = "starting"
+    set_session_status(session_row, "starting")
     session_row.started_at = now
     session_row.exited_at = None
     session_row.exit_code = None
@@ -476,6 +486,7 @@ async def move_session(
             host_id=target.id,
             cwd=body.cwd,
             status="starting",
+            ended_by_host_restart_at=None,
             started_at=_utcnow(),
             exited_at=None,
             exit_code=None,
@@ -555,7 +566,7 @@ def mark_session_stopped(session_row: Session) -> None:
     # Written here rather than waited for: the daemon confirms the exit with a
     # status frame, but an offline host never will, and a stopped workspace
     # must not read as still running because its host was unreachable.
-    session_row.status = "killed"
+    set_session_status(session_row, "killed")
     session_row.exited_at = _utcnow()
     session_row.foreground_command = None
 

@@ -1151,6 +1151,7 @@ async fn serve_one_connection_with_loader(
         .iter()
         .map(|binding| binding.session_id.clone())
         .collect::<std::collections::HashSet<_>>();
+    let (existing_sessions, existing_sessions_complete) = registry.registration_inventory();
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
@@ -1163,7 +1164,8 @@ async fn serve_one_connection_with_loader(
         keeps_peers_across_reconnect: true,
         live_bindings,
         session_ice_policy: true,
-        existing_sessions: registry.ids(),
+        existing_sessions,
+        existing_sessions_complete,
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
         supports_device_connections: true,
@@ -3937,6 +3939,7 @@ async fn handle_session_create(
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let session_id = create.session_id;
+    let change = registry.worker_change();
     tracing::info!(%session_id, "session.create");
 
     let _ = crate::update::refresh_worker_pair_status().await;
@@ -3948,6 +3951,7 @@ async fn handle_session_create(
             "spawn-worker does not match spawnd; run spawnd update to repair the installed pair",
         )
         .await;
+        change.finish();
         send_spawn_failed_exit(session_id, out_tx, "worker mismatch").await;
         return;
     }
@@ -3960,6 +3964,7 @@ async fn handle_session_create(
     normalize_session_env(&mut env).await;
     if let Err(error) = materialize_session_capabilities(&create, &mut env) {
         tracing::warn!(%session_id, %error, "session capability setup failed");
+        change.finish();
         send_spawn_failed_exit(session_id, out_tx, "capability setup failed").await;
         return;
     }
@@ -3973,6 +3978,7 @@ async fn handle_session_create(
         match ensure_session_cwd(&create.cwd).await {
             Some(path) => path,
             None => {
+                change.finish();
                 send_spawn_failed_exit(session_id, out_tx, "cwd create failed").await;
                 return;
             }
@@ -4005,14 +4011,7 @@ async fn handle_session_create(
             )
             .await;
             // Update UI status: starting → exited.
-            let exit = Outbound::SessionExit {
-                session_id,
-                exit_code: None,
-                signal: Some("spawn_failed".into()),
-            };
-            if let Ok(s) = serde_json::to_string(&exit) {
-                let _ = out_tx.send(WsOutbound::json(s)).await;
-            }
+            send_exit_signal(session_id, out_tx, "spawn_failed".into()).await;
             return;
         }
     };
@@ -4029,6 +4028,7 @@ async fn handle_session_create(
         Some(Arc::new(env)),
     )
     .await;
+    change.finish();
 }
 
 /// Ask macOS for the folders this daemon reads — once, here, and never again.
@@ -8192,6 +8192,131 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventory_survives_reconnect_and_covers_worker_changes() {
+        // Isolate the login shell, worker directory and all instance state.
+        // No other test (or installed daemon) shares this process environment.
+        let Some(root) = std::env::var_os("SPAWN_TEST_INVENTORY_ROOT") else {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::inventory_survives_reconnect_and_covers_worker_changes",
+                ])
+                .env_clear()
+                .env("SPAWN_TEST_INVENTORY_ROOT", dir.path())
+                .env("SPAWND_WORKER_DIR", dir.path().join("workers"))
+                .env("SPAWND_WORKER_BIN", worker_backend::built_worker_bin())
+                .env("SPAWN_CONFIG_DIR", dir.path().join("config"))
+                .env("SPAWND_NO_CPU_SCOPES", "1")
+                .env("HOME", dir.path())
+                .env("SHELL", "/bin/sh")
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        let rtc = RtcSessions::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let registry = SessionRegistry::new();
+        assert_eq!(registry.registration_inventory(), (vec![], false));
+        assert!(registry.claim_discovery());
+        rediscover_existing_sessions(&registry, &rtc, &tx).await;
+        assert_eq!(registry.registration_inventory(), (vec![], true));
+        let id = Uuid::new_v4();
+        let create = SessionCreate {
+            session_id: id,
+            cwd: root.to_str().unwrap().into(),
+            skills: vec![],
+            create_cwd: false,
+        };
+
+        // Restart with no old worker: pause before the lifecycle lookup.
+        let hold = registry.lock_generation_transition(id).await;
+        let restart = handle_session_restart(create.clone(), &registry, &rtc, &tx);
+        tokio::pin!(restart);
+        assert!(futures_util::poll!(&mut restart).is_pending());
+        assert_eq!(registry.registration_inventory(), (vec![], false));
+        drop(hold);
+        restart.await;
+        assert_eq!(registry.registration_inventory(), (vec![id], true));
+
+        // A second supervisor adopts the real shell from its startup marker.
+        let adopted = SessionRegistry::new();
+        assert!(adopted.claim_discovery());
+        rediscover_existing_sessions(&adopted, &rtc, &tx).await;
+        assert!(!adopted.claim_discovery());
+        assert_eq!(adopted.registration_inventory(), (vec![id], true));
+        assert!(adopted.with_handle(id, |h| h.write_stdin(b"exit 23\n").unwrap()));
+        loop {
+            let frame: serde_json::Value =
+                serde_json::from_str(rx.recv().await.unwrap().as_str()).unwrap();
+            if frame["type"] == "session.exit" && frame["exit_code"] == 23 {
+                break;
+            }
+        }
+        assert_eq!(adopted.registration_inventory(), (vec![], true));
+
+        // Poll a create and a lazy adoption at their first suspension. Neither
+        // has a registry binding yet. A cancelled launch is uncertain too.
+        let hold = adopted.lock_attach().await;
+        let attach = ensure_session_attached(Uuid::new_v4(), &adopted, &rtc, &tx);
+        tokio::pin!(attach);
+        assert!(futures_util::poll!(&mut attach).is_pending());
+        assert!(!adopted.registration_inventory().1);
+        drop(hold);
+        assert!(matches!(attach.await, AttachOutcome::Unavailable));
+        let launch = handle_session_create(create, &adopted, &rtc, &tx);
+        tokio::pin!(launch);
+        assert!(futures_util::poll!(&mut launch).is_pending());
+        assert_eq!(adopted.registration_inventory(), (vec![], false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn startup_inventory_needs_proof_for_every_marker() {
+        use spawnd::sessiond::endpoint::{self, LockAttempt};
+        let _env_lock = worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let env = worker_backend::tests::WorkerEnv::install(false);
+        let id = Uuid::new_v4();
+        let ep = endpoint::endpoint_for(env.path(), &endpoint::config_root_tag(), id).unwrap();
+        let LockAttempt::Acquired(held) = endpoint::try_reserve(&ep).unwrap() else {
+            panic!()
+        };
+        let (out, _rx) = mpsc::channel(4);
+        let rtc = RtcSessions::new();
+
+        // A previous supervisor may have died between spawning and bind.
+        assert!(!worker_backend::startup_worker_markers().1);
+        drop(std::os::unix::net::UnixListener::bind(ep.main_arg()).unwrap());
+        let uncertain = SessionRegistry::new();
+        assert!(uncertain.claim_discovery());
+        rediscover_existing_sessions(&uncertain, &rtc, &out).await;
+        assert_eq!(uncertain.registration_inventory(), (vec![], false));
+        drop(held);
+        assert!(!uncertain.claim_discovery());
+        assert!(!uncertain.registration_inventory().1);
+
+        let clean = SessionRegistry::new();
+        rediscover_existing_sessions(&clean, &rtc, &out).await;
+        assert_eq!(clean.registration_inventory(), (vec![], true));
+        assert!(!Path::new(ep.main_arg()).exists());
+        // Cleanup under the reservation can still refuse an untrusted file.
+        std::fs::write(ep.main_arg(), []).unwrap();
+        let invalid = SessionRegistry::new();
+        rediscover_existing_sessions(&invalid, &rtc, &out).await;
+        assert!(!invalid.registration_inventory().1);
+        assert!(Path::new(ep.main_arg()).is_file());
+    }
+
     fn skilled_create(cwd: &str) -> SessionCreate {
         SessionCreate {
             session_id: Uuid::new_v4(),
@@ -8581,6 +8706,7 @@ async fn handle_session_restart(
     let session_id = create.session_id;
     let daemon_pid = std::process::id();
     tracing::info!(daemon_pid, %session_id, "session.restart");
+    let change = registry.worker_change();
 
     // Hold the generation transition across every lifecycle delivery. This
     // lets each TERM/KILL revalidate the exact atomic lifecycle snapshot and
@@ -8660,6 +8786,7 @@ async fn handle_session_restart(
     }
     tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
     handle_session_create(create, registry, rtc_sessions, out_tx).await;
+    change.finish();
     // The replacement is registered (or its failure is on the wire): a device
     // re-offering on this word is not refused for a session that is gone.
     if let Some(announcements) = announcements {
@@ -8812,10 +8939,14 @@ async fn send_error_code(
 }
 
 async fn send_spawn_failed_exit(session_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, reason: &str) {
+    send_exit_signal(session_id, out_tx, format!("spawn_failed: {reason}")).await;
+}
+
+async fn send_exit_signal(session_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, signal: String) {
     let exit = Outbound::SessionExit {
         session_id,
         exit_code: None,
-        signal: Some(format!("spawn_failed: {reason}")),
+        signal: Some(signal),
     };
     if let Ok(s) = serde_json::to_string(&exit) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
@@ -8830,12 +8961,20 @@ async fn spawn_exit_forwarder(
     rtc_sessions: RtcSessions,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
-    let reason = exit_rx.await.unwrap_or(pty::ExitReason {
+    let reason = exit_rx.await;
+    let confirmed_exit = reason
+        .as_ref()
+        .is_ok_and(|reason| reason.signal.as_deref() != Some("worker_lost"));
+    let reason = reason.unwrap_or(pty::ExitReason {
         exit_code: None,
         signal: None,
     });
     let transition = registry.lock_generation_transition(session_id).await;
+    let change = registry.worker_change();
     let removed = registry.remove_if_generation(session_id, generation);
+    if confirmed_exit || removed.is_none() {
+        change.finish();
+    }
     let announcements = rtc_sessions
         .close_for_session(session_id, generation, "session ended")
         .await;
@@ -8871,7 +9010,12 @@ async fn adopt_worker_session(
     if registry.contains(session_id) {
         return Ok(true);
     }
-    let Some(launched) = worker_backend::adopt(session_id).await? else {
+    let adopted = if notify_started {
+        worker_backend::adopt(session_id).await?
+    } else {
+        worker_backend::adopt_candidate(session_id).await?
+    };
+    let Some(launched) = adopted else {
         return Ok(false);
     };
     register_attached(
@@ -8960,16 +9104,20 @@ async fn ensure_session_attached(
     }
     // Serialize lazy adoption: snapshot bursts and stdin dispatch racing here
     // would double-connect and displace each other's worker connections.
+    let change = registry.worker_change();
     let _guard = registry.lock_attach().await;
     if registry.contains(session_id) {
+        change.finish();
         return AttachOutcome::Attached;
     }
     match adopt_worker_session(session_id, registry, rtc_sessions, out_tx, true).await {
         Ok(true) => {
+            change.finish();
             tracing::info!(%session_id, "lazily adopted session worker");
             AttachOutcome::Attached
         }
         Ok(false) => {
+            change.finish();
             tracing::debug!(%session_id, "no session worker found for unknown session");
             AttachOutcome::Unavailable
         }
@@ -8987,7 +9135,8 @@ async fn rediscover_existing_sessions(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    for session_id in worker_backend::discover_ids() {
+    let (ids, mut complete) = worker_backend::startup_worker_markers();
+    for session_id in ids {
         if registry.contains(session_id) {
             continue;
         }
@@ -8995,8 +9144,10 @@ async fn rediscover_existing_sessions(
             Ok(true) => tracing::info!(%session_id, "rediscovered worker-backed session"),
             Ok(false) => {}
             Err(e) => {
+                complete = false;
                 tracing::warn!(%session_id, error = %e, "failed to adopt session worker");
             }
         }
     }
+    registry.finish_discovery(complete);
 }

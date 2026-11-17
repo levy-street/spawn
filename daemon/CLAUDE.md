@@ -153,6 +153,12 @@ Nothing but `register` goes out on a control websocket before the server's
 foreground re-announcement each makes on install — are installed from the
 `Registered` arm of `dispatch_loop`, never from connect.
 
+On registration, `run.rs` takes `existing_sessions` and
+`existing_sessions_complete` together from the registry. Only a finished,
+fully resolved startup scan permits the flag. Launch, adoption and restart
+cover the gap before registry insertion. An uncertain worker leaves the flag
+off across reconnects. See `docs/SESSIOND.md` for the host reboot case.
+
 ## Platform boundaries and Windows paths
 
 OS syscalls and security policy that a feature module should not have to

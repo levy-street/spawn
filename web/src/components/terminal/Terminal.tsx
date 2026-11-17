@@ -1404,8 +1404,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     enabled:
       socketWanted &&
       daemonConnection !== null &&
-      sessionIdentityQuery.data?.status !== "exited" &&
-      sessionIdentityQuery.data?.status !== "killed",
+      sessionIdentityQuery.data !== undefined &&
+      sessionIdentityQuery.data.status !== "exited" &&
+      sessionIdentityQuery.data.status !== "killed",
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -1647,6 +1648,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         scrollbackSnapshotTimeoutRef.current = null;
       }
       scrollbackSnapshotInFlightRef.current = false;
+    },
+    onStatus: (status) => {
+      if (status === "running" || status === "starting") setExitBanner(null);
     },
     onExit: (code, sig) => {
       const banner = `\r\n\x1b[33m[session exited code=${code ?? "?"}${

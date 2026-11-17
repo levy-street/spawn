@@ -451,21 +451,6 @@ pub(super) fn endpoint_exists(endpoint: &Endpoint) -> bool {
     endpoint.inner.socket.exists()
 }
 
-pub(super) fn discover_ids(dir: &Path, _tag: &str) -> Vec<Uuid> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let stem = name.strip_suffix(".sock")?;
-            Uuid::parse_str(stem).ok()
-        })
-        .collect()
-}
-
 pub struct LifecycleExchange {
     request: [u8; wire::LIFECYCLE_REQUEST_LEN + 1],
     len: usize,

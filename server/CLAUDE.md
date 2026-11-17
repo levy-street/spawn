@@ -55,6 +55,12 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   `spawn.alerts.v1`) are the compatibility contract every deployed peer is held
   to — adding a frame never touches them, and changing one is a fleet-wide
   cutover: read "The wire protocols" in `docs/RELEASE.md` before you do.
+- Once daemon registration has passed its ownership and generation checks,
+  a complete worker list can end missing running windows on that host. Only
+  JSON `true` opts in. A later report can revive a window carrying
+  `ended_by_host_restart_at`. Every explicit stop, restart, move or daemon
+  lifecycle update clears that mark. Keep the registration transaction
+  separate from its websocket sends.
 - A schema change: `models.py` plus an Alembic revision. Keep a single head —
   check `alembic heads` after any merge. Migrations run before the new server
   starts, so old code must tolerate the new schema (`docs/RELEASE.md`).

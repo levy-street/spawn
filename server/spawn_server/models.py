@@ -973,6 +973,7 @@ class Session(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+    ended_by_host_restart_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_output_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

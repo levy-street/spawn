@@ -7,21 +7,21 @@ import hashlib
 import json
 import uuid
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from starlette.websockets import WebSocketDisconnect
 
 from spawn_server import auth
-from spawn_server.db import get_sessionmaker
+from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
 from spawn_server.models import BrowserDevice, Host, HostBrowserPin, Session, User
-from spawn_server.redis import get_backend
+from spawn_server.redis import get_backend, session_event_channel, user_alert_channel
 from spawn_server.ws.broker import DaemonConn, HostBrowserConn, get_broker
 from spawn_server.ws.daemon import (
     _allocate_host_generation,
@@ -3586,3 +3586,341 @@ async def test_pruning_a_revoked_endorser_keeps_its_subtree_severed(client):
         assert endorsed_pin.endorser_device_id == endorser_id
     assert await _live_browser_device_ids(host_id) == [direct_id]
     assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {direct_id}
+
+
+@contextmanager
+def _registration_statements():
+    statements = []
+    engine = get_engine().sync_engine
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+
+async def _inventory_owner():
+    async with get_sessionmaker()() as db:
+        user = User(email=str(uuid.uuid4()), password_hash="")
+        db.add(user)
+        await db.commit()
+        return user.id
+
+
+def _inventory_socket(host, owner):
+    token = auth.issue_daemon_token(host, owner)
+    return FakeDaemonWebSocket(authorization=f"Bearer {token}")
+
+
+async def test_register_inventory_statement_budget_and_legacy_frames(client, monkeypatch):
+    from spawn_server.ws import daemon as daemon_mod
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    sid = await _create_session_row(owner, host)
+    await _set_session_status(sid, "killed")
+    # Capture precisely through the end of registration, excluding teardown.
+    traces = []
+
+    async def capture_end(*args):
+        traces.append(statements.copy())
+
+    monkeypatch.setattr(daemon_mod, "_auto_update_after_registration", capture_end)
+    for reported in ([], [sid]):
+        frames = None
+        legacy_sql = None
+        for flag in (
+            {},
+            {"existing_sessions_complete": False},
+            {"existing_sessions_complete": 1},
+            {"existing_sessions_complete": "true"},
+            {"existing_sessions_complete": None},
+            {"existing_sessions_complete": True},
+        ):
+            ws = _inventory_socket(host, owner)
+            ws.queue_text({"type": "register", "existing_sessions": reported, **flag})
+            ws.queue_disconnect()
+            with _registration_statements() as statements:
+                await daemon_ws(ws, token=None)
+            trace = traces.pop()
+            if frames is None:
+                frames, legacy_sql = _sent_json(ws), trace
+                if get_engine().dialect.name == "sqlite":
+                    # Captured from the base registration path: the second
+                    # owner check and two row lookups apply only for a report.
+                    assert len(trace) == (14 if reported else 11)
+                assert [f["type"] for f in frames] == ["registered"] + ["session.kill"] * len(
+                    reported
+                )
+                assert len([s for s in trace if "FROM sessions " in s]) == len(reported) * 2
+            assert _sent_json(ws) == frames
+            if flag.get("existing_sessions_complete") is True:
+                extra = [s for s in trace if s not in legacy_sql]
+                assert len(trace) == len(legacy_sql) + 1
+                assert len(extra) == 1 and extra[0].startswith(
+                    "SELECT sessions.id, sessions.foreground_command"
+                )
+                assert [s for s in trace if s not in extra] == legacy_sql
+            else:
+                assert trace == legacy_sql
+
+
+async def test_complete_reconnect_ends_missing_workers_and_reverses_on_live_report(
+    file_sqlite_client, monkeypatch
+):
+    from spawn_server.ws import daemon as daemon_mod
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    missing = [await _create_session_row(owner, host) for _ in range(2)]
+    protected = {}
+    for status in ("starting", "killed", "exited", "unknown"):
+        sid = await _create_session_row(owner, host)
+        await _set_session_status(sid, status)
+        protected[sid] = status
+    other = await _create_host(owner)
+    protected[await _create_session_row(owner, other)] = "running"
+    protected[await _create_session_row(await _inventory_owner(), host)] = "running"
+    headers = {"Authorization": f"Bearer {auth.issue_access_token(owner)}"}
+    saved_thread = str(uuid.uuid4())
+    async with get_sessionmaker()() as db:
+        row = await db.get(Session, missing[0])
+        row.foreground_command = "codex"
+        row.agent_session_id = saved_thread
+        await db.commit()
+
+    ws = _inventory_socket(host, owner)
+    ws.queue_text({"type": "register", "existing_sessions": missing})
+    ws.queue_disconnect()
+    await daemon_ws(ws, token=None)
+    ws = _inventory_socket(host, owner)
+    original = daemon_mod._publish_session_event_if_owner
+    events = []
+
+    async def publish(conn, sid, frame):
+        assert _sent_json(ws)[0]["type"] == "registered"
+        assert get_broker().get_daemon_for_host(host) is conn
+        events.append((sid, frame))
+        return await original(conn, sid, frame)
+
+    monkeypatch.setattr(daemon_mod, "_publish_session_event_if_owner", publish)
+    # Keep the fixture local. Listen on the actual channels a device subscribes to.
+    monkeypatch.setattr(daemon_mod, "_schedule_alert_push", lambda *_: None)
+    ws.queue_text({"type": "register", "existing_sessions": [], "existing_sessions_complete": True})
+    ws.queue_disconnect()
+    async with (
+        get_backend().subscribe_channel(user_alert_channel(owner)) as device,
+        get_backend().subscribe_channel(session_event_channel(missing[0])) as pane,
+    ):
+        with _registration_statements() as statements:
+            await daemon_ws(ws, token=None)
+        messages = [json.loads(await asyncio.wait_for(anext(device), 2)) for _ in range(5)]
+        exit_frame = {"type": "session.exit", "exit_code": None, "signal": "worker_lost"}
+        assert json.loads(await asyncio.wait_for(anext(pane), 2)) == exit_frame
+    assert sorted(events) == sorted((sid, exit_frame) for sid in missing)
+    assert sorted(m["id"] for m in messages if m.get("resource") == "sessions") == sorted(missing)
+    assert sorted(m["session_id"] for m in messages if m.get("event") == "session.died") == sorted(
+        missing
+    )
+    assert next(m for m in messages if m.get("session_id") == missing[0])["command"] == "codex"
+    assert len([s for s in statements if s.startswith("UPDATE sessions ")]) == 1
+    for sid in missing:
+        response = await file_sqlite_client.get(f"/api/sessions/{sid}", headers=headers)
+        assert response.status_code == 200
+        row = response.json()
+        assert row["status"] == "killed" and row["exited_at"] is not None
+        assert row["exit_code"] is None and row["foreground_command"] is None
+        assert "ended_by_host_restart_at" not in row
+        async with get_sessionmaker()() as db:
+            held = await db.get(Session, sid)
+            assert held.ended_by_host_restart_at == held.exited_at
+    async with get_sessionmaker()() as db:
+        for sid, expected in protected.items():
+            row = await db.get(Session, sid)
+            assert (row.status, row.ended_by_host_restart_at) == (expected, None)
+
+    done = _signal_when_registration_done(monkeypatch)
+    ws = _inventory_socket(host, owner)
+    task = asyncio.create_task(daemon_ws(ws, token=None))
+    try:
+        ws.queue_text({"type": "register", "existing_sessions": [missing[0]]})
+        await asyncio.wait_for(done.wait(), 2)
+        assert _frames_for(ws, missing[0]) == []
+        assert get_broker().get_daemon_for_session(missing[0]) is get_broker().get_daemon_for_host(
+            host
+        )
+        assert events[-1] == (missing[0], {"type": "session.status", "status": "running"})
+        async with get_sessionmaker()() as db:
+            row = await db.get(Session, missing[0])
+            assert (
+                row.status,
+                row.ended_by_host_restart_at,
+                row.exited_at,
+                row.agent_session_id,
+            ) == ("running", None, None, saved_thread)
+    finally:
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, 2)
+
+
+async def test_complete_inventory_requires_acceptance_and_a_list(client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    sid = await _create_session_row(owner, host)
+    for payload in (
+        {},
+        {"existing_sessions": None},
+        {"existing_sessions": [False]},
+        {"existing_sessions": ["invalid"]},
+    ):
+        ws = _inventory_socket(host, owner)
+        ws.queue_text({"type": "register", "existing_sessions_complete": True, **payload})
+        ws.queue_disconnect()
+        await daemon_ws(ws, token=None)
+    monkeypatch.setattr(get_broker(), "accept_daemon_owner", AsyncMock(return_value=False))
+    ws = _inventory_socket(host, owner)
+    ws.queue_text({"type": "register", "existing_sessions_complete": True, "existing_sessions": []})
+    await daemon_ws(ws, token=None)
+    assert not _sent_json(ws)
+    async with get_sessionmaker()() as db:
+        row = await db.get(Session, sid)
+        assert (row.status, row.ended_by_host_restart_at) == ("running", None)
+
+
+async def test_a_failed_registration_reply_leaves_the_window_running(client, monkeypatch):
+    from spawn_server.ws import daemon as daemon_mod
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    sid = await _create_session_row(owner, host)
+    send = daemon_mod._bounded_send_text
+
+    async def fail_reply(conn, payload):
+        if payload["type"] == "registered":
+            raise WebSocketDisconnect()
+        await send(conn, payload)
+
+    monkeypatch.setattr(daemon_mod, "_bounded_send_text", fail_reply)
+    ws = _inventory_socket(host, owner)
+    ws.queue_text({"type": "register", "existing_sessions_complete": True, "existing_sessions": []})
+    with _registration_statements() as statements:
+        await daemon_ws(ws, token=None)
+    assert not any(s.startswith("UPDATE sessions ") for s in statements)
+    async with get_sessionmaker()() as db:
+        row = await db.get(Session, sid)
+        assert (row.status, row.ended_by_host_restart_at) == ("running", None)
+
+
+async def test_superseded_complete_inventory_cannot_end_the_winners_worker(
+    file_sqlite_client, monkeypatch
+):
+    from spawn_server.ws import daemon as daemon_mod
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    sid = await _create_session_row(owner, host)
+    old = _inventory_socket(host, owner)
+    winner = _inventory_socket(host, owner)
+    pending, release = asyncio.Event(), asyncio.Event()
+    registered = _signal_when_registration_done(monkeypatch)
+    read = daemon_mod._read_workers_to_stop
+
+    async def pause_complete(*args):
+        if args[-1]:
+            pending.set()
+            await release.wait()
+        return await read(*args)
+
+    monkeypatch.setattr(daemon_mod, "_read_workers_to_stop", pause_complete)
+    old.queue_text(
+        {"type": "register", "existing_sessions_complete": True, "existing_sessions": []}
+    )
+    old_task = asyncio.create_task(daemon_ws(old, token=None))
+    await asyncio.wait_for(pending.wait(), 2)
+    winner.queue_text({"type": "register", "existing_sessions": [sid]})
+    winner_task = asyncio.create_task(daemon_ws(winner, token=None))
+    try:
+        await asyncio.wait_for(registered.wait(), 2)
+        release.set()
+        old.queue_disconnect()
+        await asyncio.wait_for(old_task, 2)
+        async with get_sessionmaker()() as db:
+            row = await db.get(Session, sid)
+            assert (row.status, row.ended_by_host_restart_at) == ("running", None)
+        assert _frames_for(winner, sid) == []
+    finally:
+        release.set()
+        winner.queue_disconnect()
+        await asyncio.wait_for(winner_task, 2)
+
+
+@pytest.mark.parametrize("action", ["restart", "move", "archive", "unarchive", "started", "exit"])
+async def test_explicit_session_writers_replace_inventory_mark(client, monkeypatch, action):
+    from tests.test_workspaces import _envelope, _tile
+
+    owner = await _inventory_owner()
+    host = await _create_host(owner)
+    sid = await _create_session_row(owner, host)
+    headers = {"Authorization": f"Bearer {auth.issue_access_token(owner)}"}
+    done = _signal_when_registration_done(monkeypatch)
+    live = _inventory_socket(host, owner)
+    live.queue_text({"type": "register", "existing_sessions": [sid]})
+    task = asyncio.create_task(daemon_ws(live, token=None))
+    await asyncio.wait_for(done.wait(), 2)
+    target_task = None
+    try:
+        if action == "move":
+            target = await _create_host(owner)
+            done.clear()
+            other = _inventory_socket(target, owner)
+            other.queue_text({"type": "register"})
+            target_task = asyncio.create_task(daemon_ws(other, token=None))
+            await asyncio.wait_for(done.wait(), 2)
+        if action in ("archive", "unarchive"):
+            created = await client.post("/api/workspaces", headers=headers, json={})
+            workspace = created.json()["workspace"]["id"]
+            path = f"/api/workspaces/{workspace}"
+            layout = _envelope([_tile(sid, 0, 0, 24, 24)])
+            assert (await client.patch(path, headers=headers, json={"layout": layout})).is_success
+            if action == "unarchive":
+                assert (await client.post(f"{path}/archive", headers=headers)).is_success
+        async with get_sessionmaker()() as db:
+            row = await db.get(Session, sid)
+            row.status = "killed"
+            row.ended_by_host_restart_at = row.exited_at = datetime.now(UTC)
+            await db.commit()
+        if action in ("started", "exit"):
+            live.queue_text({"type": f"session.{action}", "session_id": sid})
+            # Heartbeat dispatch follows the lifecycle commit in this same read loop.
+            live.queue_text({"type": "host.heartbeat"})
+            await _wait_until(lambda: any(f["type"] == "host.heartbeat" for f in _sent_json(live)))
+        elif action in ("archive", "unarchive"):
+            assert (await client.post(f"{path}/{action}", headers=headers)).is_success
+        else:
+            data = (
+                {"host_id": target, "expected_host_id": host, "cwd": "/"}
+                if action == "move"
+                else {}
+            )
+            response = await client.post(
+                f"/api/sessions/{sid}/{action}", headers=headers, json=data
+            )
+            assert response.is_success, response.text
+        expected = {"started": "running", "exit": "exited", "archive": "killed"}.get(
+            action, "starting"
+        )
+        async with get_sessionmaker()() as db:
+            row = await db.get(Session, sid)
+            assert (row.status, row.ended_by_host_restart_at) == (expected, None)
+    finally:
+        live.queue_disconnect()
+        await asyncio.wait_for(task, 2)
+        if target_task:
+            other.queue_disconnect()
+            await asyncio.wait_for(target_task, 2)

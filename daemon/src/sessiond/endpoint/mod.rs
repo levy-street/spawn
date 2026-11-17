@@ -146,7 +146,59 @@ pub fn endpoint_exists(endpoint: &Endpoint) -> bool {
 }
 
 pub fn discover_ids(dir: &Path, tag: &str) -> Vec<Uuid> {
-    imp::discover_ids(dir, tag)
+    scan_worker_markers(dir, tag, false).0
+}
+
+pub fn scan_worker_markers(dir: &Path, tag: &str, check_reservations: bool) -> (Vec<Uuid>, bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (Vec::new(), false);
+    };
+    let mut ids = Vec::new();
+    let mut reservations = std::collections::HashSet::new();
+    let mut complete = true;
+    #[cfg(unix)]
+    let suffix = ".sock";
+    #[cfg(windows)]
+    let suffix = ".endpoint";
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if check_reservations {
+            if let Some(id) = name
+                .strip_suffix(".lock")
+                .or_else(|| name.strip_suffix(".lifecycle.sock"))
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                reservations.insert(id);
+            }
+        }
+        let Some(id) = name
+            .strip_suffix(suffix)
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            continue;
+        };
+        #[cfg(windows)]
+        if !endpoint_for(dir, tag, id).is_ok_and(|ep| endpoint_exists(&ep)) {
+            complete = false;
+            continue;
+        }
+        ids.push(id);
+    }
+    for id in &ids {
+        reservations.remove(id);
+    }
+    for id in reservations {
+        complete &= endpoint_for(dir, tag, id).is_ok_and(|ep| match try_reserve_stale(&ep) {
+            Ok(LockAttempt::Acquired(lock)) => remove_stale(&ep, &lock).is_ok(),
+            _ => false,
+        });
+    }
+    (ids, complete)
 }
 
 pub async fn receive_lifecycle(listener: &mut LifecycleListener) -> Result<LifecycleExchange> {
