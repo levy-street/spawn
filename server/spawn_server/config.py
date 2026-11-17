@@ -165,6 +165,8 @@ class Settings(BaseSettings):
     mobile_tree: str | None = None
     desktop_version: str | None = None
     desktop_tree: str | None = None
+    # Off by default. A private absolute directory outside the checkout.
+    support_log_dir: str | None = None
     daemon_auto_update: bool = True
     prebuilt_dir: Path = Field(
         default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"

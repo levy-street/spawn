@@ -36,10 +36,13 @@ from .routes import push as push_routes
 from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
+from .routes import support_log as support_log_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import waitlist as waitlist_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .support_log_files import prepare_store
+from .support_log_retention import start_sweeps, stop_sweeps
 from .turn import validate_and_log_ice_config
 from .ws import alerts as alerts_ws
 from .ws import browser as browser_ws
@@ -97,9 +100,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:  # noqa: BLE001
             log.warning("builtin agent seed skipped: %s", e)
 
+    support_sweeps = None
+    store = await prepare_store()
+    if store is not None:
+        # Include once per app, even if a test enters its lifespan again.
+        if hasattr(app.state, "support_log_routes"):
+            app.routes.extend(app.state.support_log_routes)
+        else:
+            before = len(app.routes)
+            app.include_router(support_log_routes.router)
+            app.state.support_log_routes = app.routes[before:]
+        app.openapi_schema = None
+        app.state.support_log_store = store
+        support_sweeps = start_sweeps(store)
     try:
         yield
     finally:
+        if support_sweeps is not None:
+            del app.state.support_log_store
+            for route in app.state.support_log_routes:
+                app.routes.remove(route)
+            app.openapi_schema = None
+            await stop_sweeps(support_sweeps)
         await get_broker().shutdown()
         await redis_shutdown()
         await dispose_engine()

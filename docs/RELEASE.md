@@ -1651,6 +1651,18 @@ Migrations run before the new server starts, so a release is safe only when the
 old code tolerates the new schema. Add columns and backfill in one release,
 then start depending on them in the next.
 
+The support log storage migration (0072) adds two tables and the unused,
+default-false `hosts.support_log_capable` column. Old server code tolerates all
+three additions. `SPAWN_SUPPORT_LOG_DIR` is the one storage setting: leave it
+unset to keep the feature off (404 uploads, no support file access or sweep).
+If enabled later, it must name an absolute private directory outside the
+checkout and database backups. The directory must be on the server's local
+disk because each startup waits for a worker thread to prepare it with mode
+0700 and check locking and writing. A failure logs one error and keeps storage
+off for that lifespan. There is still no request sender or app sharing switch
+in this change, so setting the directory alone cannot cause collection. Read
+the support log section of `docs/TRUST.md` before enabling this storage.
+
 For a Windows launch or any release that changes the native Windows handoff,
 ship in this order:
 

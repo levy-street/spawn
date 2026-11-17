@@ -184,6 +184,7 @@ async def sign_out_everywhere(
 @router.post("/account/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_account(
     body: schemas.AccountDeleteRequest,
+    request: Request,
     response: Response,
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
@@ -234,9 +235,13 @@ async def delete_account(
         .scalars()
         .all()
     )
-    await session.execute(delete(HostKeyClaim).where(HostKeyClaim.owner_user_id == user.id))
-    await session.execute(delete(User).where(User.id == user.id))
-    await session.commit()
+    from ..support_log_files import get_store
+    from ..support_log_retention import account_deletion_files
+
+    async with account_deletion_files(session, user.id, get_store(request.app)):
+        await session.execute(delete(HostKeyClaim).where(HostKeyClaim.owner_user_id == user.id))
+        await session.execute(delete(User).where(User.id == user.id))
+        await session.commit()
 
     for host_id in host_ids:
         try:

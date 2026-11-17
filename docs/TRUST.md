@@ -201,14 +201,39 @@ on a host it no longer owns.
 | Agent commands, paths, installed/latest versions, output, and detailed errors | current checks: REST plus `host.agents.check`; install definitions and historical policy/errors remain stored | installation is refused and automation disabled; checks remain server-readable and execute server-selected binaries; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
-### Optional support log sharing: daemon foundation only
+### Optional support log sharing: storage foundation
 
 **This is an exception that can disclose diagnostic information to the server
 operator. It is off for everyone until the apps ship a sharing switch.** This
-change implements only host-side statement verification and bounded collection.
-No app signs a statement, no server sends a collection request, and server-side
-upload storage, retention and owner-facing collection history are not built yet.
-There is no new server-side storage guarantee or retention promise.
+server foundation stores signed statements and collection records and has a
+daemon upload route. No app signs a statement and no server code creates or
+dispatches a collection request. Owner-facing collection history is not built.
+The route therefore cannot accept a collection in production yet. Storage is
+also off unless `SPAWN_SUPPORT_LOG_DIR` names an absolute private directory
+outside the checkout; an unusable directory leaves it off.
+
+When collection is later enabled, the server stores the **plain log bundle,
+not encrypted at rest**, on its disk outside database backups. Only the
+operator with access to that server can read it; no download route exists.
+Bundles expire after seven days and a bounded sweep runs at startup and every
+15 minutes, so deletion can follow the expiry time. Turning sharing off deletes
+collected files and cancels open requests; deleting an account deletes its files.
+The database retains the current signed statement and collection metadata
+(reason, requester, host snapshot, outcome, times, sizes and digest). Collection
+records are swept after 365 days; statements have no expiry. A missing file is
+reported as missing, never presented as an empty log.
+The stored time range and line count are what the machine reported, checked
+only for form and framing, not verified against event contents. Each server
+process permits one upload per record and four body reads at once; excess
+requests receive 409 or 503 before reading, leaving the record untouched.
+Each body has a total receive deadline of 60 seconds; expiry returns 408 and
+marks the record failed.
+
+The server cannot turn sharing on. It checks statements to keep malformed data
+out of storage, but the daemon independently decides whether the owner's
+statement and signer are valid. Removing the signing device makes server-side
+sharing checks false immediately, without erasing or rewriting the signed row.
+Durable withdrawal remains a signed off statement, not a missing row or null.
 
 The support log is a separate, bounded local record. It holds event times,
 producer builds, levels, source locations, reviewed counters/identifiers/fixed
@@ -224,6 +249,12 @@ collection reader opens exactly the two versioned support files, never lists a
 folder, and never reads ordinary daemon output or terminal storage. A typed
 header adds only the documented state counters, classified error kind/time and
 parsed build identity; it never adds general state-file text.
+
+Through the support log route, the machine sends either a refusal code that
+the server records or a support log bundle that the server checks for size,
+digest and line framing and stores as a file without interpreting its events.
+`scripts/check-no-server-agent-upload.sh` names it as the single exception to
+the rule that keeps agent upload routes off the server.
 
 The owner decides through a statement signed by an approved device. Each host
 requires an account proven by its own retained device approvals; a server-named
