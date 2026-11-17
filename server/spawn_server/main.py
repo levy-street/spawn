@@ -141,7 +141,8 @@ def create_app() -> FastAPI:
     app.include_router(push_routes.router)
     app.include_router(release_routes.router)
     app.include_router(sessions_routes.router)
-    app.include_router(support_log_routes.router)
+    if settings.support_log_dir:
+        app.include_router(support_log_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
     app.include_router(agents_routes.router)

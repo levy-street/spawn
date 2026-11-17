@@ -10,7 +10,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import delete, update
 
@@ -74,7 +73,7 @@ async def seed_statement(*, enabled=True, issued=1000):
 
 
 @pytest.mark.parametrize("vector", VECTORS["positive"])
-def test_shared_positive_and_every_transcript_byte(vector):
+def test_shared_positive_and_every_transcript_byte(vector, monkeypatch):
     value = verify_statement(vector["consent"])
     transcript = encode_transcript(value)
     assert len(transcript) == 102
@@ -86,8 +85,13 @@ def test_shared_positive_and_every_transcript_byte(vector):
     for index in range(len(transcript)):
         mutated = bytearray(transcript)
         mutated[index] ^= 1
-        with pytest.raises(InvalidSignature):
-            key.public_key().verify(signature, mutated)
+        monkeypatch.setattr(
+            "spawn_server.support_consent.encode_transcript",
+            lambda _value, transcript=bytes(mutated): transcript,
+        )
+        with pytest.raises(ConsentError) as caught:
+            verify_statement(value)
+        assert caught.value.reason == ConsentReason.INVALID_SIGNATURE
 
 
 @pytest.mark.parametrize("vector", VECTORS["negative"], ids=lambda v: v["case"])

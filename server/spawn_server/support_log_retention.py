@@ -186,7 +186,12 @@ async def account_deletion_files(session, user_id: str):
         ids = await account_file_ids(session, user_id)
         yield
         for record_id in ids:
-            await asyncio.to_thread(store.remove, record_id)
+            try:
+                await asyncio.to_thread(store.remove, record_id)
+            except OSError:
+                # The account commit has succeeded. Preserve socket/cookie cleanup;
+                # the orphan sweep will retry the remaining file after its grace.
+                log.error("SPAWN D support log account file cleanup failed; sweep will retry")
 
 
 async def run_sweeps(store, stop: asyncio.Event):

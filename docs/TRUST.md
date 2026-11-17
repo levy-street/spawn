@@ -222,6 +222,12 @@ The database retains the current signed statement and collection metadata
 (reason, requester, host snapshot, outcome, times, sizes and digest). Collection
 records are swept after 365 days; statements have no expiry. A missing file is
 reported as missing, never presented as an empty log.
+The stored time range and line count are what the machine reported, checked
+only for form and framing, not verified against event contents. Each server
+process permits one upload per record and four body reads at once; excess
+requests receive 409 or 503 before reading, leaving the record untouched.
+Each body has a total receive deadline of 60 seconds; expiry returns 408 and
+marks the record failed.
 
 The server cannot turn sharing on. It checks statements to keep malformed data
 out of storage, but the daemon independently decides whether the owner's

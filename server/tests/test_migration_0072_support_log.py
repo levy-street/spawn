@@ -53,8 +53,29 @@ def test_0072_upgrade_downgrade_and_foreign_keys(tmp_path):
                 ),
                 dict(id=survivor_host, owner=survivor, now=now),
             )
+            schema_before = {
+                name: (rootpage, sql)
+                for name, rootpage, sql in conn.execute(
+                    sa.text("SELECT name, rootpage, sql FROM sqlite_master")
+                )
+            }
+            hosts_before = conn.execute(sa.text("SELECT * FROM hosts ORDER BY id")).all()
         _run_python(["-m", "alembic", "upgrade", "0072"], env=env)
         with engine.begin() as conn:
+            schema_after = {
+                name: (rootpage, sql)
+                for name, rootpage, sql in conn.execute(
+                    sa.text("SELECT name, rootpage, sql FROM sqlite_master")
+                )
+            }
+            for name, (rootpage, sql) in schema_before.items():
+                if name == "hosts":
+                    assert schema_after[name][0] == rootpage
+                    assert schema_after[name][1].startswith(sql.splitlines()[0])
+                else:
+                    assert schema_after[name] == (rootpage, sql)
+            hosts_after = conn.execute(sa.text("SELECT * FROM hosts ORDER BY id")).all()
+            assert [tuple(row[:-1]) for row in hosts_after] == hosts_before
             conn.execute(sa.text("PRAGMA foreign_keys=ON"))
             assert not any(conn.execute(sa.text("SELECT support_log_capable FROM hosts")).scalars())
             metadata = sa.MetaData()
@@ -146,3 +167,27 @@ def test_0072_postgres_ddl_offline():
     assert "ON DELETE CASCADE" in ddl and "ON DELETE SET NULL" in ddl
     assert "DROP TABLE support_log_collections" in ddl
     assert "DROP COLUMN support_log_capable" in ddl
+
+
+def test_0072_sqlite_upgrade_only_adds_column_and_new_tables():
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/0072_support_log_store.py"
+    spec = importlib.util.spec_from_file_location("support_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    output = io.StringIO()
+    context = MigrationContext.configure(
+        url="sqlite://", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    statements = [" ".join(sql.split()) for sql in output.getvalue().split(";") if sql.strip()]
+    assert statements.pop(0) == (
+        "ALTER TABLE hosts ADD COLUMN support_log_capable BOOLEAN DEFAULT 0 NOT NULL"
+    )
+    assert len(statements) == 7
+    assert statements[0].startswith("CREATE TABLE support_log_consents (")
+    assert statements[1].startswith("CREATE TABLE support_log_collections (")
+    assert all(
+        sql.startswith("CREATE INDEX ix_support_log_") and " ON support_log_collections (" in sql
+        for sql in statements[2:]
+    )

@@ -20,6 +20,7 @@ from spawn_server.routes import support_log as route
 from spawn_server.support_consent import store_statement
 from spawn_server.support_log import create_request, get_collection, mark_dispatched, transition
 from spawn_server.support_log_files import file_status, get_store
+from spawn_server.support_log_retention import sweep_once
 from tests.test_support_consent import seed_statement, sign
 
 BODY = b'{"format":3}\n{"event":1}\n'
@@ -44,6 +45,15 @@ async def storage(tmp_path, monkeypatch):
     await store.prepare()
     yield store
     store.close()
+    assert not route._inflight and not route._reading
+
+
+@pytest_asyncio.fixture
+async def app(app, storage):
+    # The shared fixture owns the database; assemble routes after configuring storage.
+    from spawn_server.main import create_app
+
+    return create_app()
 
 
 async def setup_request(*, state="dispatched", enabled=True):
@@ -80,7 +90,18 @@ async def post(client, record_id, token, body=BODY, extra=None):
     )
 
 
-async def raw_request(app, record_id, *, token=None, body=BODY, extra=None, chunks=None):
+async def raw_request(
+    app,
+    record_id,
+    *,
+    token=None,
+    body=BODY,
+    extra=None,
+    chunks=None,
+    receive_body=None,
+    method="POST",
+    path=None,
+):
     wire_headers = headers(body)
     if token:
         wire_headers["authorization"] = f"Bearer {token}"
@@ -90,10 +111,10 @@ async def raw_request(app, record_id, *, token=None, body=BODY, extra=None, chun
         type="http",
         asgi={"version": "3.0"},
         http_version="1.1",
-        method="POST",
+        method=method,
         scheme="http",
-        path=url(record_id),
-        raw_path=url(record_id).encode(),
+        path=path or url(record_id),
+        raw_path=(path or url(record_id)).encode(),
         query_string=b"",
         root_path="",
         server=None,
@@ -105,6 +126,8 @@ async def raw_request(app, record_id, *, token=None, body=BODY, extra=None, chun
 
     async def receive():
         reads.append(True)
+        if receive_body is not None:
+            return await receive_body()
         chunk = next(pieces, None)
         return {"type": "http.request", "body": chunk or b"", "more_body": chunk is not None}
 
@@ -463,6 +486,7 @@ async def test_disconnect_marks_failed(app, storage):
     assert caught.value.status_code == 400
     assert isinstance(caught.value.__context__, ClientDisconnect)
     assert (await get_collection(record_id)).state == "failed"
+    assert not route._inflight and not route._reading
 
 
 async def test_cancel_after_rename_finishes_commit(client, storage, monkeypatch):
@@ -474,18 +498,19 @@ async def test_cancel_after_rename_finishes_commit(client, storage, monkeypatch)
         if target == "collected":
             assert storage.path(record_id).exists()
             entered.set()
-            await proceed.wait()
+            await asyncio.wait_for(proceed.wait(), 30)
         return await real_transition(record_id, current, target, **metadata)
 
     monkeypatch.setattr(route, "transition", held_transition)
     task = asyncio.create_task(post(client, record_id, token))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     proceed.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 30)
     assert (await get_collection(record_id)).state == "collected"
     assert storage.path(record_id).read_bytes() == BODY
+    assert not route._inflight and not route._reading
 
 
 async def test_oversized_length_precedes_missing_support_headers(app, storage):
@@ -501,3 +526,297 @@ async def test_oversized_length_precedes_missing_support_headers(app, storage):
     )
     assert status == 413 and reads == 0
     assert (await get_collection(record_id)).state == "failed"
+
+
+@pytest.mark.parametrize("first_kind", ["bundle", "refusal"])
+async def test_bundle_against_refusal_has_one_outcome(app, file_sqlite_client, storage, first_kind):
+    record_id, token, *_ = await setup_request()
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    refusal = b'{"declined":"no_log"}'
+    first_body = BODY if first_kind == "bundle" else refusal
+    first_type = "application/x-ndjson" if first_kind == "bundle" else "application/json"
+
+    async def receive():
+        entered.set()
+        await asyncio.wait_for(proceed.wait(), 30)
+        return {"type": "http.request", "body": first_body, "more_body": False}
+
+    first = asyncio.create_task(
+        raw_request(
+            app,
+            record_id,
+            token=token,
+            body=first_body,
+            extra={"content-type": first_type},
+            receive_body=receive,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        # Admission covers both kinds for the whole request, before any second read.
+        second = await raw_request(
+            app,
+            record_id,
+            token=token,
+            body=refusal if first_kind == "bundle" else BODY,
+            extra={
+                "content-type": "application/json"
+                if first_kind == "bundle"
+                else "application/x-ndjson"
+            },
+        )
+        assert second[0] == 409 and second[2] == 0
+        assert (await get_collection(record_id)).state == "dispatched"
+    finally:
+        proceed.set()
+    result = await asyncio.wait_for(first, 30)
+    assert result[0] == 204
+    await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
+    record = await get_collection(record_id)
+    assert record.state == ("collected" if first_kind == "bundle" else "declined")
+    assert set(storage.root.iterdir()) == (
+        {storage.path(record_id)} if record.state == "collected" else set()
+    )
+    if first_kind == "bundle":
+        assert storage.path(record_id).read_bytes() == BODY
+    else:
+        assert record.decline_code == "no_log"
+
+
+async def test_four_body_reads_reject_fifth_without_touching_record(
+    app, file_sqlite_client, storage
+):
+    from spawn_server.main import create_app
+
+    records = [await setup_request() for _ in range(5)]
+    entered = [asyncio.Event() for _ in range(4)]
+    proceed = asyncio.Event()
+
+    async def receive(index):
+        entered[index].set()
+        await asyncio.wait_for(proceed.wait(), 30)
+        return {"type": "http.request", "body": BODY, "more_body": False}
+
+    tasks = [
+        asyncio.create_task(
+            raw_request(
+                app,
+                record_id,
+                token=token,
+                receive_body=lambda index=index: receive(index),
+            )
+        )
+        for index, (record_id, token, *_) in enumerate(records[:4])
+    ]
+    fifth_id, fifth_token, *_ = records[4]
+    before = await get_collection(fifth_id)
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 30)
+        # A second app in the same process shares the receive limit.
+        status, _, reads = await raw_request(create_app(), fifth_id, token=fifth_token)
+        assert status == 503 and reads == 0
+        after = await get_collection(fifth_id)
+        assert all(
+            getattr(before, column.name) == getattr(after, column.name)
+            for column in SupportLogCollection.__table__.columns
+        )
+        assert not storage.path(fifth_id).exists()
+    finally:
+        proceed.set()
+    results = await asyncio.wait_for(asyncio.gather(*tasks), 30)
+    assert [result[0] for result in results] == [204] * 4
+    assert not route._inflight and not route._reading
+    assert (await raw_request(app, fifth_id, token=fifth_token))[0] == 204
+
+
+@pytest.mark.parametrize("content_type", ["application/x-ndjson", "application/json"])
+async def test_total_receive_deadline_fails_and_releases(app, storage, monkeypatch, content_type):
+    record_id, token, *_ = await setup_request()
+    entered, never = asyncio.Event(), asyncio.Event()
+    deadlines = []
+    timeout = asyncio.timeout
+
+    def capture_timeout(delay):
+        assert delay == 60
+        deadline = timeout(None)
+        deadlines.append(deadline)
+        return deadline
+
+    monkeypatch.setattr(route.asyncio, "timeout", capture_timeout)
+    reads = 0
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return {"type": "http.request", "body": b"{", "more_body": True}
+        entered.set()
+        await asyncio.wait_for(never.wait(), 30)
+        pytest.fail("deadline must interrupt the body read")
+
+    task = asyncio.create_task(
+        raw_request(
+            app,
+            record_id,
+            token=token,
+            extra={"content-type": content_type},
+            receive_body=receive,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 30)
+    assert len(deadlines) == 1  # One total deadline, not a fresh budget per chunk.
+    deadlines[0].reschedule(asyncio.get_running_loop().time())
+    status, _, reads = await asyncio.wait_for(task, 30)
+    assert status == 408 and reads == 2
+    assert (await get_collection(record_id)).state == "failed"
+    assert not list(storage.root.iterdir())
+    assert not route._inflight and not route._reading
+
+
+async def test_cancellation_during_receive_releases_slots(app, storage):
+    record_id, token, *_ = await setup_request()
+    entered, never = asyncio.Event(), asyncio.Event()
+
+    async def receive():
+        entered.set()
+        await asyncio.wait_for(never.wait(), 30)
+        pytest.fail("cancelled reader must stop")
+
+    task = asyncio.create_task(raw_request(app, record_id, token=token, receive_body=receive))
+    await asyncio.wait_for(entered.wait(), 30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 30)
+    assert not route._inflight and not route._reading
+    assert (await raw_request(app, record_id, token=token))[0] == 204
+
+
+async def test_sweep_waits_for_publication_between_rename_and_commit(
+    file_sqlite_client, storage, monkeypatch
+):
+    record_id, token, *_ = await setup_request()
+    renamed, proceed, sweep_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_transition = route.transition
+    original_lock = storage._try_lock
+    loop = asyncio.get_running_loop()
+
+    async def held_transition(record_id, current, target, **metadata):
+        if target == "collected":
+            assert storage.path(record_id).read_bytes() == BODY
+            renamed.set()
+            await asyncio.wait_for(proceed.wait(), 30)
+        return await original_transition(record_id, current, target, **metadata)
+
+    def observed_lock():
+        fd = original_lock()
+        if fd is None:
+            loop.call_soon_threadsafe(sweep_waiting.set)
+        return fd
+
+    monkeypatch.setattr(route, "transition", held_transition)
+    monkeypatch.setattr(storage, "_try_lock", observed_lock)
+    upload = asyncio.create_task(post(file_sqlite_client, record_id, token))
+    await asyncio.wait_for(renamed.wait(), 30)
+    # Advance beyond orphan grace while publication owns the directory lock.
+    sweep = asyncio.create_task(sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11)))
+    try:
+        await asyncio.wait_for(sweep_waiting.wait(), 30)
+        assert not sweep.done()
+        assert (await get_collection(record_id)).state == "dispatched"
+        assert storage.path(record_id).read_bytes() == BODY
+    finally:
+        proceed.set()
+    response, _ = await asyncio.wait_for(asyncio.gather(upload, sweep), 30)
+    assert response.status_code == 204
+    assert (await get_collection(record_id)).state == "collected"
+    assert set(storage.root.iterdir()) == {storage.path(record_id)}
+    assert storage.path(record_id).read_bytes() == BODY
+
+
+@pytest.mark.parametrize("boundary", ["body", "commit"])
+async def test_signer_removed_during_upload_cannot_publish(
+    app, file_sqlite_client, storage, monkeypatch, boundary
+):
+    record_id, token, statement, *_ = await setup_request()
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    original_transition = route.transition
+
+    async def receive():
+        if boundary == "body":
+            entered.set()
+            await asyncio.wait_for(proceed.wait(), 30)
+        return {"type": "http.request", "body": BODY, "more_body": False}
+
+    async def held_transition(record_id, current, target, **metadata):
+        if target == "collected":
+            assert storage.path(record_id).exists()
+            entered.set()
+            await asyncio.wait_for(proceed.wait(), 30)
+        return await original_transition(record_id, current, target, **metadata)
+
+    if boundary == "commit":
+        monkeypatch.setattr(route, "transition", held_transition)
+    task = asyncio.create_task(raw_request(app, record_id, token=token, receive_body=receive))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        assert (await get_collection(record_id)).state == "dispatched"
+        async with get_sessionmaker()() as session:
+            await session.execute(
+                delete(BrowserDevice).where(BrowserDevice.id == statement["signer_device_id"])
+            )
+            await session.commit()
+    finally:
+        proceed.set()
+    status, _, reads = await asyncio.wait_for(task, 30)
+    assert status == 409 and reads == 1
+    assert (await get_collection(record_id)).state == "cancelled"
+    await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
+    assert (await get_collection(record_id)).state == "cancelled"
+    assert not list(storage.root.iterdir())
+
+
+async def test_refusal_wins_against_publication_in_another_worker(
+    file_sqlite_client, storage, monkeypatch
+):
+    from fastapi import HTTPException
+    from starlette.datastructures import Headers
+
+    record_id, token, *_ = await setup_request()
+    renamed, proceed = asyncio.Event(), asyncio.Event()
+    original_transition = route.transition
+
+    async def held_transition(record_id, current, target, **metadata):
+        if target == "collected":
+            assert storage.path(record_id).read_bytes() == BODY
+            renamed.set()
+            await asyncio.wait_for(proceed.wait(), 30)
+        return await original_transition(record_id, current, target, **metadata)
+
+    monkeypatch.setattr(route, "transition", held_transition)
+    # Another worker has its own admission slots; enter its publication directly
+    # while retaining the production directory lock and conditional state update.
+    publication = asyncio.create_task(
+        route.publish(
+            storage,
+            await get_collection(record_id),
+            BODY,
+            route.bundle_metadata(Headers(headers())),
+        )
+    )
+    try:
+        await asyncio.wait_for(renamed.wait(), 30)
+        response = await file_sqlite_client.post(
+            url(record_id),
+            json={"declined": "no_log"},
+            headers={"authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 204
+    finally:
+        proceed.set()
+    with pytest.raises(HTTPException) as caught:
+        await asyncio.wait_for(publication, 30)
+    assert caught.value.status_code == 409
+    await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
+    record = await get_collection(record_id)
+    assert record.state == "declined" and record.decline_code == "no_log"
+    assert not list(storage.root.iterdir())

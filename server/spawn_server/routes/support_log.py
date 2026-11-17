@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from contextlib import contextmanager
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -20,7 +21,27 @@ from ..support_log_files import StoreUnavailable, finish_job, get_store
 router = APIRouter(prefix="/api/support-log", tags=["support-log"])
 MAX_BUNDLE = 921600
 MAX_REFUSAL = 256
+MAX_BODY_READS = 4
+RECEIVE_SECONDS = 60
 NOT_FOUND = "Not Found"
+_inflight: set[str] = set()
+_reading: set[str] = set()
+
+
+@contextmanager
+def upload_slots(record_id: str):
+    # No await between checking and reserving: admission is atomic on this loop.
+    if record_id in _inflight:
+        raise HTTPException(409, "support upload already in progress")
+    if len(_reading) >= MAX_BODY_READS:
+        raise HTTPException(503, "support upload capacity reached")
+    _inflight.add(record_id)
+    _reading.add(record_id)
+    try:
+        yield
+    finally:
+        _reading.discard(record_id)
+        _inflight.remove(record_id)
 
 
 def content_length(request: Request, limit: int) -> int | None:
@@ -41,11 +62,15 @@ def content_length(request: Request, limit: int) -> int | None:
 async def bounded_body(request: Request, limit: int) -> bytearray:
     length = content_length(request, limit)
     body = bytearray()
-    async for chunk in request.stream():
-        # A transport may hand us a huge chunk. Never copy it beyond limit + 1.
-        body.extend(memoryview(chunk)[: limit + 1 - len(body)])
-        if len(body) > limit:
-            raise HTTPException(413, "support log body too large")
+    try:
+        async with asyncio.timeout(RECEIVE_SECONDS):
+            async for chunk in request.stream():
+                # A transport may hand us a huge chunk. Never copy it beyond limit + 1.
+                body.extend(memoryview(chunk)[: limit + 1 - len(body)])
+                if len(body) > limit:
+                    raise HTTPException(413, "support log body too large")
+    except TimeoutError:
+        raise HTTPException(408, "support log receive deadline exceeded") from None
     if length is not None and length != len(body):
         raise HTTPException(400, "content length mismatch")
     return body
@@ -145,55 +170,58 @@ async def upload(request_id: str, request: Request):
             raise HTTPException(404, NOT_FOUND)
         if record.state != "dispatched":
             raise HTTPException(409, "support request closed")
-    if not await is_sharing_on(record.owner_user_id):
-        await transition(record.id, "dispatched", "cancelled")
-        raise HTTPException(409, "support sharing is off")
-    # No filesystem work before daemon authentication and the record check.
-    try:
-        await store.prepare()
-    except StoreUnavailable:
-        raise HTTPException(404, NOT_FOUND) from None
-    content_type = request.headers.get("content-type", "")
-    try:
-        if content_type == "application/x-ndjson":
-            content_length(request, MAX_BUNDLE)
-            metadata = bundle_metadata(request.headers)
-            body = await bounded_body(request, MAX_BUNDLE)
-            await asyncio.to_thread(validate_bundle, body, metadata)
-            await finish_job(publish(store, record, body, metadata))
-        elif content_type == "application/json":
-            body = await bounded_body(request, MAX_REFUSAL)
-            refusal = strict_json(bytes(body))
-            if (
-                not isinstance(refusal, dict)
-                or set(refusal) != {"declined"}
-                or not isinstance(refusal["declined"], str)
-                or refusal["declined"] not in DECLINE_CODES
-            ):
-                raise ValueError
-            changed = await transition(
-                record.id,
-                "dispatched",
-                "declined",
-                require_sharing=True,
-                decline_code=refusal["declined"],
-            )
-            if not changed:
-                await transition(record.id, "dispatched", "cancelled")
-                raise HTTPException(409, "support request closed")
-        else:
-            raise HTTPException(415, "unsupported support log content type")
-    except (ValueError, UnicodeError, RecursionError) as exc:
-        await transition(record.id, "dispatched", "failed")
-        raise HTTPException(400, "invalid support log upload") from exc
-    except HTTPException as exc:
-        if exc.status_code in {400, 413, 415}:
+    with upload_slots(record.id):
+        if not await is_sharing_on(record.owner_user_id):
+            await transition(record.id, "dispatched", "cancelled")
+            raise HTTPException(409, "support sharing is off")
+        # No filesystem work before daemon authentication and the record check.
+        try:
+            await store.prepare()
+        except StoreUnavailable:
+            raise HTTPException(404, NOT_FOUND) from None
+        content_type = request.headers.get("content-type", "")
+        try:
+            if content_type == "application/x-ndjson":
+                content_length(request, MAX_BUNDLE)
+                metadata = bundle_metadata(request.headers)
+                body = await bounded_body(request, MAX_BUNDLE)
+                _reading.remove(record.id)
+                await asyncio.to_thread(validate_bundle, body, metadata)
+                await finish_job(publish(store, record, body, metadata))
+            elif content_type == "application/json":
+                body = await bounded_body(request, MAX_REFUSAL)
+                _reading.remove(record.id)
+                refusal = strict_json(bytes(body))
+                if (
+                    not isinstance(refusal, dict)
+                    or set(refusal) != {"declined"}
+                    or not isinstance(refusal["declined"], str)
+                    or refusal["declined"] not in DECLINE_CODES
+                ):
+                    raise ValueError
+                changed = await transition(
+                    record.id,
+                    "dispatched",
+                    "declined",
+                    require_sharing=True,
+                    decline_code=refusal["declined"],
+                )
+                if not changed:
+                    await transition(record.id, "dispatched", "cancelled")
+                    raise HTTPException(409, "support request closed")
+            else:
+                raise HTTPException(415, "unsupported support log content type")
+        except (ValueError, UnicodeError, RecursionError) as exc:
             await transition(record.id, "dispatched", "failed")
-        raise
-    except ClientDisconnect:
-        await transition(record.id, "dispatched", "failed")
-        raise HTTPException(400, "incomplete support log upload") from None
-    except Exception:
-        await transition(record.id, "dispatched", "failed")
-        raise HTTPException(500, "support log storage failed") from None
+            raise HTTPException(400, "invalid support log upload") from exc
+        except HTTPException as exc:
+            if exc.status_code in {400, 408, 413, 415}:
+                await transition(record.id, "dispatched", "failed")
+            raise
+        except ClientDisconnect:
+            await transition(record.id, "dispatched", "failed")
+            raise HTTPException(400, "incomplete support log upload") from None
+        except Exception:
+            await transition(record.id, "dispatched", "failed")
+            raise HTTPException(500, "support log storage failed") from None
     return Response(status_code=204)

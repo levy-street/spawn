@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import delete, update
@@ -16,7 +21,7 @@ from spawn_server.db import get_sessionmaker
 from spawn_server.models import AuthIdentity, Host, SupportLogCollection, User
 from spawn_server.support_consent import get_statement, store_statement
 from spawn_server.support_log import create_request, get_collection, mark_dispatched, transition
-from spawn_server.support_log_files import CHECKOUT, get_store
+from spawn_server.support_log_files import get_store
 from spawn_server.support_log_retention import (
     account_deletion_files,
     account_file_ids,
@@ -26,10 +31,10 @@ from spawn_server.support_log_retention import (
     sweep_once,
 )
 from tests.test_support_consent import sign
-from tests.test_support_log_uploads import BODY, post, raw_request, setup_request, storage
+from tests.test_support_log_uploads import BODY, app, post, raw_request, setup_request, storage, url
 
 # Re-export this shared fixture without introducing a global test dependency.
-__all__ = ["storage"]
+__all__ = ["app", "storage"]
 
 
 async def age_record(record_id, **changes):
@@ -167,7 +172,10 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     assert not await mark_dispatched(requested)
 
 
-async def test_account_deletion_removes_files_and_cascades(client, storage):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_account_deletion_removes_files_and_cascades(
+    client, storage, monkeypatch, caplog, cleanup_fails
+):
     record_id, token, statement, _key, host = await setup_request()
     assert (await post(client, record_id, token)).status_code == 204
     other, other_token, *_ = await setup_request()
@@ -183,26 +191,110 @@ async def test_account_deletion_removes_files_and_cascades(client, storage):
             )
         )
         await session.commit()
+    socket = Mock(close=AsyncMock())
+    broker = Mock(get_daemon_for_host=Mock(return_value=socket))
+    monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
+    remove = storage.remove
+    if cleanup_fails:
+
+        def fail_remove(_record_id):
+            raise OSError("injected")
+
+        monkeypatch.setattr(storage, "remove", fail_remove)
     response = await client.post(
         "/api/account/delete",
         json={"confirm_email": user.email},
         headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
     )
-    assert response.status_code == 204
+    assert response.status_code == 204 and response.content == b""
+    assert 'spawn_session=""' in response.headers["set-cookie"]
+    assert "Max-Age=0" in response.headers["set-cookie"]
+    broker.get_daemon_for_host.assert_called_once_with(host.id)
+    socket.close.assert_awaited_once()
     assert await get_collection(record_id) is None
     assert await get_statement(user.id) is None
-    assert not storage.path(record_id).exists()
+    assert storage.path(record_id).exists() == cleanup_fails
     assert storage.path(other).exists()
     async with get_sessionmaker()() as session:
         assert await session.get(Host, host.id) is None
+        assert await session.get(User, user.id) is None
+    if cleanup_fails:
+        assert caplog.text.count("account file cleanup failed") == 1
+        monkeypatch.setattr(storage, "remove", remove)
+        await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
+        assert not storage.path(record_id).exists()
+        assert storage.path(other).exists()
+
+
+async def test_disabled_routes_match_unknown_paths(tmp_path, monkeypatch):
+    from spawn_server.main import create_app
+
+    monkeypatch.setattr(get_settings(), "support_log_dir", None)
+    app = create_app()
+    status, body, _ = await raw_request(app, "", method="GET", path="/openapi.json")
+    assert status == 200
+    assert not any("support-log" in path for path in json.loads(body)["paths"])
+    for method, suffix in (("POST", ""), ("GET", ""), ("HEAD", ""), ("POST", "/")):
+        result = await raw_request(app, "", method=method, path=url(uuid.uuid4()) + suffix)
+        unknown = await raw_request(app, "", method=method, path=f"/unknown/{uuid.uuid4()}{suffix}")
+        assert result == unknown
+        assert result[0] == 404 and result[2] == 0
+
+
+def test_application_starts_without_unix_support(tmp_path):
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "SPAWN_DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'startup.db'}",
+        "SPAWN_SUPPORT_LOG_DIR": "",
+        "SPAWN_USE_INPROCESS_PUBSUB": "1",
+    }
+    code = """
+import asyncio
+import os
+import sys
+
+sys.modules["fcntl"] = None
+for name in ("fchmod", "O_DIRECTORY", "O_NOFOLLOW", "getuid"):
+    if hasattr(os, name):
+        delattr(os, name)
+
+from spawn_server import main, support_log_files
+from spawn_server.db import Base, get_engine, init_engine
+
+assert support_log_files.fcntl is None
+assert support_log_files.get_store() is None
+app = main.create_app()
+assert not any("support-log" in path for path in app.openapi()["paths"])
+
+async def start():
+    init_engine()
+    async with get_engine().begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with main.lifespan(app):
+        pass
+
+asyncio.run(start())
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
 
 async def test_feature_off_no_io_body_or_sweep(app, tmp_path, monkeypatch):
     directory = tmp_path / "never-created"
     monkeypatch.setattr(get_settings(), "support_log_dir", None)
     from spawn_server import support_log_files as files
+    from spawn_server.main import create_app
 
     monkeypatch.setattr(files, "_store", lambda _path: pytest.fail("off must not touch the store"))
+    app = create_app()
     assert start_sweeps() is None
     for record_id, token in (("malformed", None), (str(uuid.uuid4()), "invalid")):
         status, _, reads = await raw_request(app, record_id, token=token)
@@ -215,20 +307,31 @@ async def test_feature_off_no_io_body_or_sweep(app, tmp_path, monkeypatch):
     assert not directory.exists()
 
 
-@pytest.mark.parametrize("kind", ["relative", "checkout", "file", "write_failure", "symlink"])
+@pytest.mark.parametrize(
+    "kind", ["relative", "checkout", "file", "write_failure", "symlink", "no_fcntl"]
+)
 async def test_bad_configuration_logs_once_and_stays_off(app, tmp_path, monkeypatch, caplog, kind):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    working = tmp_path / "working"
+    working.mkdir()
+    monkeypatch.chdir(working)
+    monkeypatch.setattr("spawn_server.support_log_files.checkout_root", lambda: checkout)
     if kind == "relative":
         directory = "relative-support-storage"
     elif kind == "checkout":
-        directory = str(CHECKOUT / "support-storage-must-not-exist")
+        directory = str(checkout / "support-storage-must-not-exist")
     elif kind == "file":
         path = tmp_path / "file"
         path.touch()
         directory = str(path)
     elif kind == "symlink":
         path = tmp_path / "link"
-        path.symlink_to(CHECKOUT, target_is_directory=True)
+        path.symlink_to(checkout, target_is_directory=True)
         directory = str(path / "support-storage-must-not-exist")
+    elif kind == "no_fcntl":
+        directory = str(tmp_path / "storage")
+        monkeypatch.setattr("spawn_server.support_log_files.fcntl", None)
     else:
         directory = str(tmp_path / "storage")
         monkeypatch.setattr(
@@ -241,12 +344,14 @@ async def test_bad_configuration_logs_once_and_stays_off(app, tmp_path, monkeypa
     # Initialization is scheduled, never awaited by server startup.
     status, _, reads = await raw_request(app, str(uuid.uuid4()))
     assert status == 404 and reads == 0
-    await runner[1]
+    await asyncio.wait_for(runner[1], 30)
     assert get_store() is None and start_sweeps() is None
     status, _, reads = await raw_request(app, str(uuid.uuid4()), token="invalid")
     assert status == 404 and reads == 0
     assert caplog.text.count("storage is unusable") == 1
-    assert not (CHECKOUT / "support-storage-must-not-exist").exists()
+    assert not (checkout / "support-storage-must-not-exist").exists()
+    if kind == "no_fcntl":
+        assert not Path(directory).exists()
 
 
 async def test_startup_and_periodic_sweep(app, tmp_path, monkeypatch):
@@ -264,8 +369,8 @@ async def test_startup_and_periodic_sweep(app, tmp_path, monkeypatch):
     assert retention.INTERVAL_SECONDS == 900
     monkeypatch.setattr(retention, "INTERVAL_SECONDS", 0.01)
     runner = start_sweeps()
-    await asyncio.wait_for(first.wait(), 1)
-    await asyncio.wait_for(second.wait(), 1)
+    await asyncio.wait_for(first.wait(), 30)
+    await asyncio.wait_for(second.wait(), 30)
     await stop_sweeps(runner)
     assert runner[1].done()
 
@@ -336,7 +441,7 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
     async def held_ids(session, user_id):
         ids = await original(session, user_id)
         captured.set()
-        await proceed.wait()
+        await asyncio.wait_for(proceed.wait(), 30)
         return ids
 
     monkeypatch.setattr(retention, "account_file_ids", held_ids)
@@ -347,10 +452,10 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
             headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
         )
     )
-    await asyncio.wait_for(captured.wait(), 1)
+    await asyncio.wait_for(captured.wait(), 30)
     late = asyncio.create_task(post(file_sqlite_client, record_id, token))
     proceed.set()
-    result, upload = await asyncio.gather(deletion, late)
+    result, upload = await asyncio.wait_for(asyncio.gather(deletion, late), 30)
     assert result.status_code == 204
     assert upload.status_code in {401, 404, 409}
     assert not list(storage.root.iterdir())

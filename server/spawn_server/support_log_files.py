@@ -7,7 +7,6 @@ SQLite transactions over disk work. All filesystem jobs run off the event loop.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import stat
@@ -16,11 +15,20 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 from .config import get_settings
 from .support_consent import canonical_uuid
 
 log = logging.getLogger("spawn.support_log")
-CHECKOUT = Path(__file__).resolve().parents[2]
+
+
+def checkout_root() -> Path:
+    # Resolve only when configured storage is initialized.
+    return Path(__file__).resolve().parents[2]
 
 
 class StoreUnavailable(Exception):
@@ -48,8 +56,12 @@ class SupportLogFiles:
         self._init_lock = asyncio.Lock()
 
     def _prepare(self):
+        if fcntl is None or not all(
+            hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "fchmod")
+        ):
+            raise OSError("support storage requires Unix file locking and permissions")
         root = self.root.resolve()
-        if not self.root.is_absolute() or root.is_relative_to(CHECKOUT):
+        if not self.root.is_absolute() or root.is_relative_to(checkout_root()):
             raise OSError("support directory must be absolute and outside checkout")
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)

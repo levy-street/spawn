@@ -15,13 +15,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("hosts") as batch:
-        # Reserved for the later dispatch change; no registration code uses it.
-        batch.add_column(
-            sa.Column(
-                "support_log_capable", sa.Boolean(), nullable=False, server_default=sa.false()
-            )
-        )
+    # Reserved for the later dispatch change; no registration code uses it.
+    op.add_column(
+        "hosts",
+        sa.Column("support_log_capable", sa.Boolean(), nullable=False, server_default=sa.false()),
+    )
     op.create_table(
         "support_log_consents",
         sa.Column(
@@ -99,5 +97,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("support_log_collections")
     op.drop_table("support_log_consents")
+    # SQLite batch drop rebuilds hosts; only the downgrade pays this cost.
     with op.batch_alter_table("hosts") as batch:
         batch.drop_column("support_log_capable")

@@ -90,7 +90,8 @@ is reserved for that later dispatch change.
 the body, no support file access and no sweep task. Set it only to an absolute
 private storage directory outside the repository checkout. The startup sweep
 creates it with mode 0700 in a background thread; uploads stay off until that
-check succeeds. An unusable directory logs one error and leaves storage off.
+check succeeds. An unusable directory or missing Unix file locking support logs
+one error and leaves storage off.
 Keeping bundles outside the checkout prevents a deploy or source backup from
 copying plain diagnostic logs. They are separate from database backups.
 
@@ -124,6 +125,12 @@ the two exact wire values, without parameters. Malformed refusals and
 unsupported content types close the attempt as failed, as malformed bundles do.
 JSON refusals have a 256-byte cap. An oversized declared body is refused before
 parsing support headers; absent Content-Length still uses the streaming bound.
+The stored time range and line count are what the machine reported, checked
+only for form and framing, not verified against event contents. Each process
+permits one upload per record and four body reads at once; excess requests
+receive 409 or 503 before reading, leaving the record untouched. Each body has
+a total receive deadline of 60 seconds; expiry returns 408 and marks the record
+failed.
 The daemon independently checks consent and trust; these server checks cannot
 enable sharing.
 
