@@ -1100,6 +1100,7 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
         command.args(argv);
         // The current environment is inherited. exec replaces only spawnd;
         // spawn-worker processes keep owning their sessions and are re-adopted.
+        crate::support_log::flush_before_exit();
         let _exec_error = command.exec();
         drop(permit);
         UpdateFailure::new(UpdateStage::Exec, "exec_failed")
@@ -1116,6 +1117,7 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
             let result = spawn_update_handoff(&exec_target, &config_dir);
             drop(permit);
             if result.is_ok() {
+                crate::support_log::flush_before_exit();
                 std::process::exit(0);
             }
             UpdateFailure::new(UpdateStage::Exec, "exec_failed")
@@ -1696,6 +1698,7 @@ fn exec_path(path: &Path) -> Result<()> {
         command.arg0(argv0);
     }
     command.args(argv);
+    crate::support_log::flush_before_exit();
     let error = command.exec();
     Err(error).context("execing reverted spawnd")
 }
@@ -1704,6 +1707,7 @@ fn exec_path(path: &Path) -> Result<()> {
 fn exec_path(path: &Path) -> Result<()> {
     let config_dir = crate::config::config_dir()?;
     spawn_update_handoff(path, &config_dir).context("handing reverted spawnd to its manager")?;
+    crate::support_log::flush_before_exit();
     std::process::exit(0)
 }
 

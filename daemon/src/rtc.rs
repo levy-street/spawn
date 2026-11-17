@@ -9965,6 +9965,110 @@ mod tests {
         ws_drain.abort();
     }
 
+    /// What a terminal shows and what is typed into it never reach the
+    /// support log, or what its reader returns. A real worker runs `cat`; the
+    /// canary is typed, echoed, and replayed — with the diagnostics replay
+    /// dump on, in the diagnostics build, writing it beside the support
+    /// folder — and decoys holding it sit inside the support folder under
+    /// other names. Plain, hex and base64 forms are all looked for. The
+    /// support log here is the process-wide capture (support_log.rs), so
+    /// every thread's events count, at the levels the support log keeps.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_support_log_never_holds_terminal_content() {
+        let capture = crate::support_log::capture::global();
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let _env = WorkerTestEnv::install();
+        let canary = crate::support_log::capture::canary();
+        for decoy in ["support.jsonl.2", "support.log", "seg-00000001.log"] {
+            std::fs::write(
+                capture.log.dir().join(decoy),
+                format!("{{\"t\":\"2999-01-01T00:00:00.000Z\",\"msg\":\"{canary}\"}}\n"),
+            )
+            .expect("decoy");
+        }
+        #[cfg(feature = "diagnostics")]
+        let dump_dir = {
+            let dir = capture.instance_logs.join("replays");
+            std::fs::create_dir_all(&dir).expect("replay dump dir");
+            std::env::set_var("SPAWND_DIAG_REPLAY_DUMP_DIR", &dir);
+            dir
+        };
+
+        let session_id = Uuid::new_v4();
+        let argv = ["/bin/sh", "-c", "printf 'worker-ready\\n'; exec cat"]
+            .map(String::from)
+            .to_vec();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        vars.insert("TERM".to_string(), "xterm-256color".to_string());
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            session_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &vars,
+        })
+        .await
+        .expect("launch real worker");
+        let handle = launched.handle;
+        let _worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
+        let control = handle.control.clone();
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        control.set_sink(ws_tx).await;
+        let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+        let registry = SessionRegistry::new();
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        let mut viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "canary-viewer", "g").await;
+        viewer
+            .pty
+            .send(&Bytes::from(format!("{canary}\n")))
+            .await
+            .expect("type the canary");
+        collect_pty_until(&mut viewer.pty_messages, canary.as_bytes()).await;
+        let history = request_history(&mut viewer).await;
+        assert!(
+            history
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes()),
+            "the replay should hold what was typed"
+        );
+        sessions.close("canary-viewer", "g", session_id).await;
+        close_test_peer(&viewer.pc).await;
+        ws_drain.abort();
+
+        #[cfg(feature = "diagnostics")]
+        {
+            std::env::remove_var("SPAWND_DIAG_REPLAY_DUMP_DIR");
+            let dumped = std::fs::read_dir(&dump_dir)
+                .expect("replay dump dir")
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    std::fs::read(entry.path()).is_ok_and(|bytes| {
+                        bytes.windows(canary.len()).any(|w| w == canary.as_bytes())
+                    })
+                });
+            assert!(dumped, "the diagnostics replay dump should hold the canary");
+        }
+
+        let contents = capture.contents();
+        assert!(
+            contents.contains(&session_id.to_string()),
+            "the support log should have recorded this session"
+        );
+        crate::support_log::capture::assert_absent(&contents, &canary, "the support log");
+        crate::support_log::capture::assert_absent(&capture.bundle(), &canary, "the bundle");
+    }
+
     /// Only a replay with no screen leaves the pane blank, and not when the
     /// request's own size changed the PTY with nothing from the program
     /// before the replay's anchor: that repaint reaches the viewer.

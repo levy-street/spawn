@@ -300,6 +300,22 @@ fn read_user_config(path: &Path) -> Option<String> {
     Some(text)
 }
 
+/// The 1-based line and column (in characters) of byte `offset` in `text`.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.chars().count())
+        + 1;
+    (line, column)
+}
+
 /// The user's configuration, its relative paths made the ones they named
 /// in `base` (the user's home, where the file lives), with this window's
 /// skills and trust merged in. Their own entries win: a skill path already
@@ -310,17 +326,27 @@ fn merged_config(
     skills: &[PathBuf],
     trusted: Option<&Path>,
 ) -> DocumentMut {
-    let mut config = match user.map(str::parse::<DocumentMut>) {
-        Some(Ok(mut config)) => {
+    let mut config = match user.map(|text| (text, text.parse::<DocumentMut>())) {
+        Some((_, Ok(mut config))) => {
             if let Some(base) = base {
                 rebase_relative_paths(&mut config, base);
             }
             config
         }
-        Some(Err(error)) => {
+        Some((text, Err(error))) => {
             // Codex refuses a file it cannot parse; this window starts from
-            // spawnd's part alone rather than not at all.
-            tracing::warn!(%error, "the user's Codex config does not parse; not merging it");
+            // spawnd's part alone rather than not at all. Where, never what:
+            // the parser's own message quotes the offending line, and the
+            // file holds MCP environment values and tokens.
+            let (line, column) = error
+                .span()
+                .map(|span| line_and_column(text, span.start))
+                .unwrap_or((0, 0));
+            tracing::warn!(
+                line,
+                column,
+                "the user's Codex config does not parse at line {line}, column {column}; not merging it"
+            );
             DocumentMut::new()
         }
         None => DocumentMut::new(),
@@ -1074,6 +1100,75 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
                 drive.as_os_str().to_string_lossy()
             )))
         );
+    }
+
+    /// A config that does not parse is logged by where it breaks, never by
+    /// what is there: toml_edit's message quotes the offending line, and a
+    /// Codex config holds MCP environment values and tokens.
+    #[test]
+    fn a_broken_config_is_logged_by_line_and_column_never_its_content() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let canary = crate::support_log::capture::canary();
+        let broken = format!("model = \"o4\"\n[mcp_servers.x.env]\nAPI_TOKEN = {canary} oops\n");
+        assert!(broken
+            .parse::<DocumentMut>()
+            .unwrap_err()
+            .to_string()
+            .contains(&canary));
+
+        let tmp = crate::support_log::capture::private_tempdir();
+        let log = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = stderr.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || CapturedStderr(sink.clone())),
+            )
+            .with(log.layer());
+        let merged = tracing::subscriber::with_default(subscriber, || {
+            merged_config(Some(&broken), None, &[], None)
+        });
+        assert!(!merged.to_string().contains(&canary));
+        assert!(log.flush(std::time::Duration::from_secs(10)));
+
+        let stderr = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+        assert!(
+            stderr.contains("does not parse at line 3, column 13"),
+            "{stderr}"
+        );
+        crate::support_log::capture::assert_absent(&stderr, &canary, "stderr");
+        let written = std::fs::read_to_string(log.dir().join(crate::support_log::CURRENT)).unwrap();
+        assert!(written.contains("\"line\":3"), "{written}");
+        crate::support_log::capture::assert_absent(&written, &canary, "the support log");
+        let bundle =
+            crate::support_log::read_window(log.dir(), "x", 0, i64::MAX / 2, 1 << 20).unwrap();
+        assert_eq!(bundle.lines.len(), 1);
+        crate::support_log::capture::assert_absent(&bundle.lines.join("\n"), &canary, "the bundle");
+    }
+
+    #[derive(Clone)]
+    struct CapturedStderr(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedStderr {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn line_and_column_count_characters_from_one() {
+        assert_eq!(line_and_column("ab\ncdé\nf", 0), (1, 1));
+        assert_eq!(line_and_column("ab\ncdé\nf", 3), (2, 1));
+        assert_eq!(line_and_column("ab\ncdé\nf", 7), (2, 4));
+        assert_eq!(line_and_column("ab\ncdé\nf", 6), (2, 3));
+        assert_eq!(line_and_column("ab\ncdé\nf", 99), (3, 2));
     }
 
     #[test]

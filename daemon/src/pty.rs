@@ -2534,6 +2534,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn support_log_preserves_history_os_error_context() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let tmp = crate::support_log::capture::private_tempdir();
+        let log = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
+        let history = ViewerHistory::default();
+        let cause = "reading /tmp/history/seg-00000001.log: No such file or directory (os error 2)";
+        let error = anyhow::Error::new(WorkerReplayRefused::new(cause.to_owned()));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
+            let session_id = Uuid::new_v4();
+            history.report(session_id, true, &error);
+            history.report(session_id, false, &error);
+            history.report(session_id, true, &error);
+        });
+        assert!(log.flush(Duration::from_secs(10)));
+        let lines = std::fs::read_to_string(log.dir().join(crate::support_log::CURRENT)).unwrap();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records.len(),
+            if crate::version::DIAGNOSTICS_BUILD {
+                3
+            } else {
+                2
+            }
+        );
+        for record in records {
+            assert_eq!(
+                record["fields"]["reason"],
+                format!("worker replay failed: {cause}")
+            );
+        }
+    }
+
     /// The classifier reads the words the scrollback log itself produces:
     /// a deleted segment is unreadable history; a tampered or truncated one
     /// is not.

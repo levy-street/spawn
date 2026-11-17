@@ -512,6 +512,7 @@ fn exec_into(path: &Path) -> std::io::Error {
         command.arg0(argv0);
     }
     command.args(argv);
+    crate::support_log::flush_before_exit();
     command.exec()
 }
 

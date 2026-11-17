@@ -108,6 +108,77 @@ pub fn open_or_create_private_dir_at(parent: &Dir, name: &Path) -> io::Result<Di
     Ok(dir)
 }
 
+/// Open the support leaf relative to a verified, no-follow parent. Ancestors
+/// above that parent remain the OS/user-selected log root: they may contain
+/// symlinks. Neither an existing parent nor a symlink target is chmodded.
+pub fn open_support_dir(path: &Path, create: bool) -> io::Result<Dir> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "support directory has no leaf")
+    })?;
+    if create {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(parent)?;
+    let meta = parent.metadata()?;
+    if !meta.is_dir()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "support parent must be owned by this user and not writable by others",
+        ));
+    }
+    let parent = Dir::from_std_file(parent);
+    if create {
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        match parent.create_dir_with(name, &builder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let dir = parent.open_dir_nofollow(name)?;
+    let file = dir.into_std_file();
+    let meta = file.metadata()?;
+    if !meta.is_dir() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "support directory must be owned by this user",
+        ));
+    }
+    // cap-std may use O_PATH on Linux. Open dot through the pinned capability
+    // for fchmod, not through the ambient path that could now name a symlink.
+    let dir = Dir::from_std_file(file);
+    if create {
+        let opened = dir.open_with(
+            ".",
+            cap_std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW),
+        )?;
+        opened.set_permissions(cap_std::fs::Permissions::from_mode(0o700))?;
+    } else if meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "support directory is accessible by others",
+        ));
+    }
+    Ok(dir)
+}
+
 pub fn create_private_file_new(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)

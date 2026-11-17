@@ -43,6 +43,7 @@ mod session_ctl;
 mod sessions;
 mod state;
 mod status;
+mod support_log;
 mod tui;
 mod update;
 mod upload;
@@ -78,7 +79,26 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {}
     }
-    init_tracing(cli.verbose);
+    // The support log is the daemon's own record: `run`, and `login`, which
+    // becomes `run`. Every other command is a person at a terminal.
+    let support = match &cli.command {
+        Command::Run(_) | Command::Login(_) => Some(
+            config::config_dir().and_then(|dir| support_log::SupportLog::open_for_instance(&dir)),
+        ),
+        _ => None,
+    };
+    let (support, support_error) = match support {
+        Some(Ok(log)) => (Some(log), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+    init_tracing(cli.verbose, support.as_ref());
+    if let Some(error) = support_error {
+        tracing::warn!(error = %format_args!("{error:#}"), "the support log is unavailable; running without it");
+    }
+    if let Some(log) = &support {
+        log.install_panic_hook();
+    }
 
     #[cfg(windows)]
     let background_role = match &cli.command {
@@ -102,8 +122,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
-            login::run(cli.server.clone(), args).await?;
+            login::run(cli.server.clone(), args)
+                .await
+                .map_err(|error| flush_login_error(error, support.as_ref()))?;
             if no_run {
+                if let Some(log) = &support {
+                    log.flush(std::time::Duration::from_millis(500));
+                }
                 return Ok(());
             }
             tracing::info!("login complete; transitioning to run");
@@ -149,6 +174,10 @@ async fn main() -> anyhow::Result<()> {
             ),
         }
     }
+    if let Some(log) = &support {
+        // What the daemon said last is what someone will want to read.
+        log.flush(std::time::Duration::from_millis(500));
+    }
     if result
         .as_ref()
         .err()
@@ -165,6 +194,34 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     result
+}
+
+// Login errors must return through main's Result, before the shared handlers:
+// cancellation is a failure and Rust prints the original error's Debug text.
+fn flush_login_error(
+    error: anyhow::Error,
+    support: Option<&support_log::SupportLog>,
+) -> anyhow::Error {
+    if let Some(log) = support {
+        log.flush(std::time::Duration::from_millis(500));
+    }
+    error
+}
+
+#[test]
+fn login_errors_keep_the_original_failure_status_and_stderr_text() {
+    use std::process::{ExitCode, Termination};
+
+    for error in [
+        anyhow::Error::from(login::LoginInterrupted),
+        login::user_error("approval refused"),
+        anyhow::anyhow!("connection failed").context("login failed"),
+    ] {
+        let original_text = format!("{error:?}");
+        let result: anyhow::Result<()> = Err(flush_login_error(error, None));
+        assert_eq!(format!("{:?}", result.as_ref().unwrap_err()), original_text);
+        assert_eq!(result.report(), ExitCode::FAILURE);
+    }
 }
 
 #[cfg(windows)]
@@ -196,8 +253,9 @@ fn detach_background_console() {
 #[cfg(not(windows))]
 fn detach_background_console() {}
 
-fn init_tracing(verbose: u8) {
-    use tracing_subscriber::{fmt, EnvFilter};
+fn init_tracing(verbose: u8, support: Option<&support_log::SupportLog>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{fmt, EnvFilter, Layer};
 
     // -v => debug for spawnd, info elsewhere
     // -vv => trace for spawnd, debug elsewhere
@@ -215,11 +273,18 @@ fn init_tracing(verbose: u8) {
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
-    let subscriber = fmt()
-        .with_env_filter(filter)
+    // `RUST_LOG` and `-v` configure stderr and nothing else: the filter is
+    // this layer's own. Formatted exactly as `fmt().with_env_filter(..)
+    // .finish()` formatted it (that builder turned internal-error logging
+    // on), because people and the desktop app read this output.
+    let stderr = fmt::layer()
         .with_target(false)
         .with_writer(std::io::stderr)
-        .finish();
+        .log_internal_errors(true)
+        .with_filter(filter);
+    // The support log carries its own fixed filter (support_log.rs).
+    let support = support.map(support_log::SupportLog::layer);
+    let subscriber = tracing_subscriber::registry().with(stderr).with(support);
     // Install the subscriber before LogTracer: tracing-subscriber's `.init()`
     // also installs a tracer, so calling both initialization helpers would
     // make the second one fail. webrtc-rs uses the `log` facade; this explicit

@@ -607,6 +607,29 @@ pub fn open_or_create_private_dir_at(parent: &Dir, name: &Path) -> io::Result<Di
     open_private_dir(&path)
 }
 
+/// Pin and validate the immediate parent before opening the support leaf.
+/// Earlier ancestors retain the existing Windows log-root trust contract.
+pub fn open_support_dir(path: &Path, create: bool) -> io::Result<Dir> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "support directory has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "support directory has no leaf")
+    })?;
+    if create {
+        create_private_dir_all(parent)?;
+    }
+    let parent = open_private_dir(parent)?;
+    if create {
+        open_or_create_private_dir_at(&parent, Path::new(name))
+    } else {
+        open_private_dir(&leaf_under(&parent, Path::new(name))?)
+    }
+}
+
 pub fn create_private_file_new(path: &Path) -> io::Result<File> {
     create_file_new(path)
 }
