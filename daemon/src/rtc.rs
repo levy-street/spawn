@@ -10066,7 +10066,10 @@ mod tests {
             "the support log should have recorded this session"
         );
         crate::support_log::capture::assert_absent(&contents, &canary, "the support log");
-        crate::support_log::capture::assert_absent(&capture.bundle(), &canary, "the bundle");
+        let bundle = tokio::task::spawn_blocking(move || capture.bundle())
+            .await
+            .unwrap();
+        crate::support_log::capture::assert_absent(&bundle, &canary, "the bundle");
     }
 
     /// Only a replay with no screen leaves the pane blank, and not when the

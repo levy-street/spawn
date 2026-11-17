@@ -201,6 +201,63 @@ on a host it no longer owns.
 | Agent commands, paths, installed/latest versions, output, and detailed errors | current checks: REST plus `host.agents.check`; install definitions and historical policy/errors remain stored | installation is refused and automation disabled; checks remain server-readable and execute server-selected binaries; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
+### Optional support log sharing: daemon foundation only
+
+**This is an exception that can disclose diagnostic information to the server
+operator. It is off for everyone until the apps ship a sharing switch.** This
+change implements only host-side statement verification and bounded collection.
+No app signs a statement, no server sends a collection request, and server-side
+upload storage, retention and owner-facing collection history are not built yet.
+There is no new server-side storage guarantee or retention promise.
+
+The support log is a separate, bounded local record. It holds event times,
+producer builds, levels, source locations, reviewed counters/identifiers/fixed
+choices and a small reviewed set of local paths and classified filesystem
+errors. Paths can reveal information about the machine's folders. There is no collection path for terminal input/output, terminal history, file
+excerpts, command arguments, environment values, credential fields, arbitrary
+event messages or third-party message/field content. Construction enforces this: unknown fields are withheld
+before formatting; allowed scalar/identity/choice fields have typed rules; path
+origins and error callsites are inventoried in a checked-in policy. Sanitizing
+is a second, heuristic defense and cannot reliably remove short secrets from an
+admitted path. The source guard and canaries cover these boundaries. The
+collection reader opens exactly the two versioned support files, never lists a
+folder, and never reads ordinary daemon output or terminal storage. A typed
+header adds only the documented state counters, classified error kind/time and
+parsed build identity; it never adds general state-file text.
+
+The owner decides through a statement signed by an approved device, checked by
+each host against its own account and the **same device admission function** used
+for signed connections. Direct approval or a carried chain to a trusted device
+must remain valid, with no removed party. The server can say no, never manufacture
+a yes: null disables, while enabling requires a valid device statement. An
+identical still-current statement can clear the server-off flag. The host checks
+the signature and signer on application, on load and at every collection, and
+checks again after preparing the bundle. Newest timestamp wins, statements over
+24 hours in the future are rejected, and consent has no expiry. Support sharing
+retains delivered revocations locally. Logout, reset and exorcise remove consent.
+
+Each host enforces one collection in flight, at most one per five minutes and
+twelve per rolling day from its own durable receipts (refusals count too), a
+60-second to 72-hour window, a 1 MiB complete uncompressed bundle, and a 900 KiB
+gzip body. Every request runs outside control dispatch with a 30-second deadline;
+disk and compression work runs on blocking workers. HTTPS goes only to the host's
+configured server origin with redirects and retries disabled. The host's bounded
+append-only receipts record attempts, results and refusals, and `spawnd status`
+shows sharing, the approving device/time, server-off and recent receipts. Audit
+or verification failure does not authorize disclosure.
+
+A dishonest server can still collect within those limits while sharing is on,
+hold back a signed turn-off, or replay the last on statement to a host that lost
+its local consent state and still trusts that signer. It can withhold evidence
+of a device's removal before a host learns it. It can omit a collection from any
+future server-side history, although the host keeps its own receipts. An upload
+already sent cannot be recalled by a later turn-off. Direct withdrawal over a
+device connection is not implemented in this change. A maliciously delivered
+app or hosted web client could sign without the person's action; this is the
+existing client-delivery residual risk, not protection signatures can provide.
+The exact daemon contract and counter meanings are in
+[`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
+
 ### Host capacity (2026-08-21)
 
 Showing a fleet means showing how hard each machine is working, and utilization

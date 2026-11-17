@@ -53,10 +53,10 @@ struct InstanceStatus {
     launch: String,
     /// Whether the running daemon's spawn-worker matches it.
     pair: String,
-    /// The daemon's own support log (support_log.rs), which stays on this
-    /// machine.
+    /// The local support log; sharing requires a verified device statement.
     #[serde(skip_serializing_if = "Option::is_none")]
     support_log: Option<String>,
+    support_sharing: crate::support_store::SharingStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +237,22 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         launch,
         pair,
         support_log,
+        support_sharing: crate::support_log::support_dir(dir)
+            .ok()
+            .map(|path| {
+                crate::support_store::status(
+                    dir,
+                    &crate::support::Trust {
+                        account: stored
+                            .proven_account_id()
+                            .and_then(|id| spawnd::host_pair_approval::account_id_bytes(&id).ok()),
+                        record: stored.clone(),
+                        revoked: Default::default(),
+                    },
+                    &path,
+                )
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -437,8 +453,36 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         };
         let _ = writeln!(text, "  host key     {shown}");
         let _ = writeln!(text, "  browser pins {}", instance.browser_pins);
+        let sharing = &instance.support_sharing;
+        let _ = writeln!(
+            text,
+            "  sharing      {}",
+            if sharing.enabled { "on" } else { "off" }
+        );
+        if let (Some(device), Some(at)) = (sharing.signer_device_id, sharing.issued_at_ms) {
+            let _ = writeln!(
+                text,
+                "               approved by device {device} at {at} ms since Unix epoch"
+            );
+        }
+        if sharing.server_off {
+            let _ = writeln!(text, "               the server switched sharing off");
+        }
+        for receipt in &sharing.recent {
+            let outcome = serde_json::to_value(receipt.outcome).unwrap_or_default();
+            let _ = writeln!(
+                text,
+                "  collection   {} · {} · {} · {} bytes · {} lines · {} seconds",
+                receipt.time,
+                receipt.request_id,
+                outcome.as_str().unwrap_or("failed"),
+                receipt.bytes,
+                receipt.lines,
+                receipt.window
+            );
+        }
         if let Some(path) = &instance.support_log {
-            let _ = writeln!(text, "  support log  {path} · kept on this machine");
+            let _ = writeln!(text, "  support log  {path}");
         }
     }
     let others = output.instances.len().saturating_sub(1);
@@ -575,6 +619,7 @@ mod tests {
                 }),
                 launch: "release store".into(),
                 pair: "matches".into(),
+                support_sharing: Default::default(),
                 support_log: Some(
                     "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl".into(),
                 ),
@@ -595,7 +640,7 @@ mod tests {
         ));
         assert!(plain.contains("  pair         matches\n"));
         assert!(plain.contains(
-            "  support log  /Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl · kept on this machine\n"
+            "  support log  /Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl\n"
         ));
         assert!(plain.contains("Other instances on this machine: none\n"));
         assert!(plain.ends_with(&format!(

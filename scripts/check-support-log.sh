@@ -45,6 +45,7 @@ CONTENT_MODULES=(
   daemon/src/sessiond/emulator.rs
   daemon/src/sessiond/scrollback.rs
 )
+COLLECTION_MODULES=(daemon/src/support.rs daemon/src/support_store.rs daemon/src/support_consent.rs)
 
 fail() {
   printf 'support-log: %s\n' "$1" >&2
@@ -57,7 +58,7 @@ code_of() {
   grep -v -E '^[[:space:]]*//' "$1" || true
 }
 
-for file in "$MODULE" "$POLICY" "$MAIN" "${CONTENT_MODULES[@]}"; do
+for file in "$MODULE" "$POLICY" "$MAIN" "${CONTENT_MODULES[@]}" "${COLLECTION_MODULES[@]}"; do
   [[ -f "$file" ]] || fail "missing file: $file"
 done
 
@@ -255,7 +256,7 @@ for site in policy["path_sites"]:
     reviewed_paths[key] = site["source"]
 found_paths = {}
 for path in sorted(Path("daemon/src").rglob("*.rs")):
-    if path.name in {"support_log_tests.rs", "update_tests.rs"}:
+    if path.name in {"support_log_tests.rs", "support_tests.rs", "support_store_tests.rs", "update_tests.rs"}:
         continue  # Both are included only by #[cfg(test)] modules.
     text = path.read_text()
     for line, statement, fields in inventory(text):
@@ -284,6 +285,7 @@ for gate in [
     'self.meta.file().map(Path::new) == Some(Path::new(&site.file))', 'Some(site.line) == self.meta.line()',
     'if self.text_allowed(field.name())', 'self.checked_text(field.name(), &format())',
     'rule.kind == "scalar"', '_ => false',
+    '"choice" => rule.values.iter().any(|v| v == raw)',
 ]:
     require(gate in collector, "missing construction gate: " + gate)
 visitor = collector.split("impl Visit for Collector<'_> {", 1)[1]
@@ -293,6 +295,45 @@ require('self.push_text(field,||{' in compact, "str bypasses admission")
 require(compact.count('self.push_scalar(field,||') == 6, "all scalar types must use admission")
 require(compact.count('self.fields.push(') == 1 and 'FieldValue::Str(WITHHELD.to_owned())' in compact, "bytes must be withheld")
 require('msg: &msg' in source and 'fields: is_spawnd(target).then_some(FieldsOut(&fields))' in source, "foreign record shape changed")
+# Pin the production event emission and only its empty message argument. An
+# extra event visitation or render call is a new path requiring review.
+require(layer.count("event.record(") == 1, "additional event visitation path")
+require(layer.count("render_line(") == 1, "additional event rendering path")
+require('"",\n                collector.fields,' in layer, "event messages must remain empty")
+
+# Collection is deliberately split: consent/receipts have local storage, but
+# the uploader may not open any file or choose an arbitrary byte source.
+upload = Path("daemon/src/support.rs").read_text()
+upload_compact = re.sub(r"\s+", "", upload)
+storage = Path("daemon/src/support_store.rs").read_text()
+consent = Path("daemon/src/support_consent.rs").read_text()
+for module in (upload, storage, consent):
+    code = "\n".join(line for line in module.splitlines() if not line.lstrip().startswith("//"))
+    for marker in ("read_dir", ".entries(", "glob(", "glob::", "walkdir", "WalkDir", "read_link",
+                   "scrollback", "REPLAY_DUMP", ".replay", "spawnd.log", "err.log", "journal"):
+        require(marker not in code, "forbidden collection source: " + marker)
+for marker in ("std::fs", "tokio::fs", "File::", "OpenOptions", "include_bytes!", "include_str!",
+               "Command::new", "read_to_end", "read_to_string", "crate::host_files", "crate::host_control",
+               "crate::upload", "crate::worker_backend", "crate::sessions", "crate::pty"):
+    require(marker not in upload, "uploader must not open or produce another byte source: " + marker)
+require(upload_compact.count(".send().await") == 1 and upload.count("client.post(") == 1,
+        "exactly one HTTP upload call site")
+require(re.findall(r"\.body\(([^)]*)\)", upload) == ["body"], "only the reader body may be uploaded")
+require("let support_log::CompressedBundle { header, body } = prepared.bundle;" in upload,
+        "gzip bytes must come from the support reader")
+require(upload.count("support_log::collect_bundle(") == 1, "one support reader per collection")
+require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(deadline" in upload_compact,
+        "origin-pinned bounded upload required")
+require("request_id: Uuid" in upload and "url.set_path(&format!(" in upload, "typed request path required")
+require("tokio::task::spawn_blocking(move || prepare(" in upload, "snapshot must run on a blocking worker")
+require("tokio::spawn(async move" in upload, "collection needs its own task")
+for module in (storage, consent):
+    require("reqwest" not in module and ".post(" not in module, "storage cannot upload")
+run = Path("daemon/src/run.rs").read_text()
+arm = run.split("Inbound::SupportLogCollect {", 1)[1].split("Inbound::Error", 1)[0]
+require(".await" not in arm and "support.collect(" in arm, "dispatch must only enqueue collection")
+require("crate::run::admitted_device(" in upload and "admitted_device(verified.sender_public_key()" in re.sub(r"\s+", "", run),
+        "consent and connections must share admission")
 PY_POLICY
 
 self_test() {
@@ -378,6 +419,37 @@ PY_REPLACE
 
   printf '%s\n' 'warn!(%shell, "unreviewed shell origin");' >>"$fixture/$MODULE"
   expect_failure "an imported shorthand path callsite"
+
+  mutate_module '"choice" => rule.values.iter().any(|v| v == raw)' '"choice" => true'
+  expect_failure "accepting arbitrary choice strings"
+
+  mutate_module '                collector.fields,' '                { event.record(&mut collector); collector.fields },'
+  expect_failure "an extra event visitation path"
+
+  mutate_module '                "",' '                &format!("{:?}", event),'
+  expect_failure "formatting a message into an event"
+
+  local upload_file="$fixture/daemon/src/support.rs"
+  local original_upload
+  original_upload="$(cat "$upload_file")"
+  expect_upload_failure() {
+    if SUPPORT_LOG_GUARD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      fail "self-test: $1 passed"
+    fi
+    printf '%s\n' "$original_upload" >"$upload_file"
+  }
+  for mutation in 'let b = std::fs::read(path);' 'let b = tokio::fs::read(path);' 'let b = File::open(path);' 'let b = include_bytes!("extra");' 'let b = glob("*");' 'let b = dir.entries();' 'let b = "scrollback";' 'let b = "SPAWND_DIAG_REPLAY_DUMP_DIR";' 'let b = "spawnd.log";' 'let b = "err.log";' 'let b = "journal";' 'let b = client.post(url).send().await;'; do
+    printf '%s\n' "$mutation" >>"$upload_file"
+    expect_upload_failure "another collection source or upload: $mutation"
+  done
+  python3 -I - "$upload_file" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+assert '.body(body)' in s
+p.write_text(s.replace('.body(body)', '.body(arbitrary)'))
+PY_MUTATE_UPLOAD
+  expect_upload_failure "a body not supplied by the support reader"
 
   local original_policy
   original_policy="$(cat "$fixture/$POLICY")"

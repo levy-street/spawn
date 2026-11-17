@@ -392,10 +392,10 @@ fn neither_path_is_ever_followed_through_a_link() {
         "not the log\n"
     );
     // The reader refuses a link at either name.
-    assert!(read_window(&path, "x", 0, i64::MAX, 1 << 20).is_err());
+    assert!(read_window(&path, "00000000", 0, i64::MAX, 1 << 20, None).is_err());
     std::fs::remove_file(path.join(CURRENT)).unwrap();
     std::os::unix::fs::symlink(&elsewhere, path.join(PREVIOUS)).unwrap();
-    assert!(read_window(&path, "x", 0, i64::MAX, 1 << 20).is_err());
+    assert!(read_window(&path, "00000000", 0, i64::MAX, 1 << 20, None).is_err());
     // A link in place of the folder itself is refused too.
     let linked = tmp.path().join("linked");
     std::os::unix::fs::symlink(tmp.path(), &linked).unwrap();
@@ -434,7 +434,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
         .filter(|line| line["target"] == "spawnd::run")
         .count();
     assert_eq!(written as u64 + dropped, EVENTS as u64);
-    let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 30).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 30, None).unwrap();
     assert_eq!(bundle.header.dropped_events, dropped);
 }
 
@@ -462,17 +462,17 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
     }
     let from = 1_000_000 + 4_000;
     let to = 1_000_000 + 4_099;
-    let all = read_window(&path, "abcd1234", from, to, 1 << 20).unwrap();
+    let all = read_window(&path, "abcd1234", from, to, 1 << 20, None).unwrap();
     assert_eq!(all.lines.len(), 100);
     assert!(!all.header.truncated);
     assert!(all.lines[0].contains("line-004000"));
     assert!(all.lines[99].contains("line-004099"));
     // Spanning both files, oldest first.
-    let spanning = read_window(&path, "abcd1234", 1_000_000, to, 1 << 30).unwrap();
+    let spanning = read_window(&path, "abcd1234", 1_000_000, to, 1 << 30, None).unwrap();
     assert!(spanning.lines.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(spanning.lines.iter().all(|line| !line.contains("DECOY")));
     // A byte cap keeps the newest.
-    let capped = read_window(&path, "abcd1234", from, to, 10 * 1100).unwrap();
+    let capped = read_window(&path, "abcd1234", from, to, 10 * 1100, None).unwrap();
     assert!(capped.header.truncated);
     assert!(capped.header.bytes <= 10 * 1100);
     assert_eq!(capped.lines.len(), capped.header.lines);
@@ -486,11 +486,19 @@ fn the_reader_takes_its_window_newest_first_and_names_only_two_files() {
         if crate::version::DIAGNOSTICS_BUILD {
             "diagnostics"
         } else {
-            "release"
+            "normal"
         }
     );
     // A missing folder is an empty bundle, not an error.
-    let missing = read_window(&tmp.path().join("none"), "x", 0, i64::MAX, 1 << 20).unwrap();
+    let missing = read_window(
+        &tmp.path().join("none"),
+        "00000000",
+        0,
+        i64::MAX,
+        1 << 20,
+        None,
+    )
+    .unwrap();
     assert!(missing.lines.is_empty());
 }
 
@@ -513,7 +521,7 @@ fn reader_preserves_each_producers_build_identity() {
     older_bytes.push(b'\n');
     store.append(&older_bytes).unwrap();
     store.append(&current).unwrap();
-    let bundle = read_window(&path, "", 0, i64::MAX, 4096).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX, 4096, None).unwrap();
     assert_eq!(bundle.lines.len(), 2);
     let lines: Vec<serde_json::Value> = bundle
         .lines
@@ -765,12 +773,12 @@ fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
     fill(&store, 1, 10, "safe");
     // An overlapping old process can recreate its files, never the new pair.
     std::fs::write(path.join("support.jsonl"), "unsafe older history\n").unwrap();
-    let bundle = read_window(&path, "x", 0, i64::MAX / 2, 1 << 20).unwrap();
+    let bundle = read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 20, None).unwrap();
     assert_eq!(bundle.lines.len(), 1);
     assert!(bundle.lines[0].contains("safe"));
     let _reopened = Store::open(&path).unwrap();
     assert_eq!(
-        read_window(&path, "x", 0, i64::MAX / 2, 1 << 20)
+        read_window(&path, "00000000", 0, i64::MAX / 2, 1 << 20, None)
             .unwrap()
             .lines,
         bundle.lines
@@ -940,4 +948,189 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
         &marker,
         "worker error",
     );
+}
+
+#[test]
+fn snapshot_orders_timestamps_then_append_order_and_skips_large_and_invalid_lines() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    for (at, msg) in [
+        (3000, "tie-first"),
+        (1000, "old-small"),
+        (3000, "tie-second"),
+        (2000, "middle"),
+    ] {
+        store
+            .append(&render_line(
+                &rfc3339_millis(at),
+                "INFO",
+                "spawnd",
+                "src/main.rs:1",
+                msg,
+                vec![],
+            ))
+            .unwrap();
+    }
+    store
+        .append(&render_line(
+            &rfc3339_millis(4000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            &"x".repeat(1500),
+            vec![],
+        ))
+        .unwrap();
+    store.append(b"invalid\n").unwrap();
+    // Deliberately bypass tail repair for an interrupted final write.
+    let mut file = open_or_create(&store.dir, CURRENT).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"{\"t\":").unwrap();
+    drop(file);
+    let mut bundle = read_window(&path, "00000000", 0, 5000, 1600, None).unwrap();
+    assert_eq!(bundle.header.invalid_lines, 2);
+    assert!(bundle.header.truncated);
+    assert!(bundle.encode().unwrap().len() <= 1600);
+    let raw_bytes = bundle.encode().unwrap().len();
+    assert_eq!(bundle.header.bytes, raw_bytes);
+    assert!(!bundle.lines.iter().any(|l| l.contains(&"x".repeat(30))));
+    assert!(bundle.lines[0].contains("old-small"));
+    assert!(bundle.lines[1].contains("middle"));
+    assert!(bundle.lines[2].contains("tie-first"));
+    assert!(bundle.lines[3].contains("tie-second"));
+    assert_eq!(bundle.header.from, Some(1000));
+    assert_eq!(bundle.header.to, Some(3000));
+}
+
+#[test]
+fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    store
+        .append(&render_line(
+            &rfc3339_millis(2000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            "previous",
+            vec![],
+        ))
+        .unwrap();
+    // Fill the remainder with invalid terminated lines without stressing a writer.
+    let mut file = open_or_create(&store.dir, CURRENT).unwrap();
+    let remaining = MAX_FILE_BYTES - file.metadata().unwrap().len();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let mut padding = vec![b'x'; remaining as usize];
+    *padding.last_mut().unwrap() = b'\n';
+    file.write_all(&padding).unwrap();
+    drop(file);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        store.lock.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        store
+            .append_locked(&render_line(
+                &rfc3339_millis(1000),
+                "INFO",
+                "spawnd",
+                "src/main.rs:1",
+                "current",
+                vec![],
+            ))
+            .unwrap();
+        store.lock.unlock().unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let busy = read_window(&path, "00000000", 0, 5000, 4096, None);
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(
+        busy.is_err(),
+        "a snapshot must not race the writer's rotation"
+    );
+    let bundle = read_window(&path, "00000000", 0, 5000, 4096, None).unwrap();
+    assert_eq!(bundle.lines.len(), 2);
+    assert!(bundle.lines[0].contains("current"));
+    assert!(bundle.lines[1].contains("previous"));
+    // Every read handle has closed before the next rotation. This replacement
+    // fails on Windows if a reader kept an incompatible handle open.
+    let next = Store::open(&path).unwrap();
+    let mut file = open_or_create(&next.dir, CURRENT).unwrap();
+    file.set_len(MAX_FILE_BYTES).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    next.append(&render_line(
+        &rfc3339_millis(3000),
+        "INFO",
+        "spawnd",
+        "src/main.rs:1",
+        "next",
+        vec![],
+    ))
+    .unwrap();
+    assert!(read_window(&path, "00000000", 0, 5000, 4096, None).is_ok());
+}
+
+#[test]
+fn typed_header_cannot_copy_state_text_and_compression_has_a_final_cap() {
+    let marker = capture::canary();
+    let state: crate::state::StateFile = serde_json::from_value(serde_json::json!({
+        "pid":1,"version":marker,"connected":true,"connected_at":marker,
+        "server":marker,"last_error":{"kind":marker,"detail":marker,"at":"2026-01-01T00:00:00Z"},
+        "sessions":2,"exe":marker,"release":marker,"tree":marker
+    }))
+    .unwrap();
+    let projection = BundleState::from_state(state);
+    capture::assert_absent(
+        &serde_json::to_string(&projection).unwrap(),
+        &marker,
+        "typed state",
+    );
+    let tmp = capture::private_tempdir();
+    let path = tmp.path().join(DIR_NAME);
+    let store = Store::open(&path).unwrap();
+    store
+        .append(&render_line(
+            &rfc3339_millis(1000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            "first",
+            vec![],
+        ))
+        .unwrap();
+    store
+        .append(&render_line(
+            &rfc3339_millis(2000),
+            "INFO",
+            "spawnd",
+            "src/main.rs:1",
+            "second",
+            vec![],
+        ))
+        .unwrap();
+    let bundle = read_window(&path, "00000000", 0, 3000, 4096, Some(projection)).unwrap();
+    assert!(compress_bundle(bundle.clone(), 1).unwrap().is_none());
+    let full = compress_bundle(bundle.clone(), MAX_GZIP_BYTES)
+        .unwrap()
+        .unwrap();
+    let clipped = compress_bundle(bundle.clone(), full.body.len() - 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(clipped.header.lines, 1);
+    assert_eq!(clipped.header.from, Some(2000));
+    assert!(clipped.header.truncated);
+    assert!(clipped.body.len() < full.body.len());
+    let result = compress_bundle(bundle, MAX_GZIP_BYTES).unwrap().unwrap();
+    let mut raw = String::new();
+    flate2::read::GzDecoder::new(result.body.as_slice())
+        .read_to_string(&mut raw)
+        .unwrap();
+    assert_eq!(result.header.bytes, raw.len());
+    capture::assert_absent(&raw, &marker, "complete bundle");
 }

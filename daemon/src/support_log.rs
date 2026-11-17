@@ -28,7 +28,7 @@
 //! trust are described by `platform::open_support_dir` and daemon/CLAUDE.md.
 //!
 //! [`read_window`] opens exactly the current versioned pair and never lists
-//! the folder. Collection, a flushed snapshot and transmission are future work.
+//! the folder. Collection runs through the blocking snapshot and gzip builder.
 
 use std::cell::Cell;
 use std::fmt::{self, Write as _};
@@ -1131,7 +1131,7 @@ fn render_line(
     }
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -1160,7 +1160,10 @@ fn parse_rfc3339_millis(value: &str) -> Option<i64> {
         return None;
     }
     let seconds = crate::state::parse_rfc3339_seconds(&format!("{seconds}Z"))?;
-    Some(seconds * 1000 + millis.parse::<i64>().ok()?)
+    let timestamp = seconds
+        .checked_mul(1000)?
+        .checked_add(millis.parse::<i64>().ok()?)?;
+    (timestamp >= 0 && rfc3339_millis(timestamp as u64) == value).then_some(timestamp)
 }
 
 /// The support folder, held open, and its lock file.
@@ -1355,33 +1358,161 @@ fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
     }
 }
 
-/// What a collection of the support log says about itself, ahead of its
-/// lines.
+/// Values copied from the heartbeat, with no general-purpose string field.
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub(crate) struct BundleState {
+    connected: bool,
+    connected_at: Option<i64>,
+    sessions: usize,
+    worker_mismatch: bool,
+    rtc_peers: Option<crate::state::RtcPeerGauge>,
+    build_counter: Option<u64>,
+    release: Option<ReleaseId>,
+    last_error: Option<BundleError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(not(test), allow(dead_code))]
+struct BundleError {
+    kind: ErrorKind,
+    at: i64,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ErrorKind {
+    Dns,
+    Tcp,
+    Tls,
+    Auth,
+    Protocol,
+    Http,
+    Unknown,
+}
+
+/// Release-store identity, parsed into a restricted build grammar. Never an
+/// arbitrary state-file string, even if that file was edited by another tool.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ReleaseId(String);
+impl ReleaseId {
+    fn parse(value: String) -> Option<Self> {
+        let (version, hash) = value.rsplit_once('-')?;
+        if hash.len() != 8 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let (core, meta) = version.split_once('+')?;
+        let numbers: Vec<_> = core.split('.').collect();
+        if numbers.len() != 3
+            || !numbers
+                .iter()
+                .all(|n| !n.is_empty() && n.len() <= 8 && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        let mut parts = meta.split('.');
+        let commit = parts.next()?.strip_prefix('g')?;
+        if commit.is_empty() || commit.len() > 64 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        if parts.any(|part| !matches!(part, "dirty" | "diagnostics")) {
+            return None;
+        }
+        Some(Self(value))
+    }
+}
+impl BundleState {
+    pub(crate) fn read(config: &Path) -> Result<Option<Self>> {
+        Ok(crate::state::read(config)?.map(Self::from_state))
+    }
+    fn from_state(state: crate::state::StateFile) -> Self {
+        Self {
+            connected: state.connected,
+            connected_at: state
+                .connected_at
+                .as_deref()
+                .and_then(crate::state::parse_rfc3339_seconds),
+            sessions: state.sessions,
+            worker_mismatch: state.worker_mismatch,
+            rtc_peers: state.rtc_peers,
+            build_counter: state.build_counter,
+            release: state.release.and_then(ReleaseId::parse),
+            last_error: state.last_error.and_then(|error| {
+                Some(BundleError {
+                    kind: match error.kind.as_str() {
+                        "dns" => ErrorKind::Dns,
+                        "tcp" => ErrorKind::Tcp,
+                        "tls" => ErrorKind::Tls,
+                        "auth" => ErrorKind::Auth,
+                        "protocol" => ErrorKind::Protocol,
+                        "http" => ErrorKind::Http,
+                        _ => ErrorKind::Unknown,
+                    },
+                    at: crate::state::parse_rfc3339_seconds(&error.at)?,
+                })
+            }),
+        }
+    }
+}
+
+/// Header counts describe the whole snapshot, not only the retained lines.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct BundleHeader {
     pub kind: &'static str,
     pub format: u32,
-    pub reader_version: String,
+    pub reader_version: &'static str,
+    pub reader_build: &'static str,
     pub reader_variant: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
     pub instance: String,
-    pub window_from: String,
-    pub window_to: String,
+    pub window_from: u64,
+    pub window_to: u64,
+    pub from: Option<u64>,
+    pub to: Option<u64>,
     pub lines: usize,
+    /// Entire uncompressed JSONL, including this header and every newline.
     pub bytes: usize,
     pub dropped_events: u64,
-    /// Lines inside the window were left out to stay under the byte cap.
+    pub invalid_lines: u64,
     pub truncated: bool,
+    pub state: Option<BundleState>,
 }
 
-/// The header and the selected lines, oldest first.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Bundle {
     pub header: BundleHeader,
     pub lines: Vec<String>,
+}
+impl Bundle {
+    pub(crate) fn encode(&mut self) -> Result<Vec<u8>> {
+        self.header.lines = self.lines.len();
+        self.header.from = self
+            .lines
+            .first()
+            .and_then(|s| record_time(s.as_bytes()))
+            .map(|t| t as u64);
+        self.header.to = self
+            .lines
+            .last()
+            .and_then(|s| record_time(s.as_bytes()))
+            .map(|t| t as u64);
+        let line_bytes: usize = self.lines.iter().map(|s| s.len() + 1).sum();
+        // bytes includes its own decimal representation; monotone fixed point.
+        loop {
+            let header = serde_json::to_vec(&self.header)?;
+            let total = header.len() + 1 + line_bytes;
+            if total == self.header.bytes {
+                let mut raw = Vec::with_capacity(total);
+                raw.extend_from_slice(&header);
+                raw.push(b'\n');
+                for line in &self.lines {
+                    raw.extend_from_slice(line.as_bytes());
+                    raw.push(b'\n');
+                }
+                return Ok(raw);
+            }
+            self.header.bytes = total;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1394,127 +1525,204 @@ struct LineHead {
     #[serde(default)]
     fields: Option<DroppedFields>,
 }
-
 #[derive(Deserialize)]
 struct DroppedFields {
     #[serde(default)]
     dropped: Option<u64>,
 }
-
-/// Read one of the two files by its exact name, at most its cap from its
-/// end. `None` when it does not exist.
-#[cfg_attr(not(test), allow(dead_code))]
-fn read_capped(dir: &Dir, name: &str) -> io::Result<Option<File>> {
-    match crate::platform::open_private_file_at(dir, Path::new(name), false) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
+fn record_time(bytes: &[u8]) -> Option<i64> {
+    let head: LineHead = serde_json::from_slice(bytes).ok()?;
+    parse_rfc3339_millis(&head.t).filter(|t| *t >= 0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn read_tail(file: Option<File>) -> io::Result<Vec<u8>> {
-    let Some(mut file) = file else {
-        return Ok(Vec::new());
+/// Open only one exact leaf and copy it while the cross-process lock is held.
+fn read_capped(dir: &Dir, name: &str) -> io::Result<Vec<u8>> {
+    let file = match crate::platform::open_private_file_at(dir, Path::new(name), false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    let len = file.metadata()?.len();
-    if len > MAX_FILE_BYTES {
-        file.seek(SeekFrom::Start(len - MAX_FILE_BYTES))?;
+    if file.metadata()?.len() > MAX_FILE_BYTES {
+        return Err(io::Error::other("oversized support file"));
     }
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
-/// The support log's lines whose time falls in `[from_ms, to_ms]` (Unix
-/// milliseconds), chosen newest first until `max_bytes` (each line and its
-/// newline counted), returned oldest first behind a header.
-///
-/// Opens exactly [`CURRENT`] and [`PREVIOUS`] in `support_dir`, through the
-/// verified private folder and without following a link, and never lists the
-/// folder. The two are opened together under the rotation lock, so a rotation
-/// cannot move a line from one to the other mid-read.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_window(
+pub(crate) fn active_for(dir: &Path) -> Option<SupportLog> {
+    let inner = EXIT_LOG.get()?.upgrade()?;
+    (inner.dir == dir).then_some(SupportLog { inner })
+}
+
+/// Blocking-only snapshot. Flush this process's writer first (500 ms); copy
+/// both exact files under the cross-process lock, then parse after unlocking.
+/// Other writers' completed appends are included; their queued events are not.
+/// Stable timestamp sort preserves physical append order (previous, current)
+/// for equal timestamps, including overlapping daemon writers. An oversized
+/// record is skipped and smaller older records can still fit.
+fn read_window(
     support_dir: &Path,
     instance: &str,
     from_ms: i64,
     to_ms: i64,
     max_bytes: usize,
+    state: Option<BundleState>,
 ) -> Result<Bundle> {
-    let (current, previous) = match crate::platform::open_support_dir(support_dir, false) {
+    anyhow::ensure!(
+        instance.len() == 8 && instance.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid instance tag"
+    );
+    let (previous, current) = match crate::platform::open_support_dir(support_dir, false) {
         Ok(dir) => {
             let lock = open_or_create(&dir, LOCK)?;
-            lock.lock()?;
-            let opened = read_capped(&dir, CURRENT)
-                .and_then(|current| Ok((current, read_capped(&dir, PREVIOUS)?)));
-            let _ = lock.unlock();
-            let (current, previous) = opened?;
-            (read_tail(current)?, read_tail(previous)?)
+            lock.try_lock()
+                .map_err(|_| io::Error::other("support snapshot busy"))?;
+            let copied = (|| {
+                Ok::<_, io::Error>((read_capped(&dir, PREVIOUS)?, read_capped(&dir, CURRENT)?))
+            })();
+            let unlocked = lock.unlock();
+            let copied = copied?;
+            unlocked?;
+            copied
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("opening {}", support_dir.display()))
-        }
+        Err(error) => return Err(error.into()),
     };
-    let mut selected: Vec<String> = Vec::new();
-    let mut bytes = 0usize;
+    let mut invalid_lines = 0u64;
     let mut dropped_events = 0u64;
-    let mut truncated = false;
-    let newest_first = current
-        .split(|&b| b == b'\n')
-        .rev()
-        .chain(previous.split(|&b| b == b'\n').rev());
-    for raw in newest_first {
-        let Ok(text) = std::str::from_utf8(raw) else {
-            continue;
-        };
-        let Ok(head) = serde_json::from_str::<LineHead>(text) else {
-            continue;
-        };
-        let Some(at) = parse_rfc3339_millis(&head.t) else {
-            continue;
-        };
-        if at < from_ms || at > to_ms {
-            continue;
+    let mut records = Vec::new();
+    for bytes in [&previous, &current] {
+        for raw in bytes.split_inclusive(|&b| b == b'\n') {
+            let parsed = raw
+                .strip_suffix(b"\n")
+                .filter(|line| line.len() <= MAX_EVENT_BYTES)
+                .and_then(|line| std::str::from_utf8(line).ok())
+                .and_then(|text| {
+                    serde_json::from_str::<LineHead>(text)
+                        .ok()
+                        .map(|head| (text, head))
+                })
+                .and_then(|(text, head)| {
+                    parse_rfc3339_millis(&head.t)
+                        .filter(|t| *t >= 0)
+                        .map(|t| (text, head, t))
+                });
+            let Some((text, head, at)) = parsed else {
+                invalid_lines += 1;
+                continue;
+            };
+            if at < from_ms || at > to_ms {
+                continue;
+            }
+            if head.target == DROPPED_TARGET && head.msg == DROPPED_MESSAGE {
+                dropped_events =
+                    dropped_events.saturating_add(head.fields.and_then(|f| f.dropped).unwrap_or(0));
+            }
+            records.push((at, text.to_owned()));
         }
-        if head.target == DROPPED_TARGET && head.msg == DROPPED_MESSAGE {
-            dropped_events += head.fields.and_then(|f| f.dropped).unwrap_or(0);
-        }
-        if truncated {
-            continue;
-        }
-        if bytes + text.len() + 1 > max_bytes {
-            truncated = true;
-            continue;
-        }
-        bytes += text.len() + 1;
-        selected.push(text.to_string());
     }
-    selected.reverse();
-    let header = BundleHeader {
-        kind: "spawnd-support-log",
-        format: 2,
-        reader_version: crate::version::build_version(),
-        reader_variant: if crate::version::DIAGNOSTICS_BUILD {
-            "diagnostics"
-        } else {
-            "release"
+    records.sort_by_key(|(at, _)| *at); // stable: timestamp, then append order
+    let mut bundle = Bundle {
+        header: BundleHeader {
+            kind: "spawnd-support-log",
+            format: 3,
+            reader_version: crate::version::BUILD_VERSION,
+            reader_build: BUILD_ID,
+            reader_variant: if crate::version::DIAGNOSTICS_BUILD {
+                "diagnostics"
+            } else {
+                "normal"
+            },
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            instance: instance.to_owned(),
+            window_from: from_ms.max(0) as u64,
+            window_to: to_ms.max(0) as u64,
+            from: None,
+            to: None,
+            lines: 0,
+            bytes: 0,
+            dropped_events,
+            invalid_lines,
+            truncated: false,
+            state,
         },
-        os: std::env::consts::OS,
-        arch: std::env::consts::ARCH,
-        instance: instance.to_string(),
-        window_from: rfc3339_millis(from_ms.max(0) as u64),
-        window_to: rfc3339_millis(to_ms.max(0) as u64),
-        lines: selected.len(),
-        bytes,
-        dropped_events,
-        truncated,
+        lines: Vec::new(),
     };
-    Ok(Bundle {
-        header,
-        lines: selected,
-    })
+    // Reserve the worst possible header size at this cap (numeric widths,
+    // timestamps and counters included), so selection is linear and bounded.
+    bundle.header.lines = records.len();
+    bundle.header.bytes = max_bytes;
+    bundle.header.from = Some(u64::MAX);
+    bundle.header.to = Some(u64::MAX);
+    let reserve = serde_json::to_vec(&bundle.header)?.len() + 1;
+    anyhow::ensure!(
+        reserve <= max_bytes,
+        "support bundle cap is smaller than its header"
+    );
+    let mut used = reserve;
+    for (_, text) in records.into_iter().rev() {
+        if used + text.len() + 1 > max_bytes {
+            bundle.header.truncated = true;
+            continue;
+        }
+        used += text.len() + 1;
+        bundle.lines.push(text);
+    }
+    bundle.lines.reverse();
+    anyhow::ensure!(
+        bundle.encode()?.len() <= max_bytes,
+        "support bundle exceeds cap"
+    );
+    Ok(bundle)
+}
+
+pub(crate) const MAX_RAW_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_GZIP_BYTES: usize = 900 * 1024;
+pub(crate) struct CompressedBundle {
+    pub header: BundleHeader,
+    pub body: Vec<u8>,
+}
+
+/// The only source of upload bodies. All disk and compression work belongs on
+/// spawn_blocking, including the writer flush. Recompression is bounded to four
+/// attempts; each removes the oldest half. Failure is closed, never oversize.
+pub(crate) fn collect_bundle(
+    log: &SupportLog,
+    instance: &str,
+    from_ms: i64,
+    to_ms: i64,
+    state: Option<BundleState>,
+) -> Result<Option<CompressedBundle>> {
+    anyhow::ensure!(
+        log.flush(Duration::from_millis(500)),
+        "support flush timed out or failed"
+    );
+    let bundle = read_window(log.dir(), instance, from_ms, to_ms, MAX_RAW_BYTES, state)?;
+    compress_bundle(bundle, MAX_GZIP_BYTES)
+}
+fn compress_bundle(mut bundle: Bundle, cap: usize) -> Result<Option<CompressedBundle>> {
+    use flate2::{write::GzEncoder, Compression};
+    for _ in 0..4 {
+        if bundle.lines.is_empty() {
+            return Ok(None);
+        }
+        let raw = bundle.encode()?;
+        anyhow::ensure!(raw.len() <= MAX_RAW_BYTES, "support bundle exceeds raw cap");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw)?;
+        let body = encoder.finish()?;
+        if body.len() <= cap {
+            return Ok(Some(CompressedBundle {
+                header: bundle.header,
+                body,
+            }));
+        }
+        bundle.lines.drain(..bundle.lines.len().div_ceil(2));
+        bundle.header.truncated = true;
+    }
+    anyhow::bail!("support bundle exceeds compressed cap")
 }
 
 /// Tests only: one support log for the whole test process, installed as the
@@ -1576,13 +1784,13 @@ pub(crate) mod capture {
 
         pub(crate) fn bundle(&self) -> String {
             assert!(self.log.flush(Duration::from_secs(30)), "flush timed out");
-            let bundle =
-                read_window(self.log.dir(), "0badcafe", 0, i64::MAX / 2, 64 << 20).unwrap();
-            let mut text = serde_json::to_string(&bundle.header).unwrap();
-            for line in bundle.lines {
-                text.push('\n');
-                text.push_str(&line);
-            }
+            let bundle = collect_bundle(&self.log, "0badcafe", 0, i64::MAX / 2, None)
+                .unwrap()
+                .unwrap();
+            let mut text = String::new();
+            flate2::read::GzDecoder::new(bundle.body.as_slice())
+                .read_to_string(&mut text)
+                .unwrap();
             text
         }
     }

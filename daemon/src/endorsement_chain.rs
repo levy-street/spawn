@@ -29,6 +29,7 @@
 //! endorsement chain from one of this host's pinned anchors to that key, with
 //! every key on the path off the deny-list (the doc's §3 admission rule).
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -72,7 +73,7 @@ pub struct ChainEdge {
 /// delivered by the server on connect and is **add-only** for the account owner,
 /// **subtract-only** in effect (docs §3). Populated by the revocation channel
 /// (a later stage); defined here because chain validation is its only consumer.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RevocationSet {
     keys: HashSet<[u8; PUBLIC_KEY_BYTES]>,
 }
@@ -952,4 +953,58 @@ mod tests {
         assert!(!floor.absorb(RevocationSet::from_keys([a, b])));
         assert_eq!(floor.len(), 2);
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarriedEndorsement {
+    pub account_id: String,
+    pub endorser_public_key: String,
+    pub endorsed_public_key: String,
+    pub endorsed_device_id: String,
+    pub signature: String,
+}
+
+/// Bound the carried endorsement edge-set at the wire, independently of the
+/// relay's own `MAX_RELAYED_ENDORSEMENTS` (the same 64 — see the constant's
+/// rationale). The honest relay never forwards more, so an over-cap list can
+/// only come from a party driving this socket directly; refusing the frame at
+/// deserialization stops it before the vector is even fully allocated, and the
+/// admission path re-checks the same cap for defense in depth. `#[serde(default)]`
+/// still handles an absent field; a present field must be a sequence, so
+/// `carried_endorsements: null` cannot collapse to "none carried".
+pub fn deserialize_bounded_carried_endorsements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CarriedEndorsement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedEdges;
+    impl<'de> serde::de::Visitor<'de> for BoundedEdges {
+        type Value = Vec<CarriedEndorsement>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_CARRIED_ENDORSEMENTS} carried endorsement edges"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut edges = Vec::new();
+            while let Some(edge) = seq.next_element::<CarriedEndorsement>()? {
+                if edges.len() == MAX_CARRIED_ENDORSEMENTS {
+                    return Err(serde::de::Error::custom(
+                        "carried endorsement edges exceed the daemon cap",
+                    ));
+                }
+                edges.push(edge);
+            }
+            Ok(edges)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedEdges)
 }

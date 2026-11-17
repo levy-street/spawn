@@ -1121,6 +1121,7 @@ async fn serve_one_connection_with_loader(
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
         supports_device_connections: true,
+        supports_support_log: true,
     };
     let register_json = serde_json::to_string(&register)?;
     out_tx
@@ -1178,6 +1179,18 @@ async fn serve_one_connection_with_loader(
     // visible even when the read-side EOF detection misbehaves at the
     // kernel/tungstenite layer. Scoped so `dispatch_fut`'s borrow of
     // `out_tx` releases before we drop it below.
+    let support = crate::support::Collector::start(
+        config::config_dir()?,
+        crate::support::Trust {
+            record: live_credentials.record.clone(),
+            account: live_credentials
+                .record
+                .proven_account_id()
+                .and_then(|id| account_id_bytes(&id).ok()),
+            revoked: daemon_revoked.clone(),
+        },
+        live_credentials.server_origin.clone(),
+    )?;
     let dispatch_result = {
         let dispatch_fut = dispatch_loop(
             &mut in_rx,
@@ -1188,6 +1201,7 @@ async fn serve_one_connection_with_loader(
             daemon_revoked,
             Arc::clone(&registered_at),
             registered_bindings,
+            Some(&support),
         );
         tokio::pin!(dispatch_fut);
         tokio::select! {
@@ -1666,98 +1680,59 @@ fn verify_signed_rtc_offer_admitted(
     revoked: &RevocationSet,
     carried: &[CarriedEndorsement],
 ) -> Option<VerifiedRtcSignal> {
-    // Fast path: a directly-pinned browser key.
-    if let Some(verified) = verify_signed_rtc_offer(envelope, record) {
-        // Fail-closed: a revoked key never connects, even if a pin still lingers
-        // (the deny-list is delivered independently of pin reconciliation).
-        if revoked.contains(&verified.sender_public_key().to_bytes()) {
-            tracing::warn!(reason = "revoked-pinned-key", "signed RTC offer refused");
-            return None;
-        }
-        return Some(verified);
+    let verified = if let Some(verified) = verify_signed_rtc_offer(envelope, record) {
+        verified
+    } else {
+        let host_identity = creds::host_identity(record).ok().flatten()?;
+        let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
+        let claimed_sender = envelope_sender(envelope).ok()?;
+        verify_rtc_signal_wire(envelope, &claimed_sender, &host_key).ok()?
+    };
+    admitted_device(
+        verified.sender_public_key(),
+        record,
+        account_id,
+        revoked,
+        carried,
+    )
+    .then_some(verified)
+}
+
+/// The single device-admission rule, shared by signed connections and support
+/// sharing. The caller first proves possession with its domain's signature.
+/// A directly pinned device or a carried chain must be unrevoked. The account
+/// is required for a chain; support statements additionally bind it explicitly.
+pub(crate) fn admitted_device(
+    signer: &ed25519_dalek::VerifyingKey,
+    record: &StoredCreds,
+    account_id: Option<&[u8; 16]>,
+    revoked: &RevocationSet,
+    carried: &[CarriedEndorsement],
+) -> bool {
+    if carried.len() > MAX_CARRIED_ENDORSEMENTS || revoked.contains(&signer.to_bytes()) {
+        return false;
     }
-    // Chain path only when the offer carries edges and we know our own account.
-    // Each refusal names its reason: an uninformative reject line made a real
-    // admission failure undiagnosable in the field.
-    let Some(account_id) = account_id else {
-        tracing::warn!(reason = "no-account-anchor", "signed RTC offer refused");
-        return None;
-    };
-    if carried.is_empty() {
-        tracing::warn!(
-            reason = "no-carried-endorsements",
-            "signed RTC offer refused"
-        );
-        return None;
-    }
-    // Independent daemon-side cap, before any parse or signature work. The
-    // honest relay bounds carried sets to the same 64, so an over-cap list only
-    // ever comes from a party driving this socket directly; the wire
-    // deserializer already refuses such frames, and this re-check keeps the
-    // bound local to the admission path (defense in depth, named refusal).
-    if carried.len() > MAX_CARRIED_ENDORSEMENTS {
-        tracing::warn!(
-            reason = "carried-endorsements-over-cap",
-            carried = carried.len(),
-            max = MAX_CARRIED_ENDORSEMENTS,
-            "signed RTC offer refused"
-        );
-        return None;
-    }
-    let Some(host_identity) = creds::host_identity(record).ok().flatten() else {
-        tracing::warn!(reason = "no-host-identity", "signed RTC offer refused");
-        return None;
-    };
-    let Ok(host_key) = public_key_from_wire(&host_identity.public_key) else {
-        tracing::warn!(reason = "bad-host-key", "signed RTC offer refused");
-        return None;
-    };
-    // Verify against the sender the envelope CLAIMS: this proves possession of
-    // that private key. Only a proven-possessed key is a candidate for a chain.
-    let Ok(claimed_sender) = envelope_sender(envelope) else {
-        tracing::warn!(
-            reason = "unreadable-envelope-sender",
-            "signed RTC offer refused"
-        );
-        return None;
-    };
-    let Ok(verified) = verify_rtc_signal_wire(envelope, &claimed_sender, &host_key) else {
-        tracing::warn!(
-            reason = "envelope-verification-failed",
-            "signed RTC offer refused"
-        );
-        return None;
-    };
     let anchors: Vec<_> = record
         .browser_pins()
         .iter()
         .filter_map(|pin| public_key_from_wire(pin.public_key()).ok())
         .collect();
+    if anchors.contains(signer) {
+        return true;
+    }
+    let Some(account_id) = account_id else {
+        return false;
+    };
     let edges = parse_carried_endorsements(carried);
-    // find_valid_chain rejects any chain whose keys (anchor, intermediates, or
-    // the connecting key) are on the deny-list.
-    match find_valid_chain(
+    find_valid_chain(
         account_id,
         &anchors,
         revoked,
-        verified.sender_public_key(),
+        signer,
         &edges,
         DEFAULT_MAX_CHAIN_EDGES,
-    ) {
-        Ok(()) => Some(verified),
-        Err(error) => {
-            tracing::warn!(
-                reason = "no-valid-chain",
-                ?error,
-                sender = %short_key(verified.sender_public_key()),
-                carried = carried.len(),
-                parsed_edges = edges.len(),
-                anchors = anchors.len(),
-                "signed RTC offer refused"
-            );
-            None
-        }
-    }
+    )
+    .is_ok()
 }
 
 /// First bytes of a key, hex, for log correlation (never a trust input).
@@ -1908,6 +1883,7 @@ async fn dispatch_loop(
     daemon_revoked: &mut RevocationSet,
     registered_at: Arc<StdMutex<Option<Instant>>>,
     registered_bindings: std::collections::HashSet<String>,
+    support: Option<&crate::support::Collector>,
 ) -> Result<()> {
     let mut rtc_tasks: HashMap<String, mpsc::UnboundedSender<RtcSignalJob>> = HashMap::new();
     // This host's account, as canonical UUID bytes. Used to scope carried
@@ -1940,6 +1916,7 @@ async fn dispatch_loop(
             }
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
+                    support_log_consent,
                     host_id,
                     access_token,
                     account_id,
@@ -1987,6 +1964,16 @@ async fn dispatch_loop(
                     daemon_account = resolve_daemon_account(proven_account, account_id.as_deref());
                     let newly_revoked = daemon_revoked
                         .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
+                    if let Some(support) = support {
+                        support.trust(
+                            crate::support::Trust {
+                                record: live_credentials.record.clone(),
+                                account: daemon_account,
+                                revoked: daemon_revoked.clone(),
+                            },
+                            browser_device_ids.clone(),
+                        )?;
+                    }
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -1994,6 +1981,9 @@ async fn dispatch_loop(
                         out_tx,
                     )
                     .await;
+                    if let (Some(support), Some(consent)) = (support, support_log_consent) {
+                        support.consent(consent)?;
+                    }
                     if newly_revoked {
                         // RTC channels are peer-to-peer and can outlive a
                         // control-WS reconnect, so a device revoked while this
@@ -2022,6 +2012,16 @@ async fn dispatch_loop(
                     // a shrinking frame can only mean a withholding server).
                     let newly_revoked = daemon_revoked
                         .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
+                    if let Some(support) = support {
+                        support.trust(
+                            crate::support::Trust {
+                                record: live_credentials.record.clone(),
+                                account: daemon_account,
+                                revoked: daemon_revoked.clone(),
+                            },
+                            browser_device_ids.clone(),
+                        )?;
+                    }
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -2043,6 +2043,19 @@ async fn dispatch_loop(
                             "revocation update: closing live RTC sessions for re-admission"
                         );
                         rtc_sessions.invalidate_trust_and_close_all().await;
+                    }
+                }
+                Inbound::HostSupportLogConsent { consent } => {
+                    if let Some(support) = support {
+                        support.consent(consent)?;
+                    }
+                }
+                Inbound::SupportLogCollect {
+                    request_id,
+                    since_seconds,
+                } => {
+                    if let Some(support) = support {
+                        support.collect(request_id, since_seconds)?;
                     }
                 }
                 Inbound::Error { code, frame_type } => {
@@ -5182,6 +5195,7 @@ mod tests {
             &mut revoked,
             Arc::new(StdMutex::new(None)),
             std::collections::HashSet::new(),
+            None,
         );
         let exercise = async move {
             in_tx
@@ -5514,6 +5528,7 @@ mod tests {
             &mut revoked,
             Arc::new(StdMutex::new(None)),
             std::collections::HashSet::new(),
+            None,
         );
         let exercise = async move {
             in_tx
@@ -5647,6 +5662,73 @@ mod tests {
         let stranger_wire =
             sign_rtc_signal_wire(&stranger, RtcProtocol::Session, &stranger_offer).unwrap();
         assert!(verify_signed_rtc_offer(&stranger_wire, &record).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hanging_support_upload_does_not_hold_up_dispatch_pings() {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (mut trust, consent) = crate::support::tests::fixture();
+        trust.record.server_url = Some(origin.clone());
+        crate::support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+        let live = LiveCredentialSnapshot::initial(
+            trust.record.clone(),
+            &url::Url::parse(&origin).unwrap(),
+        )
+        .unwrap();
+        let support = crate::support::tests::test_collector(tmp.path().to_owned(), trust, origin);
+        let registry = SessionRegistry::new();
+        let rtc = RtcSessions::new();
+        let mut revoked = RevocationSet::new();
+        let (in_tx, mut in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let dispatch = dispatch_loop(
+            &mut in_rx,
+            &registry,
+            &rtc,
+            &out_tx,
+            &live,
+            &mut revoked,
+            Arc::new(StdMutex::new(None)),
+            HashSet::new(),
+            Some(&support),
+        );
+        let exercise = async {
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::SupportLogCollect {
+                    request_id: Uuid::new_v4(),
+                    since_seconds: 60,
+                })))
+                .await
+                .unwrap();
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let (headers, _) = crate::support::tests::receive_request(&mut connection).await;
+            assert!(headers
+                .to_lowercase()
+                .contains("content-type: application/gzip"));
+            // The listener deliberately never sends an HTTP response.
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                    request_id: "during-upload".into(),
+                })))
+                .await
+                .unwrap();
+            let pong = out_rx.recv().await.unwrap();
+            let value: serde_json::Value = serde_json::from_str(pong.as_str()).unwrap();
+            assert_eq!(value["type"], "host.pong");
+            assert_eq!(value["request_id"], "during-upload");
+            drop(in_tx);
+            drop(connection);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(dispatch, exercise)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
     }
 
     #[test]

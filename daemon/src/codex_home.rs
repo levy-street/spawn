@@ -1143,10 +1143,17 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
         let written = std::fs::read_to_string(log.dir().join(crate::support_log::CURRENT)).unwrap();
         assert!(written.contains("\"line\":3"), "{written}");
         crate::support_log::capture::assert_absent(&written, &canary, "the support log");
-        let bundle =
-            crate::support_log::read_window(log.dir(), "x", 0, i64::MAX / 2, 1 << 20).unwrap();
-        assert_eq!(bundle.lines.len(), 1);
-        crate::support_log::capture::assert_absent(&bundle.lines.join("\n"), &canary, "the bundle");
+        let bundle = crate::support_log::collect_bundle(&log, "00000000", 0, i64::MAX / 2, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bundle.header.lines, 1);
+        let mut raw = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(bundle.body.as_slice()),
+            &mut raw,
+        )
+        .unwrap();
+        crate::support_log::capture::assert_absent(&raw, &canary, "the bundle");
     }
 
     #[derive(Clone)]

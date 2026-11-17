@@ -137,6 +137,7 @@ pub fn instance_log_dir(config_dir: &Path) -> Result<PathBuf> {
 pub fn purge_local_instance_data(config_dir: &Path) -> Result<()> {
     // On Windows the whole log directory goes below as well; elsewhere the
     // support folder is the one thing spawnd writes under it.
+    crate::support_store::remove(config_dir)?;
     crate::support_log::remove(config_dir)?;
     #[cfg(windows)]
     {

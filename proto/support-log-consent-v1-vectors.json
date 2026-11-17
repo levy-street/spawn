@@ -1,0 +1,37 @@
+{
+  "contract": "SPAWN-SUPPORT-LOG-CONSENT-V1",
+  "positive": [
+    {
+      "consent": {
+        "account_id": "01010101-0101-0101-0101-010101010101",
+        "carried_endorsements": [],
+        "enabled": false,
+        "issued_at_ms": 1700000000000,
+        "signature": "pU4eupK59_fev0NJmxN3YtOogq6di5PffZmFDYCQvfE4-kj4VW1djs0xlS-1zzkvD-WzHFk3g695gVIkEf1-Ag",
+        "signer_device_id": "02020202-0202-0202-0202-020202020202",
+        "signer_public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+        "version": 1
+      },
+      "signing_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "transcript_hex": "535041574e2d535550504f52542d4c4f472d434f4e53454e542d56310101010101010101010101010101010101ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c02020202020202020202020202020202000000018bcfe56800",
+      "transcript_sha256": "98d51a6d612ca24dce2410cf9bf85be0e5cc71da8bdc376f9456aae6b20b7abf"
+    },
+    {
+      "consent": {
+        "account_id": "01010101-0101-0101-0101-010101010101",
+        "carried_endorsements": [],
+        "enabled": true,
+        "issued_at_ms": 1700000000000,
+        "signature": "RfjmUb65u1awqt5Is9T2PgV0d3LzQWmXmggaqr8MDRMO5GFOpp3LnhWZ5RFSylhJG29eSSvxSWsKC3yJHwAfBQ",
+        "signer_device_id": "02020202-0202-0202-0202-020202020202",
+        "signer_public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+        "version": 1
+      },
+      "signing_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "transcript_hex": "535041574e2d535550504f52542d4c4f472d434f4e53454e542d56310101010101010101010101010101010101ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c02020202020202020202020202020202010000018bcfe56800",
+      "transcript_sha256": "8378e232f205c9e6dc49de63dceed9cba8a0482370f6b05a2e08b9c376942ae9"
+    }
+  ],
+  "producer": "spawnd Rust ed25519-dalek 2.2",
+  "version": 1
+}

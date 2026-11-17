@@ -30,51 +30,12 @@ where
     Ok(Some(value))
 }
 
-/// Bound the carried endorsement edge-set at the wire, independently of the
-/// relay's own `MAX_RELAYED_ENDORSEMENTS` (the same 64 — see the constant's
-/// rationale). The honest relay never forwards more, so an over-cap list can
-/// only come from a party driving this socket directly; refusing the frame at
-/// deserialization stops it before the vector is even fully allocated, and the
-/// admission path re-checks the same cap for defense in depth. `#[serde(default)]`
-/// still handles an absent field; a present field must be a sequence, so
-/// `carried_endorsements: null` cannot collapse to "none carried".
-fn deserialize_bounded_carried_endorsements<'de, D>(
+use spawnd::endorsement_chain::deserialize_bounded_carried_endorsements;
+
+fn deserialize_present_consent<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<CarriedEndorsement>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
-
-    struct BoundedEdges;
-    impl<'de> serde::de::Visitor<'de> for BoundedEdges {
-        type Value = Vec<CarriedEndorsement>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(
-                formatter,
-                "a sequence of at most {MAX_CARRIED_ENDORSEMENTS} carried endorsement edges"
-            )
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            let mut edges = Vec::new();
-            while let Some(edge) = seq.next_element::<CarriedEndorsement>()? {
-                if edges.len() == MAX_CARRIED_ENDORSEMENTS {
-                    return Err(serde::de::Error::custom(
-                        "carried endorsement edges exceed the daemon cap",
-                    ));
-                }
-                edges.push(edge);
-            }
-            Ok(edges)
-        }
-    }
-
-    deserializer.deserialize_seq(BoundedEdges)
+) -> Result<Option<Option<spawnd::support_consent::Consent>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// The most agents one `host.agents.check` may name. The server sends every
@@ -183,6 +144,7 @@ pub enum Outbound {
         /// Old servers ignore the unknown field.
         supports_account_chains: bool,
         supports_device_connections: bool,
+        supports_support_log: bool,
     },
     /// The keepalive, optionally carrying two meter readings. Buckets, never
     /// percentages: see `host_metrics` for why the server is given a coarse
@@ -355,6 +317,12 @@ pub struct DaemonUpdateArtifact {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_consent"
+        )]
+        support_log_consent: Option<Option<spawnd::support_consent::Consent>>,
         host_id: Uuid,
         /// Optional daemon-token rotation. Old servers omit it.
         #[serde(default)]
@@ -379,6 +347,15 @@ pub enum Inbound {
         /// owner, subtract-only here; a wrong value can only DENY, never grant.
         #[serde(default)]
         revoked_browser_keys: Option<Vec<String>>,
+    },
+    #[serde(rename = "host.support_log_consent")]
+    HostSupportLogConsent {
+        consent: Option<spawnd::support_consent::Consent>,
+    },
+    #[serde(rename = "support_log.collect")]
+    SupportLogCollect {
+        request_id: Uuid,
+        since_seconds: i64,
     },
     /// Pushed when a host's browser pin set changes, so an endorsement takes
     /// effect without waiting for the daemon to reconnect.
@@ -582,14 +559,7 @@ pub struct RtcIceServerConfig {
 /// server-relayed and untrusted; the daemon re-verifies each signature and finds
 /// the chain (`endorsement_chain::find_valid_chain`). Wire strings, so the daemon
 /// reconstructs the exact `SPAWN-ACCT-ENDORSE-V1` transcript it re-verifies.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CarriedEndorsement {
-    pub account_id: String,
-    pub endorser_public_key: String,
-    pub endorsed_public_key: String,
-    pub endorsed_device_id: String,
-    pub signature: String,
-}
+pub use spawnd::endorsement_chain::CarriedEndorsement;
 
 /// `session.create` / `session.restart` payload. A session always starts as
 /// the user's login shell in `cwd`: the daemon resolves the shell itself, so
@@ -774,9 +744,11 @@ mod daemon_update_wire_tests {
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,
+            supports_support_log: true,
         })
         .unwrap();
         assert_eq!(value["type"], "register");
+        assert_eq!(value["supports_support_log"], true);
         assert_eq!(value["daemon_tree"], "a".repeat(40));
         assert_eq!(value["self_update"], true);
         assert!(value["self_update_blocked"].is_null());
@@ -800,6 +772,7 @@ mod daemon_update_wire_tests {
             spec: None,
             supports_account_chains: true,
             supports_device_connections: true,
+            supports_support_log: true,
         })
         .unwrap();
         assert!(without_tree.get("daemon_tree").is_none());
@@ -1347,5 +1320,49 @@ mod device_poll_tests {
             }
             other => panic!("the server's candidate frame parsed as {other:?}"),
         }
+    }
+    #[test]
+    fn support_frames_preserve_absent_null_and_reject_non_uuid_paths() {
+        let host = Uuid::from_bytes([1; 16]);
+        let absent: Inbound =
+            serde_json::from_value(serde_json::json!({"type":"registered","host_id":host}))
+                .unwrap();
+        assert!(matches!(
+            absent,
+            Inbound::Registered {
+                support_log_consent: None,
+                ..
+            }
+        ));
+        let null: Inbound = serde_json::from_value(
+            serde_json::json!({"type":"registered","host_id":host,"support_log_consent":null}),
+        )
+        .unwrap();
+        assert!(matches!(
+            null,
+            Inbound::Registered {
+                support_log_consent: Some(None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Inbound>(
+                r#"{"type":"host.support_log_consent","consent":null}"#
+            )
+            .unwrap(),
+            Inbound::HostSupportLogConsent { consent: None }
+        ));
+        assert!(serde_json::from_value::<Inbound>(serde_json::json!({"type":"support_log.collect","request_id":"../escape","since_seconds":60})).is_err());
+        let collect = serde_json::from_value::<Inbound>(
+            serde_json::json!({"type":"support_log.collect","request_id":host,"since_seconds":60}),
+        )
+        .unwrap();
+        assert!(matches!(
+            collect,
+            Inbound::SupportLogCollect {
+                since_seconds: 60,
+                ..
+            }
+        ));
     }
 }

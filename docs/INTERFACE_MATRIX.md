@@ -81,8 +81,16 @@ The daemon control frames implemented in `daemon/src/proto.rs` are:
 
 | Direction | Frames |
 | --- | --- |
-| daemon → server | `register` (`existing_sessions`, optional `spec`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
-| server → daemon | `registered`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
+| daemon → server | `register` (`existing_sessions`, optional `spec`, `supports_support_log:true`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
+| server → daemon | `registered` (optional `support_log_consent`; absent preserves, null disables), `host.support_log_consent`, `support_log.collect`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
+
+The support additions are daemon-only and additive: current server registration
+reads known properties from a JSON object and ignores the capability. There is
+no sender, upload route or app signing switch yet. `support_log.collect` carries
+a UUID `request_id` and integer `since_seconds`, clamped to 60–259200. Responses
+use a bounded HTTPS POST to the configured origin, with signed device consent,
+current admission checks and local rate history; see
+[`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
 
 As implemented:
 
