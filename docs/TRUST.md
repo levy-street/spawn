@@ -236,11 +236,8 @@ wins, off wins a tie, and signers use `max(now, current + 1)` within the 24-hour
 future bound. Consent has no expiry. Null disables; an identical current valid
 statement can clear server-off.
 
-One optional sequential actor owns sharing across control reconnects. Startup
-schedules its preparation without waiting; collection is unavailable until ready.
-The existing delivery queue is present immediately, so early trust and withdrawal
-cannot be lost during preparation. Preparation is the actor's first awaited job;
-failure enters the same terminal denial. Dispatch
+One optional sequential actor owns sharing across control reconnects. Its queue
+exists immediately; startup opens no support storage. Dispatch for trust/consent
 clones the parsed support payload, advances one generation with a compare-exchange
 loop, clears the request-started bit, tries the bounded queue and notifies the
 actor. It does no support filesystem or cryptographic work. Queue operations may
@@ -251,19 +248,32 @@ generation; unchanged observations deliver nothing.
 The actor takes one input at a time, in arrival order, and finishes it before
 taking another. A combined trust/consent update stays one input. Received trust
 and revocations are retained before writes. Collection runs inside that same
-loop: admission budget, one preparation job (authorization, durable reservation,
-snapshot and compression), one final disk authorization job, atomic start claim,
+loop: one preparation job (statement existence, authorization, durable reservation,
+snapshot and encoding), one final disk authorization job, atomic start claim,
 request selected against generation change, then one final receipt job. During
 collection, delivery still advances the generation immediately, while queued
 updates wait for collection to finish. Every filesystem job is awaited to
 completion or its deadline; healthy work is never abandoned. Lock waits are
 bounded at about two seconds. No job queues behind unfinished work. The dedicated
-thread is not joined at daemon shutdown.
+thread is not joined at daemon shutdown. The collector's custom HTTP resolver
+runs OS lookup as one job on that same thread, under the collection deadline;
+no lookup uses Tokio's blocking pool. An unfinished lookup prevents any later
+job, enters terminal denial, and cannot hold runtime shutdown. This client
+ignores environment proxies; ordinary daemon HTTP clients are unchanged.
+
+Collection admission is charged at delivery, before enqueueing (one per minute,
+burst three). A busy gate or full queue drops/counts a collection and never
+triggers overflow denial. At dequeue, an expired usable deadline or stale
+generation is dropped/counts without a storage job or POST. Before any other
+collection work, absence of the instance's consent file drops/counts the frame:
+no write, receipt, DNS lookup, connection or POST. Counts stay in memory for the
+current UTC day; a running daemon exposes them through its normal heartbeat and
+`spawnd status`. A stopped daemon shows no count.
 
 Any update failure enters terminal `Denied(reason)` for the rest of this process:
 storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
 storage worker, the consent write budget, the 256-key support revocation floor,
-delivery queue overflow or delivery-gate contention, invalid support update, or
+consent/trust delivery queue overflow or gate contention, invalid support update, or
 generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
 write failures also deny. Later inputs are drained and ignored, and stored consent
 is removed once, best-effort; a dead or unfinished worker can prevent that removal.
@@ -291,8 +301,8 @@ across reconnects. Excess requests are counted and dropped without file work,
 receipts or POSTs. Admitted collection has one 30-second deadline including
 audit (two seconds reserved for final audit), a five-second connect and
 15-second HTTP timeout. One flight, durable limits of one bundle per five
-minutes/twelve per day (refusals count), a 60-second to 72-hour window, 1 MiB raw
-and 900 KiB gzip cap bound disclosure. All support filesystem/compression work
+minutes/twelve per day (refusals count), a 60-second to 72-hour window and a 900 KiB NDJSON
+body cap (header included) bound disclosure. All support filesystem/encoding work
 runs serially on one bounded, dedicated thread. Every job is awaited to completion or its three-second deadline (final audit
 uses the remaining collection deadline); nothing queues behind unfinished work. A stalled thread cannot hold daemon shutdown. HTTPS uses the configured origin and path prefix, the daemon token,
 no redirects/retries, and only 2xx succeeds. Body provenance is guarded by typed
@@ -318,7 +328,7 @@ bytes were sent. The server can ask before relaying off; transport buffering
 cannot strengthen that ordering guarantee.
 
 Collector preparation is scheduled without waiting; ordinary startup never
-waits for support readiness or its I/O deadline. Logout (both variants), reset and exorcise retain master's
+waits for support I/O. Logout (both variants), reset and exorcise retain master's
 ordinary error behavior and cleanup order; support failure adds a warning only.
 Without a proven account no consent statement is stored or honoured; lock,
 receipt and revocation files may still exist. Status explains unavailable account

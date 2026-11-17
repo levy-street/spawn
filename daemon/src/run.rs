@@ -5877,7 +5877,7 @@ mod tests {
                 let (headers, _) = crate::support::tests::receive_request(&mut connection).await;
                 assert!(headers
                     .to_lowercase()
-                    .contains("content-type: application/gzip"));
+                    .contains("content-type: application/x-ndjson"));
                 // The listener deliberately never sends an HTTP response.
                 in_tx
                     .send(WsInbound::Json(Box::new(Inbound::HostPing {
@@ -5999,9 +5999,48 @@ mod tests {
         .await;
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn malformed_support_registration_installs_session_sinks_and_keeps_frame_order() {
+        let Some(root) = std::env::var_os("SPAWN_TEST_REGISTRATION_ROOT") else {
+            let tmp = crate::support_log::capture::private_tempdir();
+            let output = crate::support::tests::bounded(
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "run::tests::malformed_support_registration_installs_session_sinks_and_keeps_frame_order", "--nocapture"])
+                    .env("SPAWN_TEST_REGISTRATION_ROOT", tmp.path())
+                    .env("SPAWN_CONFIG_DIR", tmp.path().join("config"))
+                    .env("SPAWN_INSTALL_ROOT", tmp.path().join("install"))
+                    .env("XDG_CONFIG_HOME", tmp.path().join("settings"))
+                    .env("XDG_STATE_HOME", tmp.path().join("state"))
+                    .env("SPAWND_NO_PERMISSION_PRIME", "1")
+                    .kill_on_drop(true).output()
+            ).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let config = crate::config::config_dir().unwrap();
+        for path in [
+            config.clone(),
+            crate::platform::default_config_base().unwrap(),
+            crate::install::layout_for_instance(&config)
+                .unwrap()
+                .root()
+                .to_owned(),
+            crate::service::instance_state_path(&config).unwrap(),
+            crate::support_log::support_dir(&config).unwrap(),
+        ] {
+            assert!(
+                path.starts_with(&root) && path != root,
+                "registration path escapes test root"
+            );
+        }
+        assert_eq!(std::env::var("SPAWND_NO_PERMISSION_PRIME").unwrap(), "1");
         crate::support::tests::bounded(async {
             let (_, consent) = crate::support::tests::fixture();
             let edge = CarriedEndorsement { account_id: consent.account_id.clone(), endorser_public_key: consent.signer_public_key.clone(), endorsed_public_key: consent.signer_public_key.clone(), endorsed_device_id: consent.signer_device_id.clone(), signature: consent.signature.clone() };
@@ -6010,7 +6049,9 @@ mod tests {
             let mut unknown = serde_json::to_value(&consent).unwrap();
             unknown["unknown"] = serde_json::json!(true);
             for extension in [serde_json::json!({}), serde_json::to_value(over).unwrap(), unknown, serde_json::json!(42)] {
-                let tmp = crate::support_log::capture::private_tempdir();
+                let tmp = tempfile::tempdir_in(&root).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
                 let (trust, _) = crate::support::tests::fixture();
                 let support = crate::support::tests::test_collector(tmp.path().to_owned(), trust, String::new()).await;
                 crate::support::tests::settled(&support).await;

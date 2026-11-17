@@ -104,6 +104,9 @@ pub(crate) struct Stored {
     #[serde(default)]
     revoked: Revocations,
 }
+pub(crate) fn has_statement(config: &Path) -> std::io::Result<bool> {
+    config.join(CONSENT_NAME).try_exists()
+}
 fn read(config: &Path) -> Result<Stored> {
     CONSENT
         .read(&config.join(CONSENT_NAME))?

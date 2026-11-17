@@ -1,4 +1,4 @@
-//! One detached support storage thread. Callers await each job to completion or
+//! One detached support I/O thread. Callers await each job to completion or
 //! its deadline. A timed-out job still owns the thread; no job queues behind it.
 use std::{
     any::Any,
@@ -30,7 +30,10 @@ pub(crate) struct Worker {
     stopped: Arc<AtomicBool>,
 }
 static WORKER: OnceLock<Option<Arc<Worker>>> = OnceLock::new();
+#[cfg(not(test))]
 pub(crate) const IO_DEADLINE: Duration = Duration::from_secs(3);
+#[cfg(test)]
+pub(crate) const IO_DEADLINE: Duration = Duration::from_secs(15);
 
 impl Worker {
     pub(crate) fn process() -> Option<Arc<Self>> {

@@ -223,8 +223,11 @@ pub fn state_path(config_dir: &Path) -> PathBuf {
 }
 
 pub fn read(config_dir: &Path) -> Result<Option<StateFile>> {
-    let path = state_path(config_dir);
-    let bytes = match fs::read(&path) {
+    read_path(&state_path(config_dir))
+}
+
+pub(crate) fn read_path(path: &Path) -> Result<Option<StateFile>> {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
@@ -588,9 +591,10 @@ mod tests {
     #[test]
     fn state_json_has_the_stable_contract_shape_and_writes_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        let mut store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        store.path = dir.path().join("state.json");
         store.disconnected("auth", "token_revoked", 2);
-        let state = read(dir.path()).unwrap().unwrap();
+        let state = read_path(&store.path).unwrap().unwrap();
         let value = serde_json::to_value(&state).unwrap();
         assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["connected"], false);
@@ -638,9 +642,10 @@ mod tests {
     #[test]
     fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
         let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        let mut store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        store.path = dir.path().join("state.json");
         store.heartbeat(0, None);
-        let state = read(dir.path()).unwrap().unwrap();
+        let state = read_path(&store.path).unwrap().unwrap();
         assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
         assert!(state
             .exe
@@ -648,7 +653,7 @@ mod tests {
             .is_some_and(|exe| std::path::Path::new(exe).is_absolute()));
         assert!(!state.worker_mismatch);
         store.worker_mismatch(true);
-        let state = read(dir.path()).unwrap().unwrap();
+        let state = read_path(&store.path).unwrap().unwrap();
         assert!(state.worker_mismatch);
         assert_eq!(
             serde_json::to_value(&state).unwrap()["worker_mismatch"],

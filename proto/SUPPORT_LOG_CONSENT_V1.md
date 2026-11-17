@@ -31,8 +31,9 @@ schema and its bounded deserializer. Approvals are not part of the signed
 `daemon/src/support_consent.rs` encodes and verifies the statement. The account
 must be **locally proven by this host's retained device approvals**
 (`StoredCreds::proven_account_id`), never the account named by the server.
-Without that proof, no statement is stored or honoured and collection refuses
-with `not_consented`; status explains that a device approval is needed. This
+Without that proof, no statement is stored or honoured; collection drops if no
+statement file exists, otherwise it refuses with `not_consented`. Status explains
+that a device approval is needed. This
 restriction does not change legacy connection admission. Lock, receipt and
 revocation files may still be written; no consent statement or bundle is written
 for sharing without proven account authority.
@@ -46,7 +47,8 @@ their existing direct-pin-before-chain-cap order and refusal diagnostics.
 
 Newest `issued_at_ms` wins. At equal time, off beats on; otherwise the stored
 statement stays. An identical statement may clear `server_off` after verification. If the signed
-statement and `server_off` would stay the same, persistence is skipped. A signer must use
+statement, carried approvals, revocations and `server_off` would stay the same,
+persistence is skipped. A signer must use
 `max(now, current issued_at_ms + 1)` and must handle overflow as a failure.
 Statements more than 86,400,000 ms in the future are refused; there is no expiry.
 Removing a signer does not erase the timestamp floor.
@@ -75,11 +77,8 @@ statement exists, cleanup does not create a lock file.
   invalid. Duplicate support fields and frames over 64 KiB are invalid support;
   the ordinary parser keeps its existing WebSocket bound and duplicate semantics.
 
-One optional sequential actor owns sharing across control reconnects. Startup
-schedules its preparation without waiting; collection is unavailable until ready.
-The existing delivery queue is present immediately, so early trust and withdrawal
-cannot be lost during preparation. Preparation is the actor's first awaited job;
-failure enters the same terminal denial. Dispatch
+One optional sequential actor owns sharing across control reconnects. Its queue
+exists immediately; startup opens no support storage. Dispatch for trust/consent
 clones the parsed support payload, advances one generation with a compare-exchange
 loop, clears the request-started bit, tries the bounded queue and notifies the
 actor. It does no support filesystem or cryptographic work. Queue operations may
@@ -90,19 +89,32 @@ generation; unchanged observations deliver nothing.
 The actor takes one input at a time, in arrival order, and finishes it before
 taking another. A combined trust/consent update stays one input. Received trust
 and revocations are retained before writes. Collection runs inside that same
-loop: admission budget, one preparation job (authorization, durable reservation,
-snapshot and compression), one final disk authorization job, atomic start claim,
+loop: one preparation job (statement existence, authorization, durable reservation,
+snapshot and encoding), one final disk authorization job, atomic start claim,
 request selected against generation change, then one final receipt job. During
 collection, delivery still advances the generation immediately, while queued
 updates wait for collection to finish. Every filesystem job is awaited to
 completion or its deadline; healthy work is never abandoned. Lock waits are
 bounded at about two seconds. No job queues behind unfinished work. The dedicated
-thread is not joined at daemon shutdown.
+thread is not joined at daemon shutdown. The collector's custom HTTP resolver
+runs OS lookup as one job on that same thread, under the collection deadline;
+no lookup uses Tokio's blocking pool. An unfinished lookup prevents any later
+job, enters terminal denial, and cannot hold runtime shutdown. This client
+ignores environment proxies; ordinary daemon HTTP clients are unchanged.
+
+Collection admission is charged at delivery, before enqueueing (one per minute,
+burst three). A busy gate or full queue drops/counts a collection and never
+triggers overflow denial. At dequeue, an expired usable deadline or stale
+generation is dropped/counts without a storage job or POST. Before any other
+collection work, absence of the instance's consent file drops/counts the frame:
+no write, receipt, DNS lookup, connection or POST. Counts stay in memory for the
+current UTC day; a running daemon exposes them through its normal heartbeat and
+`spawnd status`. A stopped daemon shows no count.
 
 Any update failure enters terminal `Denied(reason)` for the rest of this process:
 storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
 storage worker, the consent write budget, the 256-key support revocation floor,
-delivery queue overflow or delivery-gate contention, invalid support update, or
+consent/trust delivery queue overflow or gate contention, invalid support update, or
 generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
 write failures also deny. Later inputs are drained and ignored, and stored consent
 is removed once, best-effort; a dead or unfinished worker can prevent that removal.
@@ -168,19 +180,20 @@ No expired job is submitted. One collection runs at a time in this process, and
 the cross-process flight lock also covers unfinished snapshots. Durable receipt limits are one collection per five
 minutes and twelve per rolling day; refusals are charged and never refund quota.
 
-The body is either `application/gzip` of at most **921600 bytes**, with
+The body is either plain `application/x-ndjson` of at most **921600 bytes**
+(header line and every newline included), with
 `Content-Length`, or a typed `application/json` refusal enum serialized as
 `{"declined":"CODE"}`. Refusals contain no additional fields or free text:
 
 | Code | Meaning |
 | --- | --- |
-| `not_consented` | Unknown locally proven account, absent/invalid/off/server-disabled statement, or stale queued request |
+| `not_consented` | Unknown locally proven account, invalid/off/server-disabled stored statement |
 | `signer_untrusted` | Signer/chain revoked or untrusted, or verified device attribution mismatches |
 | `rate_limited` | Flight lock busy or durable collection quota exhausted |
 | `no_log` | No active writer or no eligible complete records |
-| `failed` | Storage, snapshot, compression or preparation failure |
+| `failed` | Storage, snapshot or preparation failure |
 
-A request dropped before a response attempts a typed local `cancelled` receipt
+An already-started collection cancelled before a response attempts a typed local `cancelled` receipt
 and sends no new refusal; its body may still be delivered. Terminal denial or a
 stale queued generation causes no POST. Destination, audit, deadline or transport
 failure may leave no response.
@@ -190,23 +203,24 @@ with no following or retry. Servers should use 400 for malformed bodies/headers,
 requests, and 413 for oversized bodies; these statuses are all terminal to the
 daemon. A successful status is not proof of server retention.
 
-All gzip headers below are required; JSON refusals omit them:
+All support headers below are required for NDJSON; JSON refusals omit them.
+`Content-Length` is the body length; there is no separate bytes header:
 
 | Header | Wire type and meaning |
 | --- | --- |
-| `X-Spawn-Support-Log-Sha256` | 64 lower-case hexadecimal characters: SHA-256 of compressed bytes |
+| `X-Spawn-Support-Log-Sha256` | 64 lower-case hexadecimal characters: SHA-256 of the body |
 | `X-Spawn-Support-Log-Lines` | Unsigned decimal integer: event lines, excludes header |
-| `X-Spawn-Support-Log-Raw-Bytes` | Unsigned decimal integer: complete uncompressed JSONL bytes, at most 1048576 |
 | `X-Spawn-Support-Log-From` | Signed decimal Unix milliseconds: first retained event, zero if absent |
 | `X-Spawn-Support-Log-To` | Signed decimal Unix milliseconds: last retained event, zero if absent |
 | `X-Spawn-Support-Log-Truncated` | Literal `true` or `false`: eligible events omitted by a byte cap |
 
 ## Snapshot and bundle
 
-All flush, copy, parse, state projection and gzip work runs on the dedicated
+All flush, copy, parse, state projection and encoding work runs on the dedicated
 support I/O worker.
 The process's writer has 500 ms to flush. A flush failure refuses collection.
-The reader takes the cross-process rotation lock without waiting and copies
+The reader waits up to about two seconds for the cross-process rotation lock
+and copies
 only `support-v3.jsonl.1` and `support-v3.jsonl`, each at most 4 MiB. It closes
 their handles before unlocking and parses the copies afterward. It never lists
 a directory. Other writers' completed appends are included; their queued events
@@ -216,11 +230,9 @@ Complete valid records in the inclusive requested time window are stably sorted
 by timestamp, then physical append order (previous file before current file).
 Selection proceeds newest first; a record too large for the remaining cap is
 skipped, and smaller older records can still fit. Output is oldest first. The
-**1 MiB raw cap includes the header and every newline**; selection conservatively
-reserves the maximum header size. Records are copied unchanged. Gzip is checked
-after compression; an oversize result drops the oldest half and recompresses,
-at most four compression attempts. An empty result is `no_log`; inability to
-meet the compressed cap is `failed`.
+**900 KiB body cap includes the header and every newline**; selection
+conservatively reserves the maximum header size. Records are copied unchanged.
+An empty result is `no_log`.
 
 The first JSON line is a format-3 header. Its build/version/variant describe
 the **reader**; every event retains its original writer build. Variant is
@@ -229,7 +241,7 @@ tag is eight hex characters. `window_from`/`window_to` are requested Unix
 milliseconds. These counts have precise meanings:
 
 - `lines`: retained event records, excluding the header.
-- `bytes`: the entire uncompressed bundle, header and newlines included.
+- `bytes`: the entire NDJSON body, header and newlines included.
 - `from`/`to`: earliest/latest retained event timestamps, null for no records.
 - `dropped_events`: sum of valid writer drop-marker deltas in the requested
   window, before size selection; not a lifetime total or an estimate of rotated
@@ -237,7 +249,7 @@ milliseconds. These counts have precise meanings:
 - `invalid_lines`: malformed, oversized, invalid-UTF-8, invalid-timestamp or torn
   lines in the two copied files; a torn final fragment counts once. Their window
   membership may be unknowable. An empty file contributes zero.
-- `truncated`: eligible valid records were omitted by either byte cap. Rotation,
+- `truncated`: eligible valid records were omitted by the body cap. Rotation,
   writer drops and invalid lines have their separate semantics above.
 
 The optional typed `state` projection contains only `connected`, `connected_at`,
@@ -251,7 +263,7 @@ and eight-hex release digest. Unrecognized release formats become null.
 
 The append-only local receipts are `support/sent.jsonl`, rotated once to
 `sent.jsonl.1` at 128 KiB each. Each contains only local time, typed request UUID,
-outcome/refusal, compressed bytes, event line count and clamped window seconds.
+outcome/refusal, body bytes, event line count and clamped window seconds.
 A durable `started` reservation precedes reading/uploading; `sent` or
 `upload_failed` or `cancelled` completes it. Refusals also consume budget. Conservative failure
 accounting never refunds an attempted collection. Cancellation is charged even
@@ -277,9 +289,9 @@ Before the server half or either app ships:
   the host's 24-hour future bound without showing false success. Off wins ties.
   Missing local account proof stays unavailable.
 - Authenticate the bearer token as the host, bind the request ID to that host,
-  validate gzip/header limits and typed refusals, and treat only 2xx as success.
+  validate NDJSON/header limits and typed refusals, and treat only 2xx as success.
 - Expect no POST for excess/admission-dropped requests, unavailable collectors,
-  terminal denial, stale queued requests,
+  terminal denial, absent statement files, stale or expired queued requests,
   cancellation, and some destination/audit/deadline/transport failures. Do not
   interpret silence as either success or proof that no bytes arrived.
 - Disclose the restart residual: terminal process denial is lost at
@@ -295,6 +307,7 @@ transcript bytes, digest, signing seed and signature, plus negative direct-pin
 and carried-chain device-attribution cases (valid signatures, refused attribution). Regenerate from `daemon/`:
 
 ```sh
+export CARGO_INCREMENTAL=0
 nice -n 15 cargo run --locked --example generate_support_log_consent_vectors > ../proto/support-log-consent-v1-vectors.json
 nice -n 15 cargo test --locked --lib support_consent::
 ```
@@ -304,11 +317,11 @@ corpus. They verify each signature and refuse a mutation at every transcript
 byte. The collection tests use only local listeners. Snapshot ordering, torn
 lines, bounded selection, rotation/concurrent reading and typed state tests are
 not Unix-gated and run in the existing full native Windows CI test job. The
-terminal canary remains Unix-only and now inspects the real compressed bundle
-builder, after decompression, in plain, hex, base64 and decimal-byte forms.
+terminal canary remains Unix-only and now inspects the real NDJSON bundle
+builder directly, in plain, hex, base64 and decimal-byte forms.
 
 The source guard pins the typed refusal enum, the two body call sites, reader
 construction and reviewed upload source markers. Its mutations cover
 extra `.json`/`.body` sources, body shadowing and a helper returning other bytes.
 It is a source-marker regression check, not a proof of data provenance. Review
-of the surrounding code and decompressed-bundle canaries remain necessary.
+of the surrounding code and NDJSON bundle canaries remain necessary.

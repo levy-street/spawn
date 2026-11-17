@@ -321,24 +321,30 @@ require(upload_compact.count("request.send()") == 1 and upload.count("client.pos
         "exactly one HTTP upload call site")
 require(upload_compact.count(".body(") == 1 and
         ".body(body)" in upload_compact,
-        "only the reader gzip may be a raw body")
+        "only the reader NDJSON may be a raw body")
 require(upload_compact.count(".json(") == 1 and
-        ".json(&RefusalBody::from(reason))" in upload_compact,
+        ".json(&reason)" in upload_compact,
         "only the typed refusal enum may be JSON")
-require(upload.count("let support_log::CompressedBundle { header, body } = prepared.bundle;") == 1,
-        "gzip bytes must come from the support reader")
+require(upload.count("let support_log::UploadBundle { header, body } = prepared;") == 1,
+        "NDJSON bytes must come from the support reader")
 require(not re.search(r"\blet\s+(?:mut\s+)?body\b", upload), "body shadowing requires review")
 require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra byte-returning helper")
 # Hash reviewed token markers, not whitespace or line numbers. These pin the
-# refusal representation/conversion and every function carrying upload bytes;
+# refusal representation and every function carrying upload bytes;
 # they are a regression guard, NOT a data-flow or security proof.
 import hashlib
-UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '01c0aab6daf9312876286ada3204b82f3f25d9a46edf3bc901582043e67efe02'), ('struct Prepared {', 'fn endpoint(', 'e20d6e9495ede29261791aee19016c0ae0ecc09822db5be43b9186a6f168ad27'), ('async fn collect(', '#[path = "support_tests.rs"]', 'c3742b01347f9c6e339b9a35860074a1a3d4d6724fca18339159d3073156be20')]
+UPLOAD_MARKERS = [('#[serde(tag = "declined", rename_all = "snake_case")]', 'pub(crate) struct Trust {', '851d0947e59bb94da22450470376692fcae746c02fb7df3e6ffa26baec323296'), ('fn prepare(', 'fn endpoint(', 'a00b4d7b12bf5e35d0e0a39fcc142614f4821c6b7cdc96387d063e4d9fb11555'), ('async fn collect(', '#[path = "support_tests.rs"]', 'ada9bbb56aae3050ff2955dd02670fd62f7410b7dfbecbb2ab0866be103c6ae6')]
 for start, end, digest in UPLOAD_MARKERS:
     require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
     region = upload.split(start, 1)[1].split(end, 1)[0]
     marked = " ".join(value for value, _, _ in tokens(region))
     require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review upload marker: " + start)
+BODY_MARKERS = [('fn read_window(', 'pub(crate) const MAX_BODY_BYTES:', 'f551404eba6ad4d79e9fe8d26c65e7b6282ba9ddd436652393d0feb0f3ad3bfd'), ('impl Bundle {', 'fn record_time(', '94b3f931a7ec20d2fd04c66d77f46da1f9608bd93e9d11137a8b775c3d6bc858'), ('pub(crate) const MAX_BODY_BYTES:', '/// Tests only: one support log', '9d3a8035f9566d9297ed3a1be7708b2e488aa6588ea1211622976570d7f9151d')]
+for start, end, digest in BODY_MARKERS:
+    require(source.count(start) == 1 and source.count(end) == 1, "unique body source marker")
+    region = source.split(start, 1)[1].split(end, 1)[0]
+    marked = " ".join(value for value, _, _ in tokens(region))
+    require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review body source marker: " + start)
 require(upload.count("support_log::collect_bundle(") == 1, "one support reader per collection")
 require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(work_deadline" in upload_compact,
         "origin-pinned bounded upload required")
@@ -347,6 +353,10 @@ require("spawn_blocking" not in upload and "ctx.io.run_with(" in upload_compact,
         "snapshot must run on the dedicated support worker")
 require(upload.count("tokio::spawn(") == 1 and "tokio::spawn(serve(" in upload_compact,
         "only the sequential support actor may be spawned")
+require('.no_proxy()' in upload and '.dns_resolver(' in upload,
+        "collector DNS must use the support worker without environment proxies")
+require('MAX_BODY_BYTES: usize = 900 * 1024;' in source and
+        'application/x-ndjson' in upload, "bounded NDJSON body required")
 for module in (storage, consent, io_worker):
     require("reqwest" not in module and ".post(" not in module, "storage cannot upload")
 run = Path("daemon/src/run.rs").read_text()
@@ -483,6 +493,24 @@ p = Path(sys.argv[1]); s = p.read_text()
 p.write_text(s.replace('.body(body)', '.body(other_bytes())') + '\nfn other_bytes() -> Vec<u8> { elsewhere() }\n')
 PY_MUTATE_UPLOAD
   expect_upload_failure "helper sourcing bytes elsewhere"
+
+  mutate_module 'MAX_BODY_BYTES: usize = 900 * 1024;' 'MAX_BODY_BYTES: usize = 1024 * 1024;'
+  expect_failure "an enlarged NDJSON body cap"
+  mutate_module 'self.header.bytes = total;' 'self.header.bytes = 0;'
+  expect_failure "changed NDJSON encoding"
+  mutate_module 'used + text.len() + 1 > max_bytes' 'used > max_bytes'
+  expect_failure "changed NDJSON selection"
+
+  for pair in 'application/x-ndjson application/octet-stream' '.no_proxy() .pool_max_idle_per_host(0)'; do
+    read -r old new <<<"$pair"
+    python3 -I - "$upload_file" "$old" "$new" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+p.write_text(s.replace(sys.argv[2], sys.argv[3]))
+PY_MUTATE_UPLOAD
+    expect_upload_failure "changed body or resolver contract: $old"
+  done
 
   local original_policy
   original_policy="$(cat "$fixture/$POLICY")"

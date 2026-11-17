@@ -1147,12 +1147,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
             .unwrap()
             .unwrap();
         assert_eq!(bundle.header.lines, 1);
-        let mut raw = String::new();
-        std::io::Read::read_to_string(
-            &mut flate2::read::GzDecoder::new(bundle.body.as_slice()),
-            &mut raw,
-        )
-        .unwrap();
+        let raw = String::from_utf8(bundle.body).unwrap();
         crate::support_log::capture::assert_absent(&raw, &canary, "the bundle");
     }
 

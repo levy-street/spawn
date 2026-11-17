@@ -46,8 +46,7 @@ impl Pause {
 }
 #[derive(Default)]
 pub(super) struct Hooks {
-    pub initialize: IoPause,
-    pub initialized: Notify,
+    pub resolve: IoPause,
     pub after_apply: Pause,
     pub before_send: Pause,
     pub before_claim: Pause,
@@ -78,12 +77,14 @@ impl IoPause {
         *self.0.try_lock().expect("test gate busy") = Some((entered, hold));
         (ready, release)
     }
-    pub(super) fn pause(&self) {
+    pub(super) fn pause(&self) -> bool {
         let gate = self.0.try_lock().expect("test gate busy").take();
         if let Some((entered, hold)) = gate {
             let _ = entered.send(());
-            let _ = hold.recv_timeout(Duration::from_secs(10));
+            let _ = hold.recv_timeout(Duration::from_secs(30));
+            return true;
         }
+        false
     }
 }
 
@@ -120,9 +121,15 @@ pub(crate) async fn test_collector(config: PathBuf, trust: Trust, origin: String
     let path = config.join("support");
     let log = support_log::SupportLog::open(&path).unwrap();
     log.fixture_event(1_000_000);
-    let collector = Collector::start_at(config, path, Some(log), "00000000".into(), origin)
-        .await
-        .unwrap();
+    let collector = Collector::start_ready(
+        config,
+        path,
+        Some(log),
+        "00000000".into(),
+        origin,
+        Worker::start().unwrap(),
+    )
+    .unwrap();
     collector.trust(Arc::new(trust), None, None);
     collector
 }
@@ -170,7 +177,7 @@ pub(crate) async fn receive_request(stream: &mut tokio::net::TcpStream) -> (Stri
         .trim()
         .parse()
         .unwrap();
-    assert!(length <= support_log::MAX_GZIP_BYTES);
+    assert!(length <= support_log::MAX_BODY_BYTES);
     while bytes.len() - end < length {
         let mut buffer = [0; 4096];
         let n = stream.read(&mut buffer).await.unwrap();
@@ -186,6 +193,8 @@ async fn actual_upload_and_refusal_complete_before_receipts_are_read() {
         let _clock = freeze_time();
         let tmp = support_log::capture::private_tempdir();
         let (listener, origin) = listener().await;
+        // This exact fixture path must also be used on Windows.
+        std::fs::write(tmp.path().join("state.json"), br#"{"pid":1,"version":"0.1.0","connected":true,"connected_at":null,"server":"","last_error":null,"sessions":7}"#).unwrap();
         let (trust, consent) = fixture();
         support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
         let c = test_collector(tmp.path().to_owned(), trust, origin).await;
@@ -198,18 +207,20 @@ async fn actual_upload_and_refusal_complete_before_receipts_are_read() {
             .contains("authorization: bearer test-token\r\n"));
         assert!(headers
             .to_lowercase()
-            .contains("content-type: application/gzip"));
-        let mut raw = String::new();
-        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut raw)
-            .unwrap();
+            .contains("content-type: application/x-ndjson"));
+        let raw = std::str::from_utf8(&body).unwrap();
         let header: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(header["bytes"], raw.len());
+        assert_eq!(header["state"]["sessions"], 7);
+        assert!(!headers.to_lowercase().contains("x-spawn-support-log-raw-bytes"));
+        let digest: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+        assert!(headers.to_lowercase().contains(&format!("x-spawn-support-log-sha256: {digest}\r\n")));
         assert_eq!(header["lines"], raw.lines().count() - 1);
         assert_eq!(
             header["window_to"].as_u64().unwrap() - header["window_from"].as_u64().unwrap(),
             60_000
         );
-        assert!(body.len() <= support_log::MAX_GZIP_BYTES);
+        assert!(body.len() <= support_log::MAX_BODY_BYTES);
         socket
             .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
             .await
@@ -332,17 +343,17 @@ async fn unknown_account_does_not_store_consent_and_bad_storage_is_optional() {
         assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
         let unavailable = tmp.path().join("file");
         std::fs::write(&unavailable, b"test").unwrap();
-        let unavailable = Collector::start_at(
+        let unavailable = Collector::start_ready(
             tmp.path().to_owned(),
             unavailable,
             None,
             "00000000".into(),
             String::new(),
+            Worker::start().unwrap(),
         )
-        .await
         .unwrap();
         settled(&unavailable).await;
-        assert_eq!(unavailable.delivery.status().denied, Some(Denied::Storage));
+        assert_eq!(unavailable.delivery.status().denied, None);
     })
     .await;
 }
@@ -556,6 +567,7 @@ async fn only_admitted_refusals_post_and_reconnect_does_not_refill() {
         let tmp = support_log::capture::private_tempdir();
         let (listener, origin) = listener().await;
         let (trust, _) = fixture();
+        support_store::apply(tmp.path(), None, &trust, 1000).unwrap();
         let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
         settled(&c).await;
         // Keep audit completion explicit; concurrent audit contention is allowed
@@ -699,45 +711,22 @@ pub(crate) async fn stall_io(c: &Collector) -> std::sync::mpsc::Sender<()> {
 }
 
 #[tokio::test]
-async fn stalled_initialization_does_not_delay_start_and_denies_at_deadline() {
-    bounded(async {
-        let tmp = support_log::capture::private_tempdir();
-        let c = Collector::start_at(
-            tmp.path().to_owned(),
-            tmp.path().join("support"),
-            None,
-            "00000000".into(),
-            String::new(),
-        )
-        .await
-        .unwrap();
-        let (ready, release) = c.delivery.hooks.initialize.arm();
-        ready.await.unwrap(); // start already returned, despite blocked preparation
-        settled(&c).await;
-        drop(release);
-        bounded(c.delivery.hooks.initialized.notified()).await;
-        assert_eq!(c.delivery.status().denied, Some(Denied::Deadline));
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn trust_received_before_startup_readiness_is_applied_in_order() {
+async fn early_trust_and_revocation_are_applied_in_order() {
     bounded(async {
         let tmp = support_log::capture::private_tempdir();
         let (listener, origin) = listener().await;
         let (trust, consent) = fixture();
         support_store::apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
-        let c = Collector::start_at(
+        let c = Collector::start_ready(
             tmp.path().to_owned(),
             tmp.path().join("support"),
             None,
             "00000000".into(),
             origin,
+            Worker::start().unwrap(),
         )
-        .await
         .unwrap();
-        let (ready, release) = c.delivery.hooks.initialize.arm();
+        let (ready, release) = c.delivery.hooks.apply.arm();
         c.trust(Arc::new(trust.clone()), None, None);
         c.update(&Arc::new(crate::proto::SupportUpdate {
             revoked_browser_keys: Some(vec![consent.signer_public_key]),
@@ -877,6 +866,7 @@ pub(crate) fn join_thread<T>(thread: std::thread::JoinHandle<T>) -> std::thread:
 #[tokio::test]
 async fn combined_update_write_failure_is_terminal_and_retains_no_on() {
     bounded(async {
+        let _clock = freeze_time();
         let tmp = support_log::capture::private_tempdir();
         let (listener, origin) = listener().await;
         let (trust, mut consent) = fixture();
@@ -1007,4 +997,197 @@ fn exhausted_generation_cannot_claim_a_request_start() {
     delivery.advance();
     assert!(!stop.claim_start());
     assert_eq!(delivery.status().denied, Some(Denied::GenerationExhausted));
+}
+
+#[tokio::test]
+async fn absent_statement_collect_creates_nothing_and_opens_no_socket() {
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let mut origin = url::Url::parse(&origin).unwrap();
+        origin.set_scheme("https").unwrap();
+        origin.set_host(Some("localhost")).unwrap();
+        let c = Collector::start_ready(
+            tmp.path().to_owned(),
+            tmp.path().join("support"),
+            None,
+            "00000000".into(),
+            origin.to_string(),
+            Worker::start().unwrap(),
+        )
+        .unwrap();
+        let (mut resolving, _release) = c.delivery.hooks.resolve.arm();
+        let (mut preparing, _release) = c.delivery.hooks.prepare.arm();
+        let frame = crate::proto::parse_inbound(&format!(
+            r#"{{"type":"support_log.collect","request_id":"{}","since_seconds":60}}"#,
+            Uuid::new_v4()
+        ))
+        .unwrap();
+        if let crate::proto::Inbound::SupportLogCollect {
+            request_id,
+            since_seconds,
+        } = frame
+        {
+            c.collect(request_id, since_seconds);
+        } else {
+            panic!("collection frame not parsed");
+        }
+        settled(&c).await;
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert!(matches!(
+            resolving.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            preparing.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+        assert_eq!(c.delivery.status().dropped_requests, 1);
+        assert_eq!(c.delivery.status().denied, None);
+    })
+    .await;
+}
+
+#[test]
+fn stalled_collection_and_refusal_dns_do_not_hold_runtime_shutdown() {
+    for enabled in [true, false] {
+        let tmp = support_log::capture::private_tempdir();
+        let config = tmp.path().to_owned();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished, shutdown) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(bounded(async {
+                let (trust, consent) = fixture();
+                support_store::apply(&config, enabled.then_some(consent), &trust, 1000).unwrap();
+                let c = test_collector(config.clone(), trust, "https://localhost".into()).await;
+                settled(&c).await;
+                let (resolving, release) = c.delivery.hooks.resolve.arm();
+                release_tx.send(release).unwrap();
+                let done = collection(&c, 60);
+                resolving.await.unwrap();
+                let receipts = support_store::recent(&config.join("support")).unwrap();
+                assert_eq!(
+                    receipts.last().unwrap().outcome,
+                    if enabled {
+                        Outcome::Started
+                    } else {
+                        Outcome::NotConsented
+                    }
+                );
+                let delivery = Arc::clone(&c.delivery);
+                drop(c);
+                done.await.unwrap();
+                // The audit cannot queue behind the unfinished lookup.
+                assert_eq!(delivery.status().denied, Some(Denied::Deadline));
+            }));
+            drop(runtime);
+            finished.send(()).unwrap();
+        });
+        let release = release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let result = shutdown.recv_timeout(Duration::from_secs(10));
+        drop(release); // release even if the bounded shutdown check failed
+        join_thread(owner).unwrap();
+        result.expect("runtime waited for the collector's OS lookup");
+    }
+}
+
+#[tokio::test]
+async fn three_slow_queued_collections_drop_expiry_without_denying() {
+    bounded(async {
+        let _clock = freeze_time();
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
+        settled(&c).await;
+        let first = collection(&c, 60);
+        let second = collection(&c, 60);
+        let third = collection(&c, 60);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        receive_request(&mut socket).await;
+        tokio::time::advance(Duration::from_secs(16)).await;
+        first.await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (_, body) = receive_request(&mut socket).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["declined"],
+            "rate_limited"
+        );
+        let (mut preparing, _release) = c.delivery.hooks.prepare.arm();
+        tokio::time::advance(Duration::from_secs(13)).await;
+        second.await.unwrap();
+        assert!(third.await.is_err());
+        settled(&c).await;
+        assert!(matches!(
+            preparing.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(c.delivery.status().denied, None);
+        assert_eq!(c.delivery.status().dropped_requests, 1);
+        assert!(authorize(tmp.path(), &trust).is_ok());
+        assert_eq!(
+            support_store::recent(&tmp.path().join("support"))
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+        c.consent(None);
+        settled(&c).await;
+        assert_eq!(c.delivery.status().denied, None);
+        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn collect_admission_full_queue_and_busy_gate_only_drop() {
+    bounded(async {
+        let _clock = freeze_time();
+        let tmp = support_log::capture::private_tempdir();
+        let (trust, _) = fixture();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
+        settled(&c).await;
+        let (entered, release) = c.delivery.hooks.after_apply.arm();
+        c.trust(Arc::new(trust), None, None);
+        entered.await.unwrap();
+        for _ in 0..QUEUE {
+            c.fence();
+        }
+        let generation = c.delivery.generation();
+        for _ in 0..4 {
+            c.collect(Uuid::new_v4(), 60);
+        }
+        {
+            let _gate = c.gate.lock().unwrap();
+            c.collect(Uuid::new_v4(), 60);
+        }
+        assert_eq!(c.delivery.generation(), generation);
+        assert_eq!(c.delivery.status().denied, None);
+        assert_eq!(c.delivery.status().dropped_requests, 5);
+        release.send(()).unwrap();
+        settled(&c).await;
+        c.consent(None);
+        settled(&c).await;
+        assert_eq!(c.delivery.status().denied, None);
+    })
+    .await;
+}
+
+#[test]
+fn drop_count_is_today_only() {
+    let delivery = Delivery::new();
+    let yesterday = support_log::now_unix_millis() / 86_400_000 - 1;
+    delivery
+        .dropped
+        .store(yesterday << 32 | 7, Ordering::Relaxed);
+    assert_eq!(delivery.status().dropped_requests, 0);
+    delivery.drop_request();
+    assert_eq!(delivery.status().dropped_requests, 1);
 }

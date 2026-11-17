@@ -24,35 +24,13 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const AUDIT_RESERVE: Duration = Duration::from_secs(2);
 const QUEUE: usize = 32;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "declined", rename_all = "snake_case")]
 pub(crate) enum Refusal {
     NotConsented,
     SignerUntrusted,
     RateLimited,
     NoLog,
     Failed,
-}
-// The only JSON body. Keep this tagged enum and its single serialization site
-// pinned by the source guard; it cannot contain arbitrary caller text.
-#[derive(Serialize)]
-#[serde(tag = "declined", rename_all = "snake_case")]
-enum RefusalBody {
-    NotConsented,
-    SignerUntrusted,
-    RateLimited,
-    NoLog,
-    Failed,
-}
-impl From<Refusal> for RefusalBody {
-    fn from(value: Refusal) -> Self {
-        match value {
-            Refusal::NotConsented => Self::NotConsented,
-            Refusal::SignerUntrusted => Self::SignerUntrusted,
-            Refusal::RateLimited => Self::RateLimited,
-            Refusal::NoLog => Self::NoLog,
-            Refusal::Failed => Self::Failed,
-        }
-    }
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Trust {
@@ -143,6 +121,16 @@ impl From<crate::support_io::Error> for Denied {
 pub(crate) struct RuntimeStatus {
     pub denied: Option<Denied>,
     pub dropped_requests: u64,
+    #[serde(default)]
+    pub dropped_day: u64,
+}
+impl RuntimeStatus {
+    pub(crate) fn today(mut self) -> Self {
+        if self.dropped_day != support_log::now_unix_millis() / 86_400_000 {
+            self.dropped_requests = 0;
+        }
+        self
+    }
 }
 static ACTIVE: OnceLock<Weak<Delivery>> = OnceLock::new();
 pub(crate) fn runtime_status() -> Option<RuntimeStatus> {
@@ -197,11 +185,34 @@ impl Delivery {
         let _ = self.denied.set(reason);
         self.changed.notify_one();
     }
+    fn drop_request(&self) {
+        let day = support_log::now_unix_millis() / 86_400_000;
+        let mut old = self.dropped.load(Ordering::Relaxed);
+        loop {
+            let count = if old >> 32 == day {
+                (old as u32).saturating_add(1)
+            } else {
+                1
+            };
+            match self.dropped.compare_exchange_weak(
+                old,
+                day << 32 | u64::from(count),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => old = current,
+            }
+        }
+    }
     fn status(&self) -> RuntimeStatus {
+        let dropped = self.dropped.load(Ordering::Relaxed);
         RuntimeStatus {
             denied: self.denied.get().copied(),
-            dropped_requests: self.dropped.load(Ordering::Relaxed),
+            dropped_requests: u64::from(dropped as u32),
+            dropped_day: dropped >> 32,
         }
+        .today()
     }
 }
 struct Stop {
@@ -243,6 +254,7 @@ impl Stop {
 struct Context {
     io: Arc<Worker>,
     config: PathBuf,
+    state_path: PathBuf,
     path: PathBuf,
     source: Option<support_log::SupportLog>,
     instance: String,
@@ -263,7 +275,7 @@ impl Budget {
 pub(crate) struct Collector {
     tx: mpsc::Sender<Command>,
     delivery: Arc<Delivery>,
-    gate: Mutex<()>,
+    gate: Mutex<Budget>,
 }
 enum Input {
     Trust {
@@ -307,22 +319,11 @@ impl Drop for Fence<'_> {
 }
 impl Collector {
     pub(crate) fn start(config: PathBuf, origin: String) -> Option<Self> {
-        // Resolve paths only; the actor performs preparation as its first job.
-        // Its existing delivery queue preserves inputs arriving before readiness.
+        // Resolve paths only; storage is opened lazily by actual inputs.
         let path = support_log::support_dir(&config).ok()?;
         let source = support_log::active_for(&path);
         let instance = crate::service::instance_name(&config);
         Self::start_ready(config, path, source, instance, origin, Worker::process()?)
-    }
-    #[cfg(test)]
-    async fn start_at(
-        config: PathBuf,
-        path: PathBuf,
-        source: Option<support_log::SupportLog>,
-        instance: String,
-        origin: String,
-    ) -> Option<Self> {
-        Self::start_ready(config, path, source, instance, origin, Worker::start()?)
     }
     fn start_ready(
         config: PathBuf,
@@ -332,36 +333,36 @@ impl Collector {
         origin: String,
         io: Arc<Worker>,
     ) -> Option<Self> {
-        let builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15));
-        #[cfg(test)]
-        let builder = builder.no_proxy();
-        let client = builder.build().ok()?;
         let delivery = Arc::new(Delivery::new());
         let (tx, rx) = mpsc::channel(QUEUE);
+        #[cfg(not(test))]
+        let state_path = crate::state::state_path(&config);
+        #[cfg(test)]
+        let state_path = config.join("state.json");
         let context = Arc::new(Context {
             io,
+            state_path,
             config,
             path,
             source,
             instance,
         });
-        tokio::spawn(serve(context, Arc::clone(&delivery), rx, client, origin));
+        tokio::spawn(serve(context, Arc::clone(&delivery), rx, origin));
         Some(Self {
             tx,
             delivery,
-            gate: Mutex::new(()),
+            gate: Mutex::new(Budget {
+                next: tokio::time::Instant::now(),
+            }),
         })
     }
     fn deliver(&self, input: Input) {
         // One short, nonwaiting delivery gate orders generation and enqueue even
         // if future callers use different tasks. Contention can only deny.
+        let control = !matches!(input, Input::Fence | Input::Shutdown);
         let guard = self.gate.try_lock();
         self.delivery.advance();
-        if guard.is_err() || self.tx.try_send(Command::Input(input)).is_err() {
+        if (guard.is_err() || self.tx.try_send(Command::Input(input)).is_err()) && control {
             self.delivery.deny(Denied::DeliveryOverflow);
         }
     }
@@ -403,29 +404,25 @@ impl Collector {
         since_seconds: i64,
         #[cfg(test)] done: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
-        let Ok(_gate) = self.gate.try_lock() else {
-            self.delivery.advance();
-            self.delivery.deny(Denied::DeliveryOverflow);
+        let Ok(mut budget) = self.gate.try_lock() else {
+            self.delivery.drop_request();
             return;
         };
-        if self.delivery.denied.get().is_some() {
-            self.delivery.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if self
-            .tx
-            .try_send(Command::Collect {
-                request_id,
-                window: since_seconds.clamp(60, 259200) as u64,
-                deadline: tokio::time::Instant::now() + DEADLINE,
-                generation: self.delivery.generation(),
-                #[cfg(test)]
-                done,
-            })
-            .is_err()
+        if self.delivery.denied.get().is_some()
+            || !budget.admit(tokio::time::Instant::now())
+            || self
+                .tx
+                .try_send(Command::Collect {
+                    request_id,
+                    window: since_seconds.clamp(60, 259200) as u64,
+                    deadline: tokio::time::Instant::now() + DEADLINE,
+                    generation: self.delivery.generation(),
+                    #[cfg(test)]
+                    done,
+                })
+                .is_err()
         {
-            self.delivery.advance();
-            self.delivery.deny(Denied::DeliveryOverflow);
+            self.delivery.drop_request();
         }
     }
 }
@@ -547,36 +544,13 @@ async fn serve(
     ctx: Arc<Context>,
     delivery: Arc<Delivery>,
     mut rx: mpsc::Receiver<Command>,
-    client: reqwest::Client,
     origin: String,
 ) {
-    let path = ctx.path.clone();
-    #[cfg(test)]
-    let starting = Arc::clone(&delivery);
-    let startup = ctx
-        .io
-        .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
-            #[cfg(test)]
-            starting.hooks.initialize.pause();
-            let result = crate::platform::open_support_dir(&path, true).map(|_| ());
-            #[cfg(test)]
-            starting.hooks.initialized.notify_one();
-            result
-        })
-        .await
-        .map_err(Denied::from)
-        .and_then(|r| r.map_err(|_| Denied::Storage));
-    if let Err(reason) = startup {
-        delivery.deny(reason);
-    }
     #[cfg(not(test))]
     let _ = ACTIVE.set(Arc::downgrade(&delivery));
     let mut trust = None;
     let mut active = false;
     let mut erased = false;
-    let mut budget = Budget {
-        next: tokio::time::Instant::now(),
-    };
     loop {
         if delivery.denied.get().is_some() && !erased {
             erased = true;
@@ -643,8 +617,8 @@ async fn serve(
                     delivery: Arc::clone(&delivery),
                     generation,
                 };
-                if !budget.admit(tokio::time::Instant::now()) || stop.stopped() {
-                    delivery.dropped.fetch_add(1, Ordering::Relaxed);
+                if tokio::time::Instant::now() >= deadline - AUDIT_RESERVE || stop.stopped() {
+                    delivery.drop_request();
                     continue;
                 }
                 let auth = if active {
@@ -654,7 +628,6 @@ async fn serve(
                 };
                 if let Err(reason) = collect(
                     Arc::clone(&ctx),
-                    &client,
                     &origin,
                     request_id,
                     window,
@@ -694,16 +667,13 @@ fn authorize(config: &std::path::Path, trust: &Trust) -> Result<Consent, Refusal
     }
     Ok(consent)
 }
-struct Prepared {
-    bundle: support_log::CompressedBundle,
-}
 fn prepare(
     ctx: &Context,
     request_id: Uuid,
     window: u64,
     deadline: tokio::time::Instant,
     owned: &mut crate::support_io::State,
-) -> Result<Prepared, Refusal> {
+) -> Result<support_log::UploadBundle, Refusal> {
     if owned.flight.is_some() {
         return Err(Refusal::RateLimited);
     }
@@ -713,13 +683,13 @@ fn prepare(
     )?;
     owned.flight = Some((deadline, flight));
     let log = ctx.source.as_ref().ok_or(Refusal::NoLog)?;
-    let state = support_log::BundleState::read(&ctx.config).map_err(|_| Refusal::Failed)?;
+    let state = support_log::BundleState::read(&ctx.state_path).map_err(|_| Refusal::Failed)?;
     #[cfg(not(test))]
     let now = support_log::now_unix_millis().min(i64::MAX as u64);
     #[cfg(test)]
     let now = 1_000_000u64; // matches the fixture event, independent of scheduling
 
-    let bundle = support_log::collect_bundle(
+    support_log::collect_bundle(
         log,
         &ctx.instance,
         now.saturating_sub(window * 1000) as i64,
@@ -727,8 +697,7 @@ fn prepare(
         state,
     )
     .map_err(|_| Refusal::Failed)?
-    .ok_or(Refusal::NoLog)?;
-    Ok(Prepared { bundle })
+    .ok_or(Refusal::NoLog)
 }
 fn endpoint(origin: &str, request_id: Uuid) -> Result<url::Url, Refusal> {
     let base = url::Url::parse(origin).map_err(|_| Refusal::Failed)?;
@@ -750,10 +719,38 @@ fn endpoint(origin: &str, request_id: Uuid) -> Result<url::Url, Refusal> {
     url.set_fragment(None);
     Ok(url)
 }
+struct Resolver {
+    io: Arc<Worker>,
+    deadline: tokio::time::Instant,
+    #[cfg(test)]
+    delivery: Arc<Delivery>,
+}
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let io = Arc::clone(&self.io);
+        let deadline = self.deadline;
+        #[cfg(test)]
+        let delivery = Arc::clone(&self.delivery);
+        Box::pin(async move {
+            let addresses = io
+                .run(deadline, move || {
+                    #[cfg(test)]
+                    if delivery.hooks.resolve.pause() {
+                        return Err(std::io::Error::other("injected lookup failure"));
+                    }
+                    std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 0))
+                })
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "support lookup unavailable")
+                })??;
+            Ok(Box::new(addresses) as reqwest::dns::Addrs)
+        })
+    }
+}
 #[allow(clippy::too_many_arguments)]
 async fn collect(
     ctx: Arc<Context>,
-    client: &reqwest::Client,
     origin: &str,
     request_id: Uuid,
     window: u64,
@@ -762,34 +759,56 @@ async fn collect(
     trust: Option<Arc<Trust>>,
     auth: Result<(), Refusal>,
 ) -> Result<(), Denied> {
-    let mut receipt = Receipt::new(request_id, window, Outcome::Failed);
     let work_deadline = deadline - AUDIT_RESERVE;
+    let work = Arc::clone(&ctx);
+    let current = trust.clone();
+    #[cfg(test)]
+    let delivery = Arc::clone(&stop.delivery);
+    // Absence is checked before authorization, reservation, snapshot or HTTP.
+    let prepared = ctx
+        .io
+        .run_with(
+            (tokio::time::Instant::now() + IO_DEADLINE).min(work_deadline),
+            move |owned| {
+                if !support_store::has_statement(&work.config)? {
+                    return Ok(None);
+                }
+                #[cfg(test)]
+                delivery.hooks.prepare.pause();
+                Ok::<_, std::io::Error>(Some((|| {
+                    auth?;
+                    authorize(&work.config, current.as_ref().ok_or(Refusal::NotConsented)?)?;
+                    prepare(&work, request_id, window, deadline, owned)
+                })()))
+            },
+        )
+        .await
+        .map_err(Denied::from)?
+        .map_err(|_| Denied::Storage)?;
+    let Some(prepared) = prepared else {
+        stop.delivery.drop_request();
+        return Ok(());
+    };
+    let mut receipt = Receipt::new(request_id, window, Outcome::Failed);
     let work = async {
         let url = match endpoint(origin, request_id) {
             Ok(url) => url,
             Err(_) => return Ok(()),
         };
-        let prepared = match (auth, trust.clone()) {
-            (Ok(()), Some(current)) => {
-                let work = Arc::clone(&ctx);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
+            .dns_resolver(Arc::new(Resolver {
+                io: Arc::clone(&ctx.io),
+                deadline: work_deadline,
                 #[cfg(test)]
-                let delivery = Arc::clone(&stop.delivery);
-                ctx.io
-                    .run_with(
-                        (tokio::time::Instant::now() + IO_DEADLINE).min(work_deadline),
-                        move |owned| {
-                            #[cfg(test)]
-                            delivery.hooks.prepare.pause();
-                            authorize(&work.config, &current)?;
-                            prepare(&work, request_id, window, deadline, owned)
-                        },
-                    )
-                    .await
-                    .map_err(Denied::from)?
-            }
-            (Err(reason), _) => Err(reason),
-            _ => Err(Refusal::NotConsented),
-        };
+                delivery: Arc::clone(&stop.delivery),
+            }))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| Denied::Storage)?;
         if stop.stopped() {
             receipt.outcome = Outcome::Cancelled;
             return Ok(());
@@ -802,7 +821,7 @@ async fn collect(
         let mut sending_bundle = false;
         match prepared {
             Ok(prepared) => {
-                let support_log::CompressedBundle { header, body } = prepared.bundle;
+                let support_log::UploadBundle { header, body } = prepared;
                 receipt.bytes = body.len();
                 receipt.lines = header.lines;
                 let digest: String = Sha256::digest(&body)
@@ -810,11 +829,10 @@ async fn collect(
                     .map(|b| format!("{b:02x}"))
                     .collect();
                 request = request
-                    .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
                     .header(reqwest::header::CONTENT_LENGTH, body.len())
                     .header("X-Spawn-Support-Log-Sha256", digest)
                     .header("X-Spawn-Support-Log-Lines", header.lines)
-                    .header("X-Spawn-Support-Log-Raw-Bytes", header.bytes)
                     .header("X-Spawn-Support-Log-From", header.from.unwrap_or(0))
                     .header("X-Spawn-Support-Log-To", header.to.unwrap_or(0))
                     .header(
@@ -837,7 +855,7 @@ async fn collect(
                     .await
                     .map_err(Denied::from)?
                     .map_err(Denied::storage)?;
-                request = request.json(&RefusalBody::from(reason));
+                request = request.json(&reason);
             }
         }
         #[cfg(test)]

@@ -45,7 +45,7 @@ optional `registered.support_log_consent`, `host.support_log_consent`, and
 `support_log.collect`. These are additive, with no control-subprotocol bump.
 The daemon can verify and upload, but no server sender/storage or app signer
 exists yet, so sharing remains off. The spec defines null versus absent,
-account/device authorization, raw/gzip limits, local receipts and POST headers.
+account/device authorization, NDJSON body limits, local receipts and POST headers.
 
 ## Identifiers
 

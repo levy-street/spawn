@@ -238,7 +238,11 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
                                 .filter(|state| {
                                     crate::state::daemon_state_is_live(&support_config, state)
                                 })
-                                .and_then(|state| state.support_runtime);
+                                .and_then(|state| {
+                                    state
+                                        .support_runtime
+                                        .map(crate::support::RuntimeStatus::today)
+                                });
                             if sharing.runtime.is_none_or(|state| state.denied.is_some()) {
                                 sharing.enabled = false;
                             }
@@ -506,7 +510,7 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             }
             let _ = writeln!(
                 text,
-                "               {} collection requests dropped by admission budget",
+                "               {} collection requests dropped today",
                 runtime.dropped_requests
             );
         }

@@ -28,7 +28,7 @@
 //! trust are described by `platform::open_support_dir` and daemon/CLAUDE.md.
 //!
 //! [`read_window`] opens exactly the current versioned pair and never lists
-//! the folder. Collection runs through the blocking snapshot and gzip builder.
+//! the folder. Collection runs through the blocking snapshot and NDJSON builder.
 
 use std::cell::Cell;
 use std::fmt::{self, Write as _};
@@ -1459,8 +1459,8 @@ impl ReleaseId {
     }
 }
 impl BundleState {
-    pub(crate) fn read(config: &Path) -> Result<Option<Self>> {
-        Ok(crate::state::read(config)?.map(Self::from_state))
+    pub(crate) fn read(path: &Path) -> Result<Option<Self>> {
+        Ok(crate::state::read_path(path)?.map(Self::from_state))
     }
     fn from_state(state: crate::state::StateFile) -> Self {
         Self {
@@ -1508,7 +1508,7 @@ pub(crate) struct BundleHeader {
     pub from: Option<u64>,
     pub to: Option<u64>,
     pub lines: usize,
-    /// Entire uncompressed JSONL, including this header and every newline.
+    /// Entire NDJSON body, including this header and every newline.
     pub bytes: usize,
     pub dropped_events: u64,
     pub invalid_lines: u64,
@@ -1621,6 +1621,8 @@ fn read_window(
             let wait = crate::support_store::LOCK_WAIT;
             #[cfg(test)]
             let wait = Duration::from_secs(10);
+            #[cfg(test)]
+            tests::snapshot_waiting(&lock);
             crate::support_store::wait_lock(&lock, wait)?;
             let copied = (|| {
                 Ok::<_, io::Error>((read_capped(&dir, PREVIOUS)?, read_capped(&dir, CURRENT)?))
@@ -1722,52 +1724,34 @@ fn read_window(
     Ok(bundle)
 }
 
-pub(crate) const MAX_RAW_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_GZIP_BYTES: usize = 900 * 1024;
-pub(crate) struct CompressedBundle {
+pub(crate) const MAX_BODY_BYTES: usize = 900 * 1024;
+pub(crate) struct UploadBundle {
     pub header: BundleHeader,
     pub body: Vec<u8>,
 }
 
-/// The only source of upload bodies. All disk and compression work belongs on
-/// the dedicated support I/O thread, including the writer flush. Recompression is bounded to four
-/// attempts; each removes the oldest half. Failure is closed, never oversize.
+/// The only source of upload bodies. Snapshot and encoding run on the
+/// dedicated support I/O thread, including the writer flush.
 pub(crate) fn collect_bundle(
     log: &SupportLog,
     instance: &str,
     from_ms: i64,
     to_ms: i64,
     state: Option<BundleState>,
-) -> Result<Option<CompressedBundle>> {
+) -> Result<Option<UploadBundle>> {
     #[cfg(not(test))]
     let flush_wait = Duration::from_millis(500);
     #[cfg(test)]
     let flush_wait = Duration::from_secs(10);
     anyhow::ensure!(log.flush(flush_wait), "support flush timed out or failed");
-    let bundle = read_window(log.dir(), instance, from_ms, to_ms, MAX_RAW_BYTES, state)?;
-    compress_bundle(bundle, MAX_GZIP_BYTES)
-}
-fn compress_bundle(mut bundle: Bundle, cap: usize) -> Result<Option<CompressedBundle>> {
-    use flate2::{write::GzEncoder, Compression};
-    for _ in 0..4 {
-        if bundle.lines.is_empty() {
-            return Ok(None);
-        }
-        let raw = bundle.encode()?;
-        anyhow::ensure!(raw.len() <= MAX_RAW_BYTES, "support bundle exceeds raw cap");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&raw)?;
-        let body = encoder.finish()?;
-        if body.len() <= cap {
-            return Ok(Some(CompressedBundle {
-                header: bundle.header,
-                body,
-            }));
-        }
-        bundle.lines.drain(..bundle.lines.len().div_ceil(2));
-        bundle.header.truncated = true;
+    let mut bundle = read_window(log.dir(), instance, from_ms, to_ms, MAX_BODY_BYTES, state)?;
+    if bundle.lines.is_empty() {
+        return Ok(None);
     }
-    anyhow::bail!("support bundle exceeds compressed cap")
+    Ok(Some(UploadBundle {
+        body: bundle.encode()?,
+        header: bundle.header,
+    }))
 }
 
 /// Tests only: one support log for the whole test process, installed as the
@@ -1832,11 +1816,7 @@ pub(crate) mod capture {
             let bundle = collect_bundle(&self.log, "0badcafe", 0, i64::MAX / 2, None)
                 .unwrap()
                 .unwrap();
-            let mut text = String::new();
-            flate2::read::GzDecoder::new(bundle.body.as_slice())
-                .read_to_string(&mut text)
-                .unwrap();
-            text
+            String::from_utf8(bundle.body).unwrap()
         }
     }
 

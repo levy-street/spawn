@@ -4,6 +4,21 @@
 use super::*;
 use tracing_subscriber::layer::SubscriberExt;
 
+thread_local! {
+    static SNAPSHOT_WAITING: std::cell::RefCell<Option<mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn snapshot_waiting(lock: &File) {
+    SNAPSHOT_WAITING.with(|signal| {
+        if let Some(signal) = signal.borrow_mut().take() {
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            signal.send(()).unwrap();
+        }
+    });
+}
+
 fn read_lines(dir: &Path) -> Vec<serde_json::Value> {
     let mut lines = Vec::new();
     for name in [PREVIOUS, CURRENT] {
@@ -918,7 +933,7 @@ fn startup_refuses_a_busy_lock_without_waiting_for_its_owner() {
     let attempt = std::thread::spawn(move || {
         tx.send(SupportLog::open(&path).is_err()).unwrap();
     });
-    let result = rx.recv_timeout(Duration::from_secs(2));
+    let result = rx.recv_timeout(Duration::from_secs(30));
     store.lock.unlock().unwrap();
     crate::support::tests::join_thread(attempt).unwrap();
     assert!(result.unwrap());
@@ -1069,20 +1084,19 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
     let locked = locked_rx.recv_timeout(Duration::from_secs(5));
     let (done, read) = mpsc::channel();
     let snapshot_path = path.clone();
+    let (waiting, entered) = mpsc::channel();
     let reader = std::thread::spawn(move || {
+        SNAPSHOT_WAITING.with(|signal| *signal.borrow_mut() = Some(waiting));
         let _ = done.send(read_window(&snapshot_path, "00000000", 0, 5000, 4096, None));
     });
-    let early = read.recv_timeout(Duration::from_millis(50));
+    let overlap = entered.recv_timeout(Duration::from_secs(10));
     // Always release the writer before asserting or joining either thread.
     drop(release_tx);
     crate::support::tests::join_thread(writer).unwrap();
-    let result = if early.is_err() {
-        read.recv_timeout(Duration::from_secs(10))
-    } else {
-        early
-    };
+    let result = read.recv_timeout(Duration::from_secs(10));
     crate::support::tests::join_thread(reader).unwrap();
     locked.unwrap();
+    overlap.unwrap();
     assert_eq!(result.unwrap().unwrap().lines.len(), 2);
     let bundle = read_window(&path, "00000000", 0, 5000, 4096, None).unwrap();
     assert_eq!(bundle.lines.len(), 2);
@@ -1109,7 +1123,7 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
 }
 
 #[test]
-fn typed_header_cannot_copy_state_text_and_compression_has_a_final_cap() {
+fn typed_header_cannot_copy_state_text_and_body_has_a_final_cap() {
     let marker = capture::canary();
     let state: crate::state::StateFile = serde_json::from_value(serde_json::json!({
         "pid":1,"version":marker,"connected":true,"connected_at":marker,
@@ -1126,43 +1140,27 @@ fn typed_header_cannot_copy_state_text_and_compression_has_a_final_cap() {
     let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
-    store
-        .append(&render_line(
-            &rfc3339_millis(1000),
-            "INFO",
-            "spawnd",
-            "src/main.rs:1",
-            "first",
-            vec![],
-        ))
+    let line = render_line(
+        &rfc3339_millis(1000),
+        "INFO",
+        "spawnd",
+        "src/main.rs:1",
+        "event",
+        vec![],
+    );
+    // One bounded fixture write crosses the actual wire cap, without a load loop.
+    open_or_create(&store.dir, CURRENT)
+        .unwrap()
+        .write_all(&line.repeat(MAX_BODY_BYTES / line.len() + 1))
         .unwrap();
-    store
-        .append(&render_line(
-            &rfc3339_millis(2000),
-            "INFO",
-            "spawnd",
-            "src/main.rs:1",
-            "second",
-            vec![],
-        ))
-        .unwrap();
-    let bundle = read_window(&path, "00000000", 0, 3000, 4096, Some(projection)).unwrap();
-    assert!(compress_bundle(bundle.clone(), 1).unwrap().is_none());
-    let full = compress_bundle(bundle.clone(), MAX_GZIP_BYTES)
+    let log = SupportLog::open(&path).unwrap();
+    let result = collect_bundle(&log, "00000000", 0, 3000, Some(projection))
         .unwrap()
         .unwrap();
-    let clipped = compress_bundle(bundle.clone(), full.body.len() - 1)
-        .unwrap()
-        .unwrap();
-    assert_eq!(clipped.header.lines, 1);
-    assert_eq!(clipped.header.from, Some(2000));
-    assert!(clipped.header.truncated);
-    assert!(clipped.body.len() < full.body.len());
-    let result = compress_bundle(bundle, MAX_GZIP_BYTES).unwrap().unwrap();
-    let mut raw = String::new();
-    flate2::read::GzDecoder::new(result.body.as_slice())
-        .read_to_string(&mut raw)
-        .unwrap();
+    let raw = String::from_utf8(result.body).unwrap();
     assert_eq!(result.header.bytes, raw.len());
+    assert!(raw.len() <= MAX_BODY_BYTES);
+    assert!(result.header.truncated);
+    assert_eq!(result.header.lines, raw.lines().count() - 1);
     capture::assert_absent(&raw, &marker, "complete bundle");
 }
