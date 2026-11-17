@@ -39,24 +39,22 @@ def headers(body=BODY, **overrides):
     }
 
 
-@pytest_asyncio.fixture
-async def storage(tmp_path, monkeypatch):
-    monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
-    store = get_store()
-    yield store
-    store.close()
-    assert not route._inflight and not route._reading
+@pytest.fixture
+def storage(app):
+    return get_store(app)
 
 
 @pytest_asyncio.fixture
-async def app(app, storage, monkeypatch):
+async def app(app, tmp_path, monkeypatch):
     # The shared fixture owns the database. These tests drive retention explicitly.
     monkeypatch.setattr(main, "init_engine", Mock())
     monkeypatch.setattr(main, "dispose_engine", AsyncMock())
+    monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
     monkeypatch.setattr(support_log_retention, "sweep_once", AsyncMock())
     upload_app = main.create_app()
     async with upload_app.router.lifespan_context(upload_app):
         yield upload_app
+    assert not route._inflight and not route._reading
 
 
 async def setup_request(*, state="dispatched", enabled=True):
@@ -208,11 +206,11 @@ async def test_success_modes_metadata_and_one_outcome(client, storage):
     assert storage.path(record.id).read_bytes() == BODY
     assert stat.S_IMODE(storage.path(record.id).stat().st_mode) == 0o600
     assert stat.S_IMODE(storage.root.stat().st_mode) == 0o700
-    assert await file_status(record) == "present"
+    assert await file_status(record, storage) == "present"
     assert (await post(client, record_id, token, b'{"format":3}\n{}\n')).status_code == 409
     assert storage.path(record.id).read_bytes() == BODY
     storage.path(record.id).unlink()
-    assert await file_status(record) == "missing"
+    assert await file_status(record, storage) == "missing"
 
 
 @pytest.mark.parametrize(
@@ -472,6 +470,7 @@ async def test_disconnect_marks_failed(app, storage):
     record_id, token, *_ = await setup_request()
     scope = dict(
         type="http",
+        app=app,
         headers=[
             (k.encode(), v.encode())
             for k, v in {

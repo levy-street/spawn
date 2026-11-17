@@ -16,7 +16,7 @@ from ..db import get_sessionmaker
 from ..models import SupportLogCollection, _utcnow
 from ..support_consent import ConsentError, canonical_uuid, is_sharing_on, strict_json
 from ..support_log import DECLINE_CODES, get_collection, transition
-from ..support_log_files import StoreUnavailable, finish_job, get_store
+from ..support_log_files import finish_job, get_store
 
 router = APIRouter(prefix="/api/support-log", tags=["support-log"])
 MAX_BUNDLE = 921600
@@ -150,8 +150,8 @@ async def publish(store, record, body, metadata):
 
 @router.post("/uploads/{request_id}", status_code=204)
 async def upload(request_id: str, request: Request):
-    store = get_store()
-    if store is None or not store.ready:
+    store = get_store(request.app)
+    if store is None:
         raise HTTPException(404, NOT_FOUND)
     # Explicit dependency scope ends before a body read, including auth's SELECT.
     async with get_sessionmaker()() as session:
@@ -173,11 +173,6 @@ async def upload(request_id: str, request: Request):
         if not await is_sharing_on(record.owner_user_id):
             await transition(record.id, "dispatched", "cancelled")
             raise HTTPException(409, "support sharing is off")
-        # No filesystem work before daemon authentication and the record check.
-        try:
-            await store.prepare()
-        except StoreUnavailable:
-            raise HTTPException(404, NOT_FOUND) from None
         content_type = request.headers.get("content-type", "")
         try:
             if content_type == "application/x-ndjson":

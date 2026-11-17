@@ -12,7 +12,6 @@ import os
 import stat
 import tempfile
 from contextlib import asynccontextmanager
-from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -24,7 +23,6 @@ from .config import get_settings
 from .support_consent import canonical_uuid
 
 log = logging.getLogger("spawn.support_log")
-PREPARE_SECONDS = 5
 
 
 def checkout_root() -> Path:
@@ -32,8 +30,14 @@ def checkout_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-class StoreUnavailable(Exception):
-    pass
+def _lock_directory(root: Path, flags: int) -> int:
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, flags)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 async def finish_job(awaitable):
@@ -49,86 +53,22 @@ async def finish_job(awaitable):
 
 
 class SupportLogFiles:
-    def __init__(self, directory: str):
-        self.root = Path(directory)
-        self.disabled = False
-        self.ready = False
+    def __init__(self, root: Path):
+        self.root = root
         self._entries = None
-        self._init_lock = asyncio.Lock()
-
-    @staticmethod
-    def _probe(root: Path):
-        if not root.is_dir():
-            raise NotADirectoryError
-        root.chmod(0o700)
-        fd, path = tempfile.mkstemp(prefix=".probe-", dir=root)
-        os.close(fd)
-        os.unlink(path)
-
-    def _prepare(self):
-        if fcntl is None or not all(
-            hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "fchmod")
-        ):
-            raise OSError("support storage requires Unix file locking and permissions")
-        root = self.root.resolve()
-        if not self.root.is_absolute() or root.is_relative_to(checkout_root()):
-            raise OSError("support directory must be absolute and outside checkout")
-        if self.disabled:
-            raise StoreUnavailable
-        if not root.exists():
-            root.parent.mkdir(parents=True, exist_ok=True)
-            # Probe a new directory before publishing it at the configured path.
-            with tempfile.TemporaryDirectory(prefix=".support-", dir=root.parent) as temp:
-                self._probe(Path(temp))
-                # Two starting workers must never replace each other's directory.
-                parent = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    fcntl.flock(parent, fcntl.LOCK_EX)
-                    if self.disabled:
-                        raise StoreUnavailable
-                    if not root.exists():
-                        os.rename(temp, root)
-                        return root
-                finally:
-                    os.close(parent)
-        self._probe(root)
-        return root
-
-    async def prepare(self):
-        async with self._init_lock:
-            if self.disabled:
-                raise StoreUnavailable
-            if not self.ready:
-                try:
-                    # Only the waiting task can publish readiness. A timed-out
-                    # filesystem call may still return after startup has continued.
-                    async with asyncio.timeout(PREPARE_SECONDS):
-                        self.root = await asyncio.to_thread(self._prepare)
-                except Exception:
-                    self.disabled = True
-                    log.error("SPAWN D support log storage is unusable; sharing storage is off")
-                    raise StoreUnavailable from None
-                self.ready = True
 
     def path(self, record_id: str) -> Path:
         canonical_uuid(record_id)
         return self.root / f"{record_id}.ndjson"
 
     def _try_lock(self):
-        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
+            return _lock_directory(self.root, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(fd)
             return None
-        except BaseException:
-            os.close(fd)
-            raise
 
     @asynccontextmanager
     async def locked(self):
-        await self.prepare()
         fd = None
         try:
             while fd is None:
@@ -188,30 +128,65 @@ class SupportLogFiles:
             self._entries = None
 
 
-@lru_cache(maxsize=8)
+def _probe(root: Path):
+    if not root.is_dir():
+        raise NotADirectoryError
+    root.chmod(0o700)
+    os.close(_lock_directory(root, fcntl.LOCK_EX))
+    fd, path = tempfile.mkstemp(prefix=".probe-", dir=root)
+    os.close(fd)
+    os.unlink(path)
+
+
 def _store(directory: str) -> SupportLogFiles:
-    return SupportLogFiles(directory)
+    if fcntl is None or not all(
+        hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "fchmod")
+    ):
+        raise OSError("support storage requires Unix file locking and permissions")
+    path = Path(directory)
+    root = path.resolve()
+    if not path.is_absolute() or root.is_relative_to(checkout_root()):
+        raise OSError("support directory must be absolute and outside checkout")
+    if not root.exists():
+        root.parent.mkdir(parents=True, exist_ok=True)
+        # Probe a new directory before publishing it at the configured path.
+        with tempfile.TemporaryDirectory(prefix=".support-", dir=root.parent) as temp:
+            _probe(Path(temp))
+            # Two starting workers must never replace each other's directory.
+            parent = _lock_directory(root.parent, fcntl.LOCK_EX)
+            try:
+                if not root.exists():
+                    os.rename(temp, root)
+                    return SupportLogFiles(root)
+            finally:
+                os.close(parent)
+    _probe(root)
+    return SupportLogFiles(root)
 
 
-def get_store() -> SupportLogFiles | None:
+async def prepare_store() -> SupportLogFiles | None:
     directory = get_settings().support_log_dir
     if not directory:
         return None
-    store = _store(directory)
-    return None if store.disabled else store
+    log.info("Checking support log storage")
+    try:
+        return await finish_job(asyncio.to_thread(_store, directory))
+    except Exception:
+        log.error("SPAWN D support log storage is unusable; sharing storage is off")
+        return None
 
 
-async def file_status(record) -> str:
+def get_store(app) -> SupportLogFiles | None:
+    return getattr(app.state, "support_log_store", None)
+
+
+async def file_status(record, store) -> str:
     if record.state != "collected":
         return "not_collected"
-    store = get_store()
     if store is None:
         return "unavailable"
     try:
-        await store.prepare()
         info = await asyncio.to_thread(store.path(record.id).lstat)
         return "present" if stat.S_ISREG(info.st_mode) else "missing"
     except FileNotFoundError:
         return "missing"
-    except StoreUnavailable:
-        return "unavailable"

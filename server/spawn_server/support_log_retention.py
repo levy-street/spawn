@@ -13,7 +13,7 @@ from .db import get_sessionmaker
 from .models import SupportLogCollection as Collection
 from .models import _utcnow
 from .support_log import transition
-from .support_log_files import StoreUnavailable, finish_job, get_store
+from .support_log_files import finish_job
 
 log = logging.getLogger("spawn.support_log")
 BATCH = 100
@@ -111,9 +111,8 @@ async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
             await asyncio.to_thread((store.root / name).unlink, missing_ok=True)
 
 
-async def sharing_turned_off(user_id: str):
+async def sharing_turned_off(user_id: str, store):
     """Called after storing the signed off statement; never substitutes a null row."""
-    store = get_store()
     if store is None:
         return
     async with get_sessionmaker()() as session:
@@ -126,32 +125,29 @@ async def sharing_turned_off(user_id: str):
             .values(state="cancelled", completed_at=_utcnow())
         )
         await session.commit()
-    try:
-        async with store.locked():
-            while True:
-                async with get_sessionmaker()() as session:
-                    ids = (
-                        await session.scalars(
-                            select(Collection.id)
-                            .where(
-                                Collection.owner_user_id == user_id,
-                                Collection.state == "collected",
-                            )
-                            .order_by(Collection.id)
-                            .limit(BATCH)
+    async with store.locked():
+        while True:
+            async with get_sessionmaker()() as session:
+                ids = (
+                    await session.scalars(
+                        select(Collection.id)
+                        .where(
+                            Collection.owner_user_id == user_id,
+                            Collection.state == "collected",
                         )
-                    ).all()
-                if not ids:
-                    break
-                for record_id in ids:
-                    await delete_collected(store, record_id)
-    except StoreUnavailable:
-        return
+                        .order_by(Collection.id)
+                        .limit(BATCH)
+                    )
+                ).all()
+            if not ids:
+                break
+            for record_id in ids:
+                await delete_collected(store, record_id)
 
 
-async def account_file_ids(session, user_id: str) -> list[str]:
+async def account_file_ids(session, user_id: str, store) -> list[str]:
     # No extra query, path access or transaction when the feature is off.
-    if get_store() is None:
+    if store is None:
         return []
     return list(
         (
@@ -165,25 +161,19 @@ async def account_file_ids(session, user_id: str) -> list[str]:
 
 
 @asynccontextmanager
-async def account_deletion_files(session, user_id: str):
+async def account_deletion_files(session, user_id: str, store):
     """Fence publication from the file-id snapshot through the account commit.
 
     With storage off this is a no-op, including the caller's transaction. With
     storage on, finish its read-only authorization transaction before file I/O.
     The caller deletes the account and commits inside this context.
     """
-    store = get_store()
     if store is None:
         yield
         return
     await session.commit()
-    try:
-        await store.prepare()
-    except StoreUnavailable:
-        yield
-        return
     async with store.locked():
-        ids = await account_file_ids(session, user_id)
+        ids = await account_file_ids(session, user_id, store)
         yield
         for record_id in ids:
             try:
@@ -199,8 +189,6 @@ async def run_sweeps(store, stop: asyncio.Event):
         while not stop.is_set():
             try:
                 await finish_job(sweep_once(store))
-            except StoreUnavailable:
-                return
             except Exception:
                 log.error("SPAWN D support log retention pass failed")
             try:
@@ -211,8 +199,7 @@ async def run_sweeps(store, stop: asyncio.Event):
         await asyncio.to_thread(store.close)
 
 
-def start_sweeps():
-    store = get_store()
+def start_sweeps(store):
     if store is None:
         return None
     stop = asyncio.Event()

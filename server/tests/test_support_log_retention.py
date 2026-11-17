@@ -8,7 +8,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -164,7 +163,7 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     assert (await post(client, other, other_token)).status_code == 204
     off = sign({**statement, "enabled": False}, key)
     await store_statement(statement["account_id"], off)
-    await sharing_turned_off(statement["account_id"])
+    await sharing_turned_off(statement["account_id"], storage)
     assert await get_statement(statement["account_id"]) == off
     assert (await get_collection(record_id)).state == "deleted"
     assert (await get_collection(requested)).state == "cancelled"
@@ -241,7 +240,7 @@ async def lifespan_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def no_sweeps(monkeypatch):
-    monkeypatch.setattr(main, "start_sweeps", lambda: pytest.fail("unexpected support log sweeps"))
+    monkeypatch.setattr(main, "start_sweeps", lambda _: pytest.fail("unexpected support log sweeps"))
 
 
 async def assert_unknown_paths(app):
@@ -255,12 +254,14 @@ async def assert_unknown_paths(app):
         assert result[0] == 404 and result[2] == 0
 
 
-async def test_disabled_routes_match_unknown_paths(lifespan_db, no_sweeps, monkeypatch):
+async def test_disabled_routes_match_unknown_paths(lifespan_db, no_sweeps, monkeypatch, caplog):
     monkeypatch.setattr(get_settings(), "support_log_dir", None)
     monkeypatch.setattr(support_log_files, "_store", lambda _: pytest.fail("unexpected store"))
+    caplog.set_level(logging.INFO, logger="spawn.support_log")
     app = main.create_app()
     async with app.router.lifespan_context(app):
         await assert_unknown_paths(app)
+    assert not any(r.name == "spawn.support_log" for r in caplog.records)
 
 
 def test_application_starts_without_unix_support(tmp_path):
@@ -285,8 +286,8 @@ from spawn_server import main, support_log_files
 from spawn_server.db import Base, get_engine, init_engine
 
 assert support_log_files.fcntl is None
-assert support_log_files.get_store() is None
 app = main.create_app()
+assert support_log_files.get_store(app) is None
 assert not any("support-log" in path for path in app.openapi()["paths"])
 
 async def start():
@@ -317,20 +318,22 @@ async def test_feature_off_no_io_body_or_sweep(app, tmp_path, monkeypatch):
 
     monkeypatch.setattr(files, "_store", lambda _path: pytest.fail("off must not touch the store"))
     app = create_app()
-    assert start_sweeps() is None
+    store = get_store(app)
+    assert start_sweeps(store) is None
     for record_id, token in (("malformed", None), (str(uuid.uuid4()), "invalid")):
         status, _, reads = await raw_request(app, record_id, token=token)
         assert status == 404 and reads == 0
-    await sharing_turned_off(str(uuid.uuid4()))
+    await sharing_turned_off(str(uuid.uuid4()), store)
     async with get_sessionmaker()() as session:
-        assert await account_file_ids(session, str(uuid.uuid4())) == []
-        async with account_deletion_files(session, str(uuid.uuid4())):
+        assert await account_file_ids(session, str(uuid.uuid4()), store) == []
+        async with account_deletion_files(session, str(uuid.uuid4()), store):
             assert not session.in_transaction()
     assert not directory.exists()
 
 
 @pytest.mark.parametrize(
-    "kind", ["relative", "checkout", "file", "uncreatable", "write_failure", "symlink", "no_fcntl"]
+    "kind",
+    ["relative", "checkout", "file", "uncreatable", "write_failure", "symlink", "no_fcntl", "lock"],
 )
 async def test_bad_configuration_logs_once_and_stays_off(
     lifespan_db, no_sweeps, tmp_path, monkeypatch, caplog, kind
@@ -357,60 +360,55 @@ async def test_bad_configuration_logs_once_and_stays_off(
     elif kind == "no_fcntl":
         directory = str(tmp_path / "storage")
         monkeypatch.setattr("spawn_server.support_log_files.fcntl", None)
+    elif kind == "lock":
+        directory = tmp_path / "storage"
+        directory.mkdir()
+        monkeypatch.setattr(support_log_files.fcntl, "flock", Mock(side_effect=OSError))
     else:
         directory = str(tmp_path / "storage")
         monkeypatch.setattr(
             "spawn_server.support_log_files.tempfile.mkstemp",
             lambda **_kw: (_ for _ in ()).throw(PermissionError()),
         )
-    monkeypatch.setattr(get_settings(), "support_log_dir", directory)
+    monkeypatch.setattr(get_settings(), "support_log_dir", str(directory))
+    caplog.set_level(logging.INFO, logger="spawn.support_log")
     app = main.create_app()
     async with app.router.lifespan_context(app):
         await assert_unknown_paths(app)
-        assert get_store() is None
+        assert get_store(app) is None
     async with app.router.lifespan_context(app):
-        assert get_store() is None
-    assert [r.levelno for r in caplog.records if r.name == "spawn.support_log"] == [logging.ERROR]
-    assert not Path(directory).is_dir()
+        assert get_store(app) is None
+    assert [r.levelno for r in caplog.records if r.name == "spawn.support_log"] == [
+        logging.INFO, logging.ERROR,
+    ] * 2
+    assert Path(directory).is_dir() == (kind == "lock")
     if kind in {"file", "uncreatable"}:
         assert path.stat().st_mode == original_mode
     assert not list(tmp_path.glob(".support-*"))
 
 
-async def test_hung_startup_stays_off(lifespan_db, no_sweeps, tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("first_usable", [True, False])
+async def test_each_lifespan_checks_storage(lifespan_db, tmp_path, monkeypatch, first_usable):
     directory = tmp_path / "storage"
     monkeypatch.setattr(get_settings(), "support_log_dir", str(directory))
-    assert support_log_files.PREPARE_SECONDS == 5
-    monkeypatch.setattr(support_log_files, "PREPARE_SECONDS", 0.2)
-    probe = support_log_files.SupportLogFiles._probe
-    release = threading.Event()
-    entered = asyncio.Event()
-    finished = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def blocked_probe(root):
-        loop.call_soon_threadsafe(entered.set)
-        try:
-            assert release.wait(10)
-            probe(root)
-        finally:
-            loop.call_soon_threadsafe(finished.set)
-
-    monkeypatch.setattr(support_log_files.SupportLogFiles, "_probe", staticmethod(blocked_probe))
     app = main.create_app()
-    try:
+    for usable in (first_usable, not first_usable):
+        if usable:
+            directory.mkdir()
+        else:
+            directory.touch()
         async with app.router.lifespan_context(app):
-            await asyncio.wait_for(entered.wait(), 10)
-            assert not finished.is_set()
-            await assert_unknown_paths(app)
-            assert get_store() is None and not directory.exists()
-    finally:
-        release.set()
-    await asyncio.wait_for(finished.wait(), 10)
-    async with app.router.lifespan_context(app):
-        await assert_unknown_paths(app)
-        assert get_store() is None and not directory.exists()
-    assert [r.levelno for r in caplog.records if r.name == "spawn.support_log"] == [logging.ERROR]
+            if usable:
+                assert get_store(app).root == directory
+                assert "post" in app.openapi()["paths"][url("{request_id}")]
+            else:
+                assert get_store(app) is None
+                await assert_unknown_paths(app)
+        assert get_store(app) is None
+        if usable:
+            directory.rmdir()
+        else:
+            directory.unlink()
 
 
 async def test_startup_and_periodic_sweep(lifespan_db, tmp_path, monkeypatch):
@@ -425,7 +423,7 @@ async def test_startup_and_periodic_sweep(lifespan_db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(support_log_retention, "sweep_once", sweep)
     assert support_log_retention.INTERVAL_SECONDS == 900
-    monkeypatch.setattr(support_log_retention, "INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(support_log_retention, "INTERVAL_SECONDS", 0)
     app = main.create_app()
     upload_path = url("{request_id}")
     assert upload_path not in app.openapi()["paths"]
@@ -435,7 +433,7 @@ async def test_startup_and_periodic_sweep(lifespan_db, tmp_path, monkeypatch):
         await asyncio.wait_for(second.wait(), 30)
         record_id, token, *_ = await setup_request()
         assert (await raw_request(app, record_id, token=token))[0] == 204
-        assert get_store().path(record_id).read_bytes() == BODY
+        assert get_store(app).path(record_id).read_bytes() == BODY
     async with app.router.lifespan_context(app):
         assert sum(route.path == upload_path for route in app.routes) == 1
     monkeypatch.setattr(get_settings(), "support_log_dir", None)
@@ -506,8 +504,8 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
     captured, proceed = asyncio.Event(), asyncio.Event()
     original = retention.account_file_ids
 
-    async def held_ids(session, user_id):
-        ids = await original(session, user_id)
+    async def held_ids(session, user_id, store):
+        ids = await original(session, user_id, store)
         captured.set()
         await asyncio.wait_for(proceed.wait(), 30)
         return ids
