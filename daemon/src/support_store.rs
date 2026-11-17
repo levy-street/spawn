@@ -15,6 +15,79 @@ pub(crate) const MAX_REVOCATIONS: usize = 256;
 #[derive(Debug, thiserror::Error)]
 #[error("support revocation capacity exceeded")]
 pub(crate) struct RevocationOverflow;
+/// Support's private floor. Never shared with connection admission, and never
+/// grows past 256 distinct keys, including while deserializing persisted state.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Revocations {
+    #[serde(deserialize_with = "bounded_keys")]
+    keys: std::collections::HashSet<[u8; 32]>,
+}
+fn bounded_keys<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::HashSet<[u8; 32]>, D::Error> {
+    struct Keys;
+    impl<'de> serde::de::Visitor<'de> for Keys {
+        type Value = std::collections::HashSet<[u8; 32]>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("at most 256 revoked keys")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut set = Revocations::default();
+            while let Some(key) = seq.next_element()? {
+                set.insert(key).map_err(serde::de::Error::custom)?;
+            }
+            Ok(set.keys)
+        }
+    }
+    d.deserialize_seq(Keys)
+}
+impl Revocations {
+    pub(crate) fn insert(&mut self, key: [u8; 32]) -> Result<bool> {
+        if self.keys.contains(&key) {
+            return Ok(false);
+        }
+        if self.keys.len() == MAX_REVOCATIONS {
+            return Err(RevocationOverflow.into());
+        }
+        Ok(self.keys.insert(key))
+    }
+    pub(crate) fn absorb(&mut self, other: Self) -> Result<bool> {
+        let mut changed = false;
+        for key in other.keys {
+            changed |= self.insert(key)?;
+        }
+        Ok(changed)
+    }
+    pub(crate) fn admission_set(&self) -> spawnd::endorsement_chain::RevocationSet {
+        spawnd::endorsement_chain::RevocationSet::from_keys(self.keys.iter().copied())
+    }
+}
+pub(crate) const CONTROL_WRITES: usize = 30;
+#[derive(Default)]
+pub(crate) struct ControlBudget(std::collections::VecDeque<tokio::time::Instant>);
+#[derive(Debug, thiserror::Error)]
+#[error("support control write budget exhausted; restart required")]
+pub(crate) struct ControlOverflow;
+impl ControlBudget {
+    fn charge(&mut self) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        while self
+            .0
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= std::time::Duration::from_secs(600))
+        {
+            self.0.pop_front();
+        }
+        if self.0.len() == CONTROL_WRITES {
+            return Err(ControlOverflow.into());
+        }
+        self.0.push_back(now);
+        Ok(())
+    }
+}
 const CONSENT_NAME: &str = "support-log-consent.json";
 const CONSENT_LOCK: &str = "support-log-consent.lock";
 const SENT: &str = "sent.jsonl";
@@ -29,7 +102,7 @@ pub(crate) struct Stored {
     pub consent: Option<Consent>,
     pub server_off: bool,
     #[serde(default)]
-    revoked: spawnd::endorsement_chain::RevocationSet,
+    revoked: Revocations,
 }
 fn read(config: &Path) -> Result<Stored> {
     CONSENT
@@ -50,7 +123,10 @@ fn write(config: &Path, stored: &Stored) -> Result<()> {
 pub(crate) fn load(config: &Path, trust: &Trust, now: u64) -> Result<Stored, Refusal> {
     let stored = read(config).map_err(|_| Refusal::Failed)?;
     let mut trust = trust.clone();
-    trust.revoked.absorb(stored.revoked.clone());
+    trust
+        .revoked
+        .absorb(stored.revoked.clone())
+        .map_err(|_| Refusal::Failed)?;
     if let Some(consent) = &stored.consent {
         trust.verify(consent, now)?;
     }
@@ -81,11 +157,12 @@ pub(crate) fn erase_statement(config: &Path) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-pub(crate) fn apply(
+pub(crate) fn apply_budgeted(
     config: &Path,
     incoming: Option<Consent>,
     trust: &Trust,
     now: u64,
+    budget: &mut ControlBudget,
 ) -> Result<()> {
     anyhow::ensure!(
         trust.account.is_some(),
@@ -93,9 +170,11 @@ pub(crate) fn apply(
     );
     let _lock = consent_lock(config)?;
     let mut stored = read(config)?;
-    stored.revoked.absorb(trust.revoked.clone());
+    let old_consent = stored.consent.clone();
+    let old_off = stored.server_off;
+    let revocations_changed = stored.revoked.absorb(trust.revoked.clone())?;
     let mut trust = trust.clone();
-    trust.revoked.absorb(stored.revoked.clone());
+    trust.revoked.absorb(stored.revoked.clone())?;
     if let Some(consent) = incoming {
         trust
             .verify(&consent, now)
@@ -117,23 +196,36 @@ pub(crate) fn apply(
     } else {
         stored.server_off = true;
     }
+    let same_statement = match (&old_consent, &stored.consent) {
+        (None, None) => true,
+        (Some(old), Some(new)) => old.same_statement(new),
+        _ => false,
+    };
+    if same_statement && old_off == stored.server_off && !revocations_changed {
+        return Ok(());
+    }
+    budget.charge()?;
     write(config, &stored)?;
     Ok(())
 }
-pub(crate) fn remember_revocations(
-    config: &Path,
-    trust: &Trust,
-) -> Result<spawnd::endorsement_chain::RevocationSet> {
+pub(crate) fn remember_revocations(config: &Path, trust: &Trust) -> Result<Revocations> {
     let _lock = consent_lock(config)?;
     let mut stored = read(config)?;
-    let changed = stored.revoked.absorb(trust.revoked.clone());
-    if stored.revoked.len() > MAX_REVOCATIONS {
-        return Err(RevocationOverflow.into());
-    }
+    let changed = stored.revoked.absorb(trust.revoked.clone())?;
     if changed {
         write(config, &stored)?;
     }
     Ok(stored.revoked)
+}
+
+#[cfg(test)]
+pub(crate) fn apply(
+    config: &Path,
+    incoming: Option<Consent>,
+    trust: &Trust,
+    now: u64,
+) -> Result<()> {
+    apply_budgeted(config, incoming, trust, now, &mut ControlBudget::default())
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -164,20 +256,39 @@ pub(crate) fn status(config: &Path, trust: &Trust, path: &Path) -> SharingStatus
     status
 }
 
-/// Complete ordinary cleanup before reporting an optional support failure.
+/// Capture the selected instance before a bounded CLI cleanup can outlive the
+/// environment guard. Resolving the path never creates a directory.
+pub(crate) fn credential_cleanup() -> impl FnOnce() -> Result<()> + Send + 'static {
+    let selected = std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty());
+    move || {
+        let path = match selected {
+            Some(path) => std::path::PathBuf::from(path),
+            None => crate::platform::default_config_base()
+                .context("cannot resolve support config dir")?,
+        };
+        remove(&path)
+    }
+}
+
+/// Preserve the ordinary result and diagnostics; optional cleanup adds only a
+/// warning. The support closure runs on the process's dedicated worker.
 pub(crate) fn cleanup_after<T>(
     ordinary: impl FnOnce() -> Result<T>,
-    support: impl FnOnce() -> Result<()>,
+    support: impl FnOnce() -> Result<()> + Send + 'static,
 ) -> Result<T> {
     let primary = ordinary();
-    let secondary = support();
-    match (primary, secondary) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(primary), Err(secondary)) => {
-            Err(primary.context(format!("support cleanup also failed: {secondary:#}")))
-        }
+    let secondary = crate::support_io::Worker::process()
+        .ok_or_else(|| anyhow::anyhow!("support worker unavailable"))
+        .and_then(|worker| {
+            worker
+                .run_sync(support)
+                .map_err(|_| anyhow::anyhow!("support cleanup unavailable or timed out"))
+        })
+        .and_then(|result| result);
+    if secondary.is_err() {
+        eprintln!("SPAWN D warning: support sharing cleanup failed; ordinary cleanup result is unchanged.");
     }
+    primary
 }
 pub(crate) fn remove(config: &Path) -> Result<()> {
     // No lock creation when there is nothing to remove (including full disks).

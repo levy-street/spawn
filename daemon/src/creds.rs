@@ -1588,6 +1588,7 @@ pub async fn logout() -> Result<()> {
 /// Clear both credential backends without presentation output. Recovery
 /// commands use this before removing the rest of the instance directory.
 pub(crate) fn reset_local_credentials() -> Result<ClearOutcome> {
+    let support_cleanup = crate::support_store::credential_cleanup();
     crate::support_store::cleanup_after(
         || {
             with_credential_lock(|| {
@@ -1601,13 +1602,14 @@ pub(crate) fn reset_local_credentials() -> Result<ClearOutcome> {
                 )
             })
         },
-        || crate::support_store::remove(&config::config_dir()?),
+        support_cleanup,
     )
 }
 
 /// Remove only the daemon token while retaining the host identity, server,
 /// Host ID, and browser pins for a one-approval re-attachment.
 pub fn logout_keep_identity() -> Result<()> {
+    let support_cleanup = crate::support_store::credential_cleanup();
     crate::support_store::cleanup_after(
         || {
             let mut stored = load().context("loading credentials to sign out")?;
@@ -1618,7 +1620,7 @@ pub fn logout_keep_identity() -> Result<()> {
             stored.access_token = None;
             save(&mut stored, &expected).context("persisting signed-out host identity")
         },
-        || crate::support_store::remove(&config::config_dir()?),
+        support_cleanup,
     )
 }
 

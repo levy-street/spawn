@@ -29,7 +29,6 @@
 //! endorsement chain from one of this host's pinned anchors to that key, with
 //! every key on the path off the deny-list (the doc's §3 admission rule).
 
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -73,11 +72,9 @@ pub struct ChainEdge {
 /// delivered by the server on connect and is **add-only** for the account owner,
 /// **subtract-only** in effect (docs §3). Populated by the revocation channel
 /// (a later stage); defined here because chain validation is its only consumer.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct RevocationSet {
     keys: HashSet<[u8; PUBLIC_KEY_BYTES]>,
-    #[serde(default)]
-    saturated: bool,
 }
 
 impl RevocationSet {
@@ -86,27 +83,18 @@ impl RevocationSet {
     }
 
     pub fn from_keys(keys: impl IntoIterator<Item = [u8; PUBLIC_KEY_BYTES]>) -> Self {
-        let mut set = Self::new();
-        for key in keys {
-            set.insert(key);
+        Self {
+            keys: keys.into_iter().collect(),
         }
-        set
     }
 
     /// Add a key to the deny-list. Returns true if it was newly inserted.
     pub fn insert(&mut self, key: [u8; PUBLIC_KEY_BYTES]) -> bool {
-        if self.saturated || self.keys.contains(&key) {
-            return false;
-        }
-        if self.keys.len() == 4096 {
-            self.saturated = true;
-            return true;
-        }
         self.keys.insert(key)
     }
 
     pub fn contains(&self, key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
-        self.saturated || self.keys.contains(key)
+        self.keys.contains(key)
     }
 
     /// True if this set holds any key not in `previous` — i.e. a revocation
@@ -114,8 +102,7 @@ impl RevocationSet {
     /// is exactly "did a new device get revoked", the signal to tear down live
     /// sessions (R1) rather than only block new connections.
     pub fn revokes_beyond(&self, previous: &RevocationSet) -> bool {
-        (self.saturated && !previous.saturated)
-            || self.keys.iter().any(|key| !previous.contains(key))
+        self.keys.iter().any(|key| !previous.contains(key))
     }
 
     /// Fold a freshly delivered deny-list into this one: **union, never
@@ -130,10 +117,7 @@ impl RevocationSet {
     /// tear down live sessions.
     pub fn absorb(&mut self, incoming: RevocationSet) -> bool {
         let grew = incoming.revokes_beyond(self);
-        self.saturated |= incoming.saturated;
-        for key in incoming.keys {
-            self.insert(key);
-        }
+        self.keys.extend(incoming.keys);
         grew
     }
 
@@ -441,26 +425,6 @@ mod tests {
             transcript,
             signature,
         }
-    }
-
-    #[test]
-    fn revocation_capacity_never_forgets_an_identity() {
-        let mut set = RevocationSet {
-            keys: (0u32..4096)
-                .map(|n| {
-                    let mut key = [0; 32];
-                    key[..4].copy_from_slice(&n.to_be_bytes());
-                    key
-                })
-                .collect(),
-            saturated: false,
-        };
-        assert!(set.insert([255; 32]));
-        assert_eq!(set.len(), 4096);
-        assert!(set.contains(&[254; 32]));
-        let mut next = RevocationSet::new();
-        assert!(next.absorb(set));
-        assert!(next.contains(&[253; 32]));
     }
 
     #[test]
@@ -990,7 +954,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CarriedEndorsement {
     pub account_id: String,
     pub endorser_public_key: String,

@@ -212,9 +212,48 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     });
     let launch = launch_text(build.live());
     let pair = pair_text(build.live());
-    let support_log = crate::support_log::current_path(dir)
-        .ok()
-        .map(|path| path.display().to_string());
+    let support_config = dir.to_owned();
+    let support_trust = crate::support::Trust::from_record(&stored);
+    let (support_log, support_sharing) = if let Some(worker) = crate::support_io::Worker::process()
+    {
+        worker
+            .run(
+                tokio::time::Instant::now() + crate::support_io::IO_DEADLINE,
+                move || {
+                    let log = crate::support_log::current_path(&support_config)
+                        .ok()
+                        .map(|path| path.display().to_string());
+                    let sharing = crate::support_log::support_dir(&support_config)
+                        .ok()
+                        .map(|path| {
+                            let mut sharing = crate::support_store::status(
+                                &support_config,
+                                &support_trust,
+                                &path,
+                            );
+                            sharing.runtime = crate::state::read(&support_config)
+                                .ok()
+                                .flatten()
+                                .filter(|state| {
+                                    crate::state::daemon_state_is_live(&support_config, state)
+                                })
+                                .and_then(|state| state.support_runtime);
+                            if sharing.runtime.is_none_or(|state| {
+                                state.pending || state.permanent_deny || state.io_overdue
+                            }) {
+                                sharing.enabled = false;
+                            }
+                            sharing
+                        })
+                        .unwrap_or_default();
+                    (log, sharing)
+                },
+            )
+            .await
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     Ok(InstanceStatus {
         account: dir
             .file_name()
@@ -237,28 +276,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         launch,
         pair,
         support_log,
-        support_sharing: crate::support_log::support_dir(dir)
-            .ok()
-            .map(|path| {
-                let mut sharing = crate::support_store::status(
-                    dir,
-                    &crate::support::Trust::from_record(&stored),
-                    &path,
-                );
-                sharing.runtime = crate::state::read(dir)
-                    .ok()
-                    .flatten()
-                    .filter(|state| crate::state::daemon_state_is_live(dir, state))
-                    .and_then(|state| state.support_runtime);
-                if sharing
-                    .runtime
-                    .is_none_or(|state| state.pending || state.permanent_deny)
-                {
-                    sharing.enabled = false;
-                }
-                sharing
-            })
-            .unwrap_or_default(),
+        support_sharing,
     })
 }
 
@@ -481,12 +499,17 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             if runtime.permanent_deny {
                 let _ = writeln!(
                     text,
-                    "               denied for this process: support update or queue failure"
+                    "               denied until restart: support input, write budget or queue failure"
+                );
+            } else if runtime.io_overdue {
+                let _ = writeln!(
+                    text,
+                    "               denied while support filesystem work is overdue"
                 );
             } else if runtime.pending {
                 let _ = writeln!(
                     text,
-                    "               denied while a support update is pending"
+                    "               denied while a support update is pending; restart may be required"
                 );
             }
             let _ = writeln!(

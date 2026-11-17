@@ -44,6 +44,7 @@ mod sessions;
 mod state;
 mod status;
 mod support;
+mod support_io;
 mod support_log;
 mod support_store;
 mod tui;

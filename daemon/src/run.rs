@@ -449,26 +449,48 @@ enum ActiveSessionEvent {
 async fn wait_for_credential_change(
     active: &LiveCredentialSnapshot,
     loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
 ) -> Result<LiveCredentialSnapshot> {
-    wait_for_credential_change_with(active, CREDENTIAL_RELOAD_INTERVAL, loader, None).await
+    wait_for_credential_change_with(active, CREDENTIAL_RELOAD_INTERVAL, loader, support).await
 }
 
 async fn credential_change_now(
     active: &LiveCredentialSnapshot,
     loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
 ) -> Result<Option<LiveCredentialSnapshot>> {
-    credential_change_now_with(active, loader).await
+    credential_change_now_with(active, loader, support).await
 }
 
 async fn credential_change_now_with(
     active: &LiveCredentialSnapshot,
     loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
 ) -> Result<Option<LiveCredentialSnapshot>> {
-    let record = loader
+    let observed = loader
         .load()
         .await
-        .context("reloading credentials before websocket admission")?;
-    active.classify_reload(record)
+        .context("reloading credentials before websocket admission")
+        .and_then(|record| active.classify_reload(record));
+    deliver_credential_observation(active, support, &observed);
+    observed
+}
+
+fn deliver_credential_observation(
+    active: &LiveCredentialSnapshot,
+    support: Option<&crate::support::Collector>,
+    observed: &Result<Option<LiveCredentialSnapshot>>,
+) {
+    let Some(support) = support else {
+        return;
+    };
+    match observed {
+        Ok(Some(next)) if next.support_trust != active.support_trust => {
+            support.trust(Arc::clone(&next.support_trust), None, None)
+        }
+        Err(_) => support.fence(),
+        _ => {} // Unchanged credentials are observations, not support inputs.
+    }
 }
 
 async fn wait_for_credential_change_with(
@@ -488,18 +510,14 @@ async fn wait_for_credential_change_with(
             _ = ticker.tick() => {}
             _ = credentials_touched_notify().notified() => {}
         }
-        if let Some(support) = support {
-            support.fence();
-        }
-        let record = loader
+        let observed = loader
             .load()
             .await
-            .context("reloading the complete credential record")?;
-        if let Some(next) = active.classify_reload(record)? {
+            .context("reloading the complete credential record")
+            .and_then(|record| active.classify_reload(record));
+        deliver_credential_observation(active, support, &observed);
+        if let Some(next) = observed? {
             return Ok(next);
-        }
-        if let Some(support) = support {
-            support.trust(Arc::clone(&active.support_trust), None, None);
         }
     }
 }
@@ -619,7 +637,8 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let ws_url = config::ws_url(&server_url)?;
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
-    let support = crate::support::Collector::start(config_dir.clone(), server_url.to_string());
+    let support =
+        crate::support::Collector::start(config_dir.clone(), server_url.to_string()).await;
     let _support_shutdown = crate::support::Fence::shutdown(support.as_ref());
     let registry = SessionRegistry::new();
     #[cfg(windows)]
@@ -707,14 +726,19 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         // scheduler turn as a credential write. Never let that select race
         // carry the stale snapshot into another socket: reread the whole
         // record through the hard-deadline loader before every attempt.
-        let immediate_reload =
-            match credential_change_now(&live_credentials, &mut credential_loader).await {
-                Ok(reload) => reload,
-                Err(error) => {
-                    rtc_sessions.invalidate_trust_and_close_all().await;
-                    return Err(error);
-                }
-            };
+        let immediate_reload = match credential_change_now(
+            &live_credentials,
+            &mut credential_loader,
+            support.as_ref(),
+        )
+        .await
+        {
+            Ok(reload) => reload,
+            Err(error) => {
+                rtc_sessions.invalidate_trust_and_close_all().await;
+                return Err(error);
+            }
+        };
         if let Some(next) = immediate_reload {
             // The prior socket-end branch may have won over a simultaneously
             // ready reload. Its ordinary close cannot authorize an offer that
@@ -888,7 +912,11 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         }
         let reloaded = {
             let sleep_fut = tokio::time::sleep(delay);
-            let reload_fut = wait_for_credential_change(&live_credentials, &mut credential_loader);
+            let reload_fut = wait_for_credential_change(
+                &live_credentials,
+                &mut credential_loader,
+                support.as_ref(),
+            );
             tokio::pin!(sleep_fut);
             tokio::pin!(reload_fut);
             tokio::select! {
@@ -996,7 +1024,7 @@ async fn serve_one_connection_with_loader(
     // Keep this boundary self-contained as well as guarding it in `run`: a
     // caller cannot open a websocket from a snapshot that was already stale
     // when the connection operation began.
-    match credential_change_now_with(live_credentials, loader).await {
+    match credential_change_now_with(live_credentials, loader, support).await {
         Ok(Some(next)) => {
             rtc_sessions.invalidate_trust_and_close_all().await;
             return Ok(ServeOutcome::CredentialsChanged(Box::new(next)));
@@ -1051,7 +1079,7 @@ async fn serve_one_connection_with_loader(
     // registering the host, installing sinks, or accepting any control/RTC
     // frame; a stale handshake is dropped without becoming an admitted daemon
     // session.
-    match credential_change_now_with(live_credentials, loader).await {
+    match credential_change_now_with(live_credentials, loader, support).await {
         Ok(Some(next)) => {
             drop(stream);
             rtc_sessions.invalidate_trust_and_close_all().await;
@@ -1198,6 +1226,9 @@ async fn serve_one_connection_with_loader(
     // kernel/tungstenite layer. Scoped so `dispatch_fut`'s borrow of
     // `out_tx` releases before we drop it below.
     let dispatch_result = {
+        if let Some(support) = support {
+            support.trust(Arc::clone(&live_credentials.support_trust), None, None);
+        }
         let dispatch_fut = dispatch_loop(
             &mut in_rx,
             registry,
@@ -1694,14 +1725,7 @@ fn verify_signed_rtc_offer_admitted(
     if let Some(verified) = verify_signed_rtc_offer(envelope, record) {
         // Fail-closed: a revoked key never connects, even if a pin still lingers
         // (the deny-list is delivered independently of pin reconciliation).
-        if !admitted_device(
-            verified.sender_public_key(),
-            record.browser_pins(),
-            account_id,
-            revoked,
-            carried,
-            None,
-        ) {
+        if revoked.contains(&verified.sender_public_key().to_bytes()) {
             tracing::warn!(reason = "revoked-pinned-key", "signed RTC offer refused");
             return None;
         }
@@ -1759,19 +1783,81 @@ fn verify_signed_rtc_offer_admitted(
         );
         return None;
     };
-    admitted_device(
-        verified.sender_public_key(),
-        record.browser_pins(),
-        Some(account_id),
+    let anchors: Vec<_> = record
+        .browser_pins()
+        .iter()
+        .filter_map(|pin| public_key_from_wire(pin.public_key()).ok())
+        .collect();
+    let edges = parse_carried_endorsements(carried);
+    // find_valid_chain rejects any chain whose keys (anchor, intermediates, or
+    // the connecting key) are on the deny-list.
+    match find_valid_chain(
+        account_id,
+        &anchors,
         revoked,
-        carried,
-        None,
-    )
-    .then_some(verified)
+        verified.sender_public_key(),
+        &edges,
+        DEFAULT_MAX_CHAIN_EDGES,
+    ) {
+        Ok(()) => Some(verified),
+        Err(error) => {
+            tracing::warn!(
+                reason = "no-valid-chain",
+                ?error,
+                sender = %short_key(verified.sender_public_key()),
+                carried = carried.len(),
+                parsed_edges = edges.len(),
+                anchors = anchors.len(),
+                "signed RTC offer refused"
+            );
+            None
+        }
+    }
 }
 
-/// Shared admission. Optional device attribution additionally restricts the
-/// final verified edge (connections intentionally do not require attribution).
+/// First bytes of a key, hex, for log correlation (never a trust input).
+fn short_key(key: &ed25519_dalek::VerifyingKey) -> String {
+    key.to_bytes()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn support_test_connection_admission(revoked: &RevocationSet) -> bool {
+    use base64::Engine;
+    use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let host = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+    let key = spawnd::signed_signal::public_key_to_wire(&signer.verifying_key());
+    let mut record = StoredCreds::default();
+    record.host_private_key_seed =
+        Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([5; 32]));
+    let pin = creds::browser_pin_from_approval(
+        &Uuid::from_bytes([2; 16]).to_string(),
+        "ed25519",
+        &key,
+        &creds::browser_key_fingerprint(&key).unwrap(),
+    )
+    .unwrap();
+    creds::merge_browser_pin(&mut record, pin).unwrap();
+    let offer = SignedSignalTranscript::new(
+        SignalKind::Offer,
+        2,
+        Uuid::from_bytes([3; 16]).to_string(),
+        ScopeType::Session,
+        Uuid::from_bytes([4; 16]).to_string(),
+        SenderRole::Browser,
+        host.verifying_key().to_bytes(),
+        "v=0\r\n",
+    )
+    .unwrap();
+    let wire = sign_rtc_signal_wire(&signer, RtcProtocol::Session, &offer).unwrap();
+    verify_signed_rtc_offer_admitted(&wire, &record, None, revoked, &[]).is_some()
+}
+
+/// Support uses the same direct-pin/chain rule as connection admission, with
+/// verified device attribution. Keep the connection path above unchanged.
 pub(crate) fn admitted_device(
     signer: &ed25519_dalek::VerifyingKey,
     pins: &[creds::BrowserPin],
@@ -1804,38 +1890,15 @@ pub(crate) fn admitted_device(
                 || edge.transcript.endorsed_device_id == *device.as_bytes()
         });
     }
-    // find_valid_chain rejects any chain whose keys (anchor, intermediates, or
-    // the connecting key) are on the deny-list.
-    match find_valid_chain(
+    find_valid_chain(
         account_id,
         &anchors,
         revoked,
         signer,
         &edges,
         DEFAULT_MAX_CHAIN_EDGES,
-    ) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                reason = "no-valid-chain",
-                ?error,
-                sender = %short_key(signer),
-                carried = carried.len(),
-                parsed_edges = edges.len(),
-                anchors = anchors.len(),
-                "signed RTC offer refused"
-            );
-            false
-        }
-    }
-}
-
-/// First bytes of a key, hex, for log correlation (never a trust input).
-fn short_key(key: &ed25519_dalek::VerifyingKey) -> String {
-    key.to_bytes()[..6]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    )
+    .is_ok()
 }
 
 /// Build the deny-list from the wire keys the server delivers. Malformed keys
@@ -2011,28 +2074,17 @@ async fn dispatch_loop(
             }
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
-                    support_log_consent,
+                    support: update,
                     host_id,
                     access_token,
                     account_id,
                     browser_pins,
-                    browser_device_ids,
-                    revoked_browser_keys,
                 } => {
-                    let browser_device_ids: Option<Arc<[String]>> =
-                        browser_device_ids.map(Arc::from);
-                    let revoked_browser_keys: Option<Arc<[String]>> =
-                        revoked_browser_keys.map(Arc::from);
                     if let Some(support) = support {
-                        support.trust(
-                            Arc::clone(&live_credentials.support_trust),
-                            browser_device_ids.clone(),
-                            revoked_browser_keys.clone(),
-                        );
+                        support.update(&update);
                     }
-                    if let (Some(support), Some(consent)) = (support, support_log_consent) {
-                        support.consent(consent);
-                    }
+                    let browser_device_ids = &update.browser_device_ids;
+                    let revoked_browser_keys = &update.revoked_browser_keys;
                     if host_id != live_credentials.host_id {
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
@@ -2096,20 +2148,13 @@ async fn dispatch_loop(
                 Inbound::HostBrowserPins {
                     account_id,
                     browser_pins,
-                    browser_device_ids,
-                    revoked_browser_keys,
+                    support: update,
                 } => {
-                    let browser_device_ids: Option<Arc<[String]>> =
-                        browser_device_ids.map(Arc::from);
-                    let revoked_browser_keys: Option<Arc<[String]>> =
-                        revoked_browser_keys.map(Arc::from);
                     if let Some(support) = support {
-                        support.trust(
-                            Arc::clone(&live_credentials.support_trust),
-                            browser_device_ids.clone(),
-                            revoked_browser_keys.clone(),
-                        );
+                        support.update(&update);
                     }
+                    let browser_device_ids = &update.browser_device_ids;
+                    let revoked_browser_keys = &update.revoked_browser_keys;
                     // Pushed when the set changes, so endorsing OR revoking a
                     // device takes effect immediately instead of waiting for the
                     // daemon to happen to reconnect -- which could be hours.
@@ -2142,9 +2187,14 @@ async fn dispatch_loop(
                         rtc_sessions.invalidate_trust_and_close_all().await;
                     }
                 }
-                Inbound::HostSupportLogConsent { consent } => {
+                Inbound::HostSupportLogConsent { support: update } => {
                     if let Some(support) = support {
-                        support.consent(consent);
+                        support.update(&update);
+                    }
+                }
+                Inbound::InvalidSupport => {
+                    if let Some(support) = support {
+                        support.invalid();
                     }
                 }
                 Inbound::SupportLogCollect {
@@ -5781,71 +5831,236 @@ mod tests {
 
     #[tokio::test]
     async fn a_hanging_support_upload_does_not_hold_up_dispatch_pings() {
-        let _clock = crate::support::tests::freeze_time();
-        let tmp = crate::support_log::capture::private_tempdir();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
+        crate::support::tests::bounded(async {
+            let _clock = crate::support::tests::freeze_time();
+            let tmp = crate::support_log::capture::private_tempdir();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let (trust, consent) = crate::support::tests::fixture();
+            let record = credential_record(
+                1,
+                4,
+                "test-token",
+                Uuid::from_bytes([3; 16]),
+                &origin,
+                5,
+                &[],
+            );
+            crate::support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+            let live = LiveCredentialSnapshot::initial(record, &url::Url::parse(&origin).unwrap())
+                .unwrap();
+            let support =
+                crate::support::tests::test_collector(tmp.path().to_owned(), trust, origin).await;
+            crate::support::tests::settled(&support).await;
+            let registry = SessionRegistry::new();
+            let rtc = RtcSessions::new();
+            let mut revoked = RevocationSet::new();
+            let (in_tx, mut in_rx) = mpsc::channel(4);
+            let (out_tx, mut out_rx) = mpsc::channel(4);
+            let dispatch = dispatch_loop(
+                &mut in_rx,
+                &registry,
+                &rtc,
+                &out_tx,
+                &live,
+                &mut revoked,
+                Arc::new(StdMutex::new(None)),
+                HashSet::new(),
+                Some(&support),
+            );
+            let exercise = async {
+                in_tx
+                    .send(WsInbound::Json(Box::new(Inbound::SupportLogCollect {
+                        request_id: Uuid::new_v4(),
+                        since_seconds: 60,
+                    })))
+                    .await
+                    .unwrap();
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let (headers, _) = crate::support::tests::receive_request(&mut connection).await;
+                assert!(headers
+                    .to_lowercase()
+                    .contains("content-type: application/gzip"));
+                // The listener deliberately never sends an HTTP response.
+                in_tx
+                    .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                        request_id: "during-upload".into(),
+                    })))
+                    .await
+                    .unwrap();
+                let pong = out_rx.recv().await.unwrap();
+                let value: serde_json::Value = serde_json::from_str(pong.as_str()).unwrap();
+                assert_eq!(value["type"], "host.pong");
+                assert_eq!(value["request_id"], "during-upload");
+                drop(in_tx);
+                drop(connection);
+            };
+            let (result, ()) = tokio::join!(dispatch, exercise);
+            result.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn support_collection_completes_across_unchanged_credential_monitor_ticks() {
+        crate::support::tests::bounded(async {
+            use tokio::io::AsyncWriteExt;
+            let tmp = crate::support_log::capture::private_tempdir();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let (trust, consent) = crate::support::tests::fixture();
+            crate::support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+            let record = credential_record(1, 4, "test-token", Uuid::from_bytes([3; 16]), &origin, 5, &[]);
+            let live = LiveCredentialSnapshot::initial(record.clone(), &url::Url::parse(&origin).unwrap()).unwrap();
+            let support = crate::support::tests::test_collector(tmp.path().to_owned(), trust, origin).await;
+            crate::support::tests::settled(&support).await;
+            let ticks = Arc::new(tokio::sync::Notify::new());
+            let observed = Arc::clone(&ticks);
+            let mut polls = 0;
+            let mut loader = CredentialLoader::start(CREDENTIAL_LOAD_DEADLINE, move || {
+                polls += 1;
+                if polls == 3 { observed.notify_one(); }
+                Ok(record.clone())
+            }).unwrap();
+            let monitor = wait_for_credential_change_with(&live, CREDENTIAL_RELOAD_INTERVAL, &mut loader, Some(&support));
+            let exercise = async {
+                let done = crate::support::tests::collection(&support, 60);
+                let (mut socket, _) = listener.accept().await.unwrap();
+                crate::support::tests::receive_request(&mut socket).await;
+                ticks.notified().await;
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+                done.await.unwrap();
+                let receipts = crate::support_store::recent(&tmp.path().join("support")).unwrap();
+                assert_eq!(receipts.last().unwrap().outcome, crate::support_store::Outcome::Sent);
+                assert_eq!(receipts.iter().filter(|r| r.outcome == crate::support_store::Outcome::Started).count(), 1);
+            };
+            tokio::select! { result = monitor => panic!("unchanged monitor returned: {}", result.is_ok()), _ = exercise => {} }
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn support_stuck_io_does_not_block_dispatch() {
+        crate::support::tests::bounded(async {
+            let tmp = crate::support_log::capture::private_tempdir();
+            let (trust, _) = crate::support::tests::fixture();
+            let support =
+                crate::support::tests::test_collector(tmp.path().to_owned(), trust, String::new())
+                    .await;
+            crate::support::tests::settled(&support).await;
+            let release = crate::support::tests::stall_io(&support).await;
+            let record = credential_record(
+                1,
+                1,
+                "test-token",
+                Uuid::from_u128(1),
+                "https://example.invalid",
+                5,
+                &[],
+            );
+            let live = LiveCredentialSnapshot::initial(
+                record,
+                &url::Url::parse("https://example.invalid").unwrap(),
+            )
             .unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let (trust, consent) = crate::support::tests::fixture();
-        let record = credential_record(
-            1,
-            4,
-            "test-token",
-            Uuid::from_bytes([3; 16]),
-            &origin,
-            5,
-            &[],
-        );
-        crate::support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
-        let live =
-            LiveCredentialSnapshot::initial(record, &url::Url::parse(&origin).unwrap()).unwrap();
-        let support = crate::support::tests::test_collector(tmp.path().to_owned(), trust, origin);
-        let registry = SessionRegistry::new();
-        let rtc = RtcSessions::new();
-        let mut revoked = RevocationSet::new();
-        let (in_tx, mut in_rx) = mpsc::channel(4);
-        let (out_tx, mut out_rx) = mpsc::channel(4);
-        let dispatch = dispatch_loop(
-            &mut in_rx,
-            &registry,
-            &rtc,
-            &out_tx,
-            &live,
-            &mut revoked,
-            Arc::new(StdMutex::new(None)),
-            HashSet::new(),
-            Some(&support),
-        );
-        let exercise = async {
-            in_tx
-                .send(WsInbound::Json(Box::new(Inbound::SupportLogCollect {
-                    request_id: Uuid::new_v4(),
-                    since_seconds: 60,
-                })))
-                .await
-                .unwrap();
-            let (mut connection, _) = listener.accept().await.unwrap();
-            let (headers, _) = crate::support::tests::receive_request(&mut connection).await;
-            assert!(headers
-                .to_lowercase()
-                .contains("content-type: application/gzip"));
-            // The listener deliberately never sends an HTTP response.
-            in_tx
-                .send(WsInbound::Json(Box::new(Inbound::HostPing {
-                    request_id: "during-upload".into(),
-                })))
-                .await
-                .unwrap();
-            let pong = out_rx.recv().await.unwrap();
-            let value: serde_json::Value = serde_json::from_str(pong.as_str()).unwrap();
-            assert_eq!(value["type"], "host.pong");
-            assert_eq!(value["request_id"], "during-upload");
-            drop(in_tx);
-            drop(connection);
-        };
-        let (result, ()) = tokio::join!(dispatch, exercise);
-        result.unwrap();
+            let (input, mut rx) = mpsc::channel(4);
+            let (output, mut responses) = mpsc::channel(4);
+            let registry = SessionRegistry::new();
+            let rtc = RtcSessions::new();
+            let mut revoked = RevocationSet::new();
+            let dispatch = dispatch_loop(
+                &mut rx,
+                &registry,
+                &rtc,
+                &output,
+                &live,
+                &mut revoked,
+                Arc::new(StdMutex::new(None)),
+                HashSet::new(),
+                Some(&support),
+            );
+            let exercise = async {
+                input
+                    .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                        request_id: "test".into(),
+                    })))
+                    .await
+                    .unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                assert_eq!(value["type"], "host.pong");
+                drop(input);
+            };
+            let (result, ()) = tokio::join!(dispatch, exercise);
+            result.unwrap();
+            drop(release);
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_support_registration_installs_session_sinks_and_keeps_frame_order() {
+        crate::support::tests::bounded(async {
+            let (_, consent) = crate::support::tests::fixture();
+            let edge = CarriedEndorsement { account_id: consent.account_id.clone(), endorser_public_key: consent.signer_public_key.clone(), endorsed_public_key: consent.signer_public_key.clone(), endorsed_device_id: consent.signer_device_id.clone(), signature: consent.signature.clone() };
+            let mut over = consent.clone();
+            over.carried_endorsements = vec![edge; MAX_CARRIED_ENDORSEMENTS + 1];
+            let mut unknown = serde_json::to_value(&consent).unwrap();
+            unknown["unknown"] = serde_json::json!(true);
+            for extension in [serde_json::json!({}), serde_json::to_value(over).unwrap(), unknown, serde_json::json!(42)] {
+                let tmp = crate::support_log::capture::private_tempdir();
+                let (trust, _) = crate::support::tests::fixture();
+                let support = crate::support::tests::test_collector(tmp.path().to_owned(), trust, String::new()).await;
+                crate::support::tests::settled(&support).await;
+                let host = Uuid::from_bytes([3; 16]);
+                let record = credential_record(1, 1, "test-token", host, "https://example.invalid", 5, &[]);
+                let live = LiveCredentialSnapshot::initial(record, &url::Url::parse("https://example.invalid").unwrap()).unwrap();
+                let registry = SessionRegistry::new();
+                let control = pty::ForwarderControl::new();
+                let session = Uuid::from_bytes([4; 16]);
+                let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+                let (outbox_tx, _outbox_rx) = mpsc::channel(1);
+                registry.insert(pty::SessionHandle::new_worker(pty::WorkerHandleParts {
+                    session_id: session, cwd: tmp.path().to_string_lossy().into_owned(), cmd_tx,
+                    lifecycle: pty::SessionLifecycle::new(tmp.path().join("unused"), Uuid::new_v4()),
+                    alive: Arc::new(std::sync::atomic::AtomicBool::new(true)), cols: 80, rows: 24, outbox_tx, control: control.clone(),
+                }));
+                control.note_foreground(session, "test").await;
+                let rtc = RtcSessions::new();
+                let mut revoked = RevocationSet::new();
+                let (input, mut rx) = mpsc::channel(8);
+                let (output, mut responses) = mpsc::channel(8);
+                let registered = Arc::new(StdMutex::new(None));
+                let dispatch = dispatch_loop(&mut rx, &registry, &rtc, &output, &live, &mut revoked, Arc::clone(&registered), HashSet::new(), Some(&support));
+                let exercise = async {
+                    for frame in [
+                        serde_json::json!({"type":"host.ping", "request_id":"before"}),
+                        serde_json::json!({"type":"registered", "host_id":host, "support_log_consent":extension}),
+                        serde_json::json!({"type":"host.support_log_consent", "consent":{}}),
+                        serde_json::json!({"type":"support_log.collect", "request_id":null, "since_seconds":{}}),
+                        serde_json::json!({"type":"host.ping", "request_id":"after"}),
+                    ] {
+                        input.send(WsInbound::Json(Box::new(crate::proto::parse_inbound(&frame.to_string()).unwrap()))).await.unwrap();
+                    }
+                    let before: serde_json::Value = serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                    assert_eq!(before["request_id"], "before");
+                    let mut saw_foreground = false;
+                    let mut saw_after = false;
+                    for _ in 0..2 {
+                        let response: serde_json::Value = serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                        if response["type"] == "session.foreground" { saw_foreground = true; }
+                        else { assert_eq!(response["request_id"], "after"); saw_after = true; }
+                    }
+                    assert!(saw_foreground && saw_after);
+                    assert!(registered.lock().unwrap().is_some());
+                    drop(input);
+                };
+                let (result, ()) = tokio::join!(dispatch, exercise);
+                result.unwrap();
+            }
+        }).await;
     }
 
     #[test]
@@ -6817,7 +7032,7 @@ mod tests {
         let mut loader =
             CredentialLoader::start(Duration::from_millis(200), move || Ok(committed.clone()))
                 .expect("credential loader");
-        let admitted = credential_change_now_with(&active, &mut loader)
+        let admitted = credential_change_now_with(&active, &mut loader, None)
             .await
             .unwrap()
             .expect("pre-connect gate must observe committed generation");

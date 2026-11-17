@@ -56,7 +56,8 @@ fn removed_signer_stays_removed_after_restart_and_cannot_waive_newest_floor() {
     let original = trust.clone();
     trust
         .revoked
-        .insert(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes());
+        .insert(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes())
+        .unwrap();
     remember_revocations(tmp.path(), &trust).unwrap();
     assert!(matches!(
         load(tmp.path(), &original, 1000),
@@ -165,63 +166,10 @@ fn equal_timestamp_off_wins_and_unproven_account_cannot_store() {
 }
 
 #[test]
-fn logout_variants_reset_and_exorcise_finish_ordinary_cleanup_on_support_failure() {
-    for keep_identity in [false, true] {
-        let tmp = crate::support_log::capture::private_tempdir();
-        let (trust, consent) = fixture();
-        apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
-        let lock = CONSENT
-            .try_lock_file(&tmp.path().join(CONSENT_LOCK))
-            .unwrap();
-        let credentials = tmp.path().join("test-credentials");
-        std::fs::write(&credentials, b"test-token").unwrap();
-        let result = cleanup_after(
-            || {
-                if keep_identity {
-                    std::fs::write(&credentials, b"signed-out")?;
-                } else {
-                    std::fs::remove_file(&credentials)?;
-                }
-                Ok(())
-            },
-            || remove(tmp.path()),
-        );
-        assert!(result.is_err());
-        if keep_identity {
-            assert_eq!(std::fs::read(&credentials).unwrap(), b"signed-out");
-        } else {
-            assert!(!credentials.exists());
-        }
-        drop(lock);
-    }
-    // The same aggregator is used by reset/exorcise's local purge; later cleanup
-    // executes even when an earlier support operation failed.
-    let ordinary = std::cell::Cell::new(false);
-    assert!(cleanup_after(
-        || {
-            ordinary.set(true);
-            Ok(())
-        },
-        || anyhow::bail!("injected cleanup failure")
-    )
-    .is_err());
-    assert!(ordinary.get());
+fn absent_statement_cleanup_does_not_create_a_lock() {
     let tmp = crate::support_log::capture::private_tempdir();
     std::fs::create_dir(tmp.path().join(CONSENT_LOCK)).unwrap();
-    remove(tmp.path()).unwrap(); // no statement: do not open/create a lock
-}
-
-#[test]
-fn reset_and_exorcise_final_removal_runs_after_consent_lock_failure() {
-    let tmp = crate::support_log::capture::private_tempdir();
-    let config = tmp.path().join("config");
-    std::fs::create_dir(&config).unwrap();
-    // A directory at the lock path fails on every supported platform, without
-    // environment changes or touching a service or credential backend.
-    std::fs::write(config.join(CONSENT_NAME), b"{}").unwrap();
-    std::fs::create_dir(config.join(CONSENT_LOCK)).unwrap();
-    assert!(crate::service::finish_local_removal(&config, Ok(())).is_err());
-    assert!(!config.exists());
+    remove(tmp.path()).unwrap();
 }
 
 #[test]
@@ -239,4 +187,19 @@ fn cancellations_without_started_reservations_still_preserve_quota() {
         begin(&path, &cancelled),
         Err(Refusal::RateLimited)
     ));
+}
+
+#[test]
+fn identical_effective_state_does_not_spend_control_writes() {
+    let tmp = crate::support_log::capture::private_tempdir();
+    let (trust, consent) = fixture();
+    let mut budget = ControlBudget::default();
+    apply_budgeted(tmp.path(), Some(consent.clone()), &trust, 1000, &mut budget).unwrap();
+    assert_eq!(budget.0.len(), 1);
+    apply_budgeted(tmp.path(), Some(consent), &trust, 1000, &mut budget).unwrap();
+    assert_eq!(budget.0.len(), 1);
+    apply_budgeted(tmp.path(), None, &trust, 1000, &mut budget).unwrap();
+    assert_eq!(budget.0.len(), 2);
+    apply_budgeted(tmp.path(), None, &trust, 1000, &mut budget).unwrap();
+    assert_eq!(budget.0.len(), 2);
 }

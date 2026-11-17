@@ -237,17 +237,20 @@ future bound. Consent has no expiry. Null disables; an identical current valid
 statement can clear server-off.
 
 One optional actor owns sharing for the whole process, across reconnects.
-Every delivered consent/trust/reload-start/teardown/shutdown input advances one
-generation and cancels existing work before enqueueing. Only the actor can
-authorize, from reverified disk before preparation and sending, when its applied
+Every delivered consent/trust/failed-reload/teardown/shutdown input advances one
+generation and cancels existing work before enqueueing. An unchanged credential
+poll is not an input. The actor authorizes through its dedicated worker from
+reverified disk before preparation and sending, when its applied
 generation equals delivered. “Pending updates block” means a delivered input
 has not successfully applied; a late older apply cannot clear that block. Failed
 inputs stay pending with bounded lock waits and retry backoff. A later verified
 consent that outranks a failed consent may supersede it; unrelated trust never
 does. Inbox/retry queues have 32 slots each; overflow permanently denies this
 process without ending control service. Support revocations cap at 256 then
-deny permanently. The shared connection revocation accumulator caps at 4096,
-then denies all identities, rather than forgetting earlier removals.
+deny support permanently; connection revocations keep master's uncapped behavior.
+Unchanged effective consent state is not persisted. At most 30 state-changing
+consent write attempts per ten minutes are allowed; exhaustion denies support
+until restart. Pending inputs that cannot be superseded may also need restart.
 
 If off cannot be written, unlinking stored on is attempted without allocation.
 Off remains pending; failed unlink or sync permanently denies for this process.
@@ -264,22 +267,30 @@ receipts or POSTs. Admitted collection has one 30-second deadline including
 audit (two seconds reserved for final audit), a five-second connect and
 15-second HTTP timeout. One flight, durable limits of one bundle per five
 minutes/twelve per day (refusals count), a 60-second to 72-hour window, 1 MiB raw
-and 900 KiB gzip cap bound disclosure. Filesystem/compression work runs on blocking
-workers. HTTPS uses the configured origin and path prefix, the daemon token,
+and 900 KiB gzip cap bound disclosure. All support filesystem/compression work
+runs serially on one bounded, dedicated thread. Its owner retains unfinished
+jobs after deadlines; overdue work denies admission, shown in status. Jobs are
+never enqueued after their deadline. A stalled thread cannot hold daemon shutdown. HTTPS uses the configured origin and path prefix, the daemon token,
 no redirects/retries, and only 2xx succeeds. Body provenance is guarded by typed
 construction, source markers and canaries; the guard is not a proof.
 
-Later inputs discard snapshot results and drop the HTTP future even during
-connect/TLS. Each bounded stream chunk checks its generation before release;
-no further chunk is released after the change. Bytes already handed to the
-transport, including bytes already written to the socket, cannot be recalled.
-The host cannot erase what the server already received. Blocking filesystem
-calls may finish after the deadline, but cannot resume a cancelled upload.
-Cancellation attempts a typed `cancelled` local receipt within that deadline.
+A collection may begin sending only if, immediately before the request is
+started, the statement stored on this host is valid, enabled, not switched off,
+and its signer is still admitted, as read from disk by this process. A change
+this process receives before the request has been started prevents it. Once the
+request has been started it is abandoned on a best-effort basis when a later
+change arrives, but its body (one bundle, at most 900 KiB) may still be delivered,
+and it ends within the 15-second request timeout in any case. A change written
+by another process of the same instance is seen at the next authorisation read.
+Cancellation attempts a typed `cancelled` receipt and never promises that no
+bytes were sent. The server can ask before relaying off; transport buffering
+cannot strengthen that ordering guarantee.
 
-Collector startup failure leaves normal daemon service working. Logout (both
-variants), reset and exorcise finish their ordinary cleanup even if support
-cleanup fails, reporting errors afterward. Status explains unavailable account
+Collector startup failure or a two-second I/O timeout leaves normal daemon
+service working. Logout (both variants), reset and exorcise retain master's
+ordinary error behavior and cleanup order; support failure adds a warning only.
+Without a proven account no consent statement is stored or honoured; lock,
+receipt and revocation files may still exist. Status explains unavailable account
 proof, pending/permanent deny and admission drops using the normal heartbeat
 (up to 30 seconds old; storage failure may prevent reporting), alongside bounded
 local receipts. No receipt proves server retention. A dishonest server can

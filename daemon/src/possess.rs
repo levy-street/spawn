@@ -694,10 +694,11 @@ async fn exorcise_one(explicit: Option<&Url>, dir: &Path) {
         tracing::warn!(%error, "removing the background service");
     }
     forget_release_selection(dir);
-    let credentials = creds::logout().await;
-    if let Err(error) = service::finish_local_removal(dir, credentials) {
+    let _ = creds::logout().await;
+    if let Err(error) = service::purge_local_instance_data(dir) {
         tracing::warn!(%error, "removing local SPAWN D runtime state");
     }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Drop the instance's pointer into the release store and collect releases

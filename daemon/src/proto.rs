@@ -32,10 +32,111 @@ where
 
 use spawnd::endorsement_chain::deserialize_bounded_carried_endorsements;
 
-fn deserialize_present_consent<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Option<spawnd::support_consent::Consent>>, D::Error> {
-    Option::deserialize(deserializer).map(Some)
+/// Parsed independently from ordinary registration. Invalid support data is
+/// support-only denial; it must never discard a valid ordinary frame.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ConsentInput {
+    #[default]
+    Absent,
+    Null,
+    Valid(spawnd::support_consent::Consent),
+    Invalid,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SupportUpdate {
+    #[serde(default)]
+    pub browser_device_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub revoked_browser_keys: Option<Vec<String>>,
+    #[serde(skip)]
+    pub consent: ConsentInput,
+}
+
+pub(crate) fn parse_inbound(text: &str) -> Result<Inbound, serde_json::Error> {
+    use serde_json::value::RawValue;
+    #[derive(Default)]
+    struct Extension<'a> {
+        kind: String,
+        support_log_consent: Option<&'a RawValue>,
+        consent: Option<&'a RawValue>,
+        duplicate_consent: bool,
+    }
+    impl<'de> Deserialize<'de> for Extension<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Fields;
+            impl<'de> serde::de::Visitor<'de> for Fields {
+                type Value = Extension<'de>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a daemon frame")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut result = Extension::default();
+                    while let Some(key) = map.next_key::<String>()? {
+                        match key.as_str() {
+                            "type" => result.kind = map.next_value()?,
+                            "support_log_consent" => {
+                                let raw = map.next_value()?;
+                                result.duplicate_consent |=
+                                    result.support_log_consent.replace(raw).is_some();
+                            }
+                            "consent" => {
+                                let raw = map.next_value()?;
+                                result.duplicate_consent |= result.consent.replace(raw).is_some();
+                            }
+                            _ => {
+                                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                            }
+                        }
+                    }
+                    Ok(result)
+                }
+            }
+            d.deserialize_map(Fields)
+        }
+    }
+    let extension: Extension<'_> = serde_json::from_str(text)?;
+    let mut frame: Inbound = match serde_json::from_str(text) {
+        Ok(frame) => frame,
+        Err(_)
+            if matches!(
+                extension.kind.as_str(),
+                "host.support_log_consent" | "support_log.collect"
+            ) =>
+        {
+            return Ok(Inbound::InvalidSupport)
+        }
+        Err(error) => return Err(error),
+    };
+    let raw = match extension.kind.as_str() {
+        "registered" => extension.support_log_consent,
+        "host.support_log_consent" => extension.consent,
+        _ => return Ok(frame),
+    };
+    let consent = match raw {
+        _ if extension.duplicate_consent => ConsentInput::Invalid,
+        Some(raw) if raw.get().len() > 64 * 1024 => ConsentInput::Invalid,
+        None if extension.kind == "registered" => ConsentInput::Absent,
+        None => ConsentInput::Invalid,
+        Some(raw) if raw.get() == "null" => ConsentInput::Null,
+        // The frame reader already bounds wire bytes. Parsing this raw slice
+        // separately preserves Consent's bounded list and unknown-field checks.
+        Some(raw) => match serde_json::from_str(raw.get()) {
+            Ok(consent) => ConsentInput::Valid(consent),
+            Err(_) => ConsentInput::Invalid,
+        },
+    };
+    match &mut frame {
+        Inbound::Registered { support, .. } | Inbound::HostSupportLogConsent { support } => {
+            std::sync::Arc::get_mut(support)
+                .expect("newly parsed support input")
+                .consent = consent;
+        }
+        _ => {}
+    }
+    Ok(frame)
 }
 
 /// The most agents one `host.agents.check` may name. The server sends every
@@ -317,12 +418,8 @@ pub struct DaemonUpdateArtifact {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "deserialize_present_consent"
-        )]
-        support_log_consent: Option<Option<spawnd::support_consent::Consent>>,
+        #[serde(flatten)]
+        support: std::sync::Arc<SupportUpdate>,
         host_id: Uuid,
         /// Optional daemon-token rotation. Old servers omit it.
         #[serde(default)]
@@ -336,22 +433,14 @@ pub enum Inbound {
         /// server that predates them; adoption simply does not happen.
         #[serde(default)]
         browser_pins: Option<Vec<InboundBrowserPin>>,
-        // None means the server never sent the field, which is not the same as
-        // an empty set: a server that cannot report its pins must not cause
-        // every local pin to be dropped.
-        #[serde(default)]
-        browser_device_ids: Option<Vec<String>>,
-        /// Account deny-list (device mesh §3): wire keys of revoked devices this
-        /// host must subtract from acceptance, so a revoked device cannot connect
-        /// even through a chain to an anchor. Server-delivered, add-only for the
-        /// owner, subtract-only here; a wrong value can only DENY, never grant.
-        #[serde(default)]
-        revoked_browser_keys: Option<Vec<String>>,
     },
     #[serde(rename = "host.support_log_consent")]
     HostSupportLogConsent {
-        consent: Option<spawnd::support_consent::Consent>,
+        #[serde(skip)]
+        support: std::sync::Arc<SupportUpdate>,
     },
+    #[serde(skip)]
+    InvalidSupport,
     #[serde(rename = "support_log.collect")]
     SupportLogCollect {
         request_id: Uuid,
@@ -365,10 +454,8 @@ pub enum Inbound {
         account_id: Option<String>,
         #[serde(default)]
         browser_pins: Option<Vec<InboundBrowserPin>>,
-        #[serde(default)]
-        browser_device_ids: Option<Vec<String>>,
-        #[serde(default)]
-        revoked_browser_keys: Option<Vec<String>>,
+        #[serde(flatten)]
+        support: std::sync::Arc<SupportUpdate>,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
@@ -1322,47 +1409,54 @@ mod device_poll_tests {
         }
     }
     #[test]
-    fn support_frames_preserve_absent_null_and_reject_non_uuid_paths() {
+    fn support_extensions_preserve_registration_and_bound_consent() {
         let host = Uuid::from_bytes([1; 16]);
-        let absent: Inbound =
-            serde_json::from_value(serde_json::json!({"type":"registered","host_id":host}))
-                .unwrap();
-        assert!(matches!(
-            absent,
-            Inbound::Registered {
-                support_log_consent: None,
-                ..
+        for (value, expected) in [
+            (None, "absent"),
+            (Some(serde_json::Value::Null), "null"),
+            (Some(serde_json::json!({})), "invalid"),
+            (Some(serde_json::json!(42)), "invalid"),
+        ] {
+            let mut wire = serde_json::json!({"type":"registered", "host_id":host});
+            if let Some(value) = value {
+                wire["support_log_consent"] = value;
             }
-        ));
-        let null: Inbound = serde_json::from_value(
-            serde_json::json!({"type":"registered","host_id":host,"support_log_consent":null}),
-        )
-        .unwrap();
+            let Inbound::Registered {
+                support, host_id, ..
+            } = parse_inbound(&wire.to_string()).unwrap()
+            else {
+                panic!("registration discarded")
+            };
+            assert_eq!(host_id, host);
+            assert_eq!(
+                match support.consent {
+                    ConsentInput::Absent => "absent",
+                    ConsentInput::Null => "null",
+                    ConsentInput::Invalid => "invalid",
+                    _ => "valid",
+                },
+                expected
+            );
+        }
+        assert!(
+            matches!(parse_inbound(r#"{"type":"host.support_log_consent","consent":null}"#).unwrap(), Inbound::HostSupportLogConsent { support } if matches!(support.consent, ConsentInput::Null))
+        );
         assert!(matches!(
-            null,
-            Inbound::Registered {
-                support_log_consent: Some(None),
-                ..
-            }
-        ));
-        assert!(matches!(
-            serde_json::from_str::<Inbound>(
-                r#"{"type":"host.support_log_consent","consent":null}"#
+            parse_inbound(
+                r#"{"type":"support_log.collect","request_id":"../escape","since_seconds":60}"#
             )
             .unwrap(),
-            Inbound::HostSupportLogConsent { consent: None }
+            Inbound::InvalidSupport
         ));
-        assert!(serde_json::from_value::<Inbound>(serde_json::json!({"type":"support_log.collect","request_id":"../escape","since_seconds":60})).is_err());
-        let collect = serde_json::from_value::<Inbound>(
-            serde_json::json!({"type":"support_log.collect","request_id":host,"since_seconds":60}),
-        )
-        .unwrap();
-        assert!(matches!(
-            collect,
-            Inbound::SupportLogCollect {
-                since_seconds: 60,
-                ..
-            }
-        ));
+    }
+    #[test]
+    fn duplicate_support_extension_does_not_discard_registration() {
+        let wire = format!(
+            r#"{{"type":"registered","host_id":"{}","support_log_consent":null,"support_log_consent":{{}}}}"#,
+            Uuid::from_bytes([1; 16])
+        );
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Invalid))
+        );
     }
 }

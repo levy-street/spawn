@@ -135,44 +135,31 @@ pub fn instance_log_dir(config_dir: &Path) -> Result<PathBuf> {
 /// support log on every platform. Ordinary disconnect never calls this;
 /// exorcise/reset do so after manager/workers.
 pub fn purge_local_instance_data(config_dir: &Path) -> Result<()> {
-    // On Windows the whole log directory goes below as well; elsewhere the
-    // support folder is the one thing spawnd writes under it.
+    let support_config = config_dir.to_owned();
     crate::support_store::cleanup_after(
-        || {
-            crate::support_log::remove(config_dir)?;
-            #[cfg(windows)]
-            {
-                for path in [
-                    instance_state_path(config_dir)?,
-                    instance_log_path(config_dir)?,
-                ] {
-                    if let Err(error) = std::fs::remove_dir_all(&path) {
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            return Err(error)
-                                .with_context(|| format!("removing {}", path.display()));
-                        }
-                    }
-                }
-            }
-            Ok(())
-        },
-        || crate::support_store::remove(config_dir),
+        || purge_runtime_data(config_dir),
+        move || crate::support_store::remove(&support_config),
     )
 }
 
-/// Reset and exorcise share the final local cleanup. Every step runs even if
-/// consent cleanup failed; errors are reported only after directory removal.
-pub(crate) fn finish_local_removal(config_dir: &Path, credentials: Result<()>) -> Result<()> {
-    let support = purge_local_instance_data(config_dir);
-    let directory = match std::fs::remove_dir_all(config_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    };
-    crate::support_store::cleanup_after(
-        || crate::support_store::cleanup_after(|| credentials, || directory),
-        || support,
-    )
+fn purge_runtime_data(config_dir: &Path) -> Result<()> {
+    // On Windows the whole log directory goes below as well; elsewhere the
+    // support folder is the one thing spawnd writes under it.
+    crate::support_log::remove(config_dir)?;
+    #[cfg(windows)]
+    {
+        for path in [
+            instance_state_path(config_dir)?,
+            instance_log_path(config_dir)?,
+        ] {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A conservative PATH so agent CLIs the daemon launches remain resolvable when

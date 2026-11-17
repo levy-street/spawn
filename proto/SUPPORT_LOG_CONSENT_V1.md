@@ -22,7 +22,8 @@ The JSON envelope has exactly `version:1`, `account_id`, `signer_public_key`,
 `signature`, and optional `carried_endorsements` (default empty). UUIDs must
 be canonical lower-case hyphenated strings. Public identities and signatures
 use canonical unpadded base64url (32 and 64 decoded bytes respectively).
-Unknown fields and noncanonical encodings fail closed. A present carried set
+Envelopes over 64 KiB, unknown fields and noncanonical encodings fail closed
+for support only. A present carried set
 must be an array, at most 64 entries, using the existing RTC carried-approval
 schema and its bounded deserializer. Approvals are not part of the signed
 102 bytes: each approval has its own account-bound signature.
@@ -32,26 +33,29 @@ must be **locally proven by this host's retained device approvals**
 (`StoredCreds::proven_account_id`), never the account named by the server.
 Without that proof, no statement is stored or honoured and collection refuses
 with `not_consented`; status explains that a device approval is needed. This
-restriction does not change legacy connection admission.
+restriction does not change legacy connection admission. Lock, receipt and
+revocation files may still be written; no consent statement or bundle is written
+for sharing without proven account authority.
 
-Strict Ed25519 verification proves possession; `run::admitted_device`, shared
-with signed RTC offers, proves trust: a direct pin or an unrevoked carried chain
+Strict Ed25519 verification proves possession; `run::admitted_device` follows
+the unchanged signed-RTC admission rule to prove trust: a direct pin or an unrevoked carried chain
 to a pin for that account. `signer_device_id` must match the directly pinned
 identity's device ID, or the device ID on the verified final approval reaching
 the signer. A mismatched attribution is `signer_untrusted`. Connections retain
 their existing direct-pin-before-chain-cap order and refusal diagnostics.
 
 Newest `issued_at_ms` wins. At equal time, off beats on; otherwise the stored
-statement stays. An identical statement may refresh its carried path and clear
-`server_off`, after verification. A signer must use
+statement stays. An identical statement may clear `server_off` after verification. If the signed
+statement and `server_off` would stay the same, persistence is skipped. A signer must use
 `max(now, current issued_at_ms + 1)` and must handle overflow as a failure.
 Statements more than 86,400,000 ms in the future are refused; there is no expiry.
 Removing a signer does not erase the timestamp floor.
 
 The owner-only atomic `support-log-consent.json` contains the statement,
 server-off flag and subtract-only revocations. Logout (both variants), reset and
-exorcise attempt its removal after ordinary cleanup, and report support failures
-without preventing credential removal or the remaining cleanup. When no
+exorcise attempt its removal after the existing credential/runtime operations.
+Support failure adds a warning only. Ordinary errors retain master's return,
+message and short-circuit behavior, including stopping before later instances. When no
 statement exists, cleanup does not create a lock file.
 
 ## Delivery, ordering, and restart
@@ -63,26 +67,33 @@ statement exists, cleanup does not create a lock file.
   or null.
 - `{"type":"support_log.collect","request_id":"<uuid>","since_seconds":N}`
   requests collection. UUID parsing and signed-integer parsing happen before
-  dispatch. Invalid values are malformed frames; N is clamped to 60–259200.
+  dispatch. N is clamped to 60–259200. Malformed support extensions and frames deny support
+  only. Registration parses its ordinary fields independently, including for a
+  wrong type, unknown consent field or over-cap carried list.
 
 One optional actor is created at daemon startup and survives all control
 reconnects. Unavailable storage leaves it absent: collections receive no answer;
 startup, registration, sessions and cleanup otherwise proceed normally.
-Consent (including null), trust changes, credential reload starting, teardown,
-and shutdown advance one delivered generation synchronously and wake all upload
-cancellation before their bounded, nonwaiting enqueue. Trust inputs share
+Consent (including null), actual credential/trust changes, failed or timed-out
+credential loads, teardown and shutdown advance one delivered generation before
+their bounded, nonwaiting enqueue. Unchanged credential polls are not inputs and
+do not cancel collections or charge quota. One notification wakes the single
+collection waiter; dispatch delivery only clones the already shared input. Trust inputs share
 immutable pin/account/token projections, not whole credential records.
 
-The actor applies inputs in arrival order. Only it authorizes, rereading and
-reverifying disk before preparation and again before sending. Allowed requires
+The actor applies inputs in arrival order. Its dedicated worker rereads and reverifies disk before preparation and again
+as the last operation before the request is created. Allowed requires
 its applied generation to equal delivered for the collection's stop token.
 An old operation can record only its own generation, so finishing after a newer
 delivery cannot grant that newer generation. A failed input stays pending and
 denies; retries wait for the consent lock up to 40 ms per attempt, with actor
-backoff from 10 ms to one second. Later trust never clears a failed consent.
+backoff from 10 ms to one second. These are minimum retry intervals even when
+other inputs arrive. Later trust never clears a failed consent.
 A later verified consent that outranks the pending one may supersede it; queued
 inputs still apply in order and collection stays blocked until the replacement
-is applied. The inbox and retry backlog each have at most 32 entries. Overflow
+is applied. Replacement checks use the current trust; a queued new signer or
+an invalid pending timestamp can prevent replacement until restart. Status says
+that restart may be required. The inbox and retry backlog each have at most 32 entries. Overflow
 permanently denies this process, without closing the control connection.
 
 If off cannot be persisted, the actor attempts an allocation-free unlink of the
@@ -90,9 +101,11 @@ stored statement, retains the pending off, and continues denying. Failed unlink
 or directory sync permanently denies this process. This condition and admission
 drop counts appear in status via the daemon heartbeat (up to its 30-second
 refresh interval; unavailable storage can prevent reporting). Support revocations
-are capped at 256; exceeding that permanently denies support. The shared
-connection revocation set caps at 4096 and then conservatively revokes all
-identities for that process; it never forgets a revocation to make room.
+are accumulated separately, capped at 256 distinct keys; the next distinct key
+permanently denies support alone. Connection admission retains master's uncapped
+revocation set. Consent has its own process-wide budget: at most 30 state-changing
+write attempts per rolling ten minutes. Exhaustion permanently denies support
+until restart, rather than discarding an input and continuing to share.
 
 Successful persistence survives restart; in-memory pending work, overflow deny,
 and the admission bucket do not. A fallback unlink also loses timestamp and
@@ -102,12 +115,18 @@ A dishonest server could already withhold a turn-off; after state loss it can
 also replay an old valid on. This is a residual, not restart durability for a
 failed write. Direct device delivery of withdrawal is not implemented here.
 
-Every later input cancels running collections: pending snapshot results are
-discarded, the HTTP future is dropped even during connect/TLS, and the gzip
-stream checks its generation before yielding each chunk (at most 4096 bytes).
-No further chunk is released after invalidation. Bytes already released to the
-transport, including bytes written to the socket, cannot be recalled; the host
-cannot erase bytes already received by the server.
+A collection may begin sending only if, immediately before the request is
+started, the statement stored on this host is valid, enabled, not switched off,
+and its signer is still admitted, as read from disk by this process. A change
+this process receives before the request has been started prevents it. Once the
+request has been started it is abandoned on a best-effort basis when a later
+change arrives, but its body (one bundle, at most 900 KiB) may still be delivered,
+and it ends within the 15-second request timeout in any case. A change written
+by another process of the same instance is seen at the next authorisation read.
+
+The server relays withdrawal and can request a bundle before delivering off.
+Dropping a future cannot recall transport buffers or bytes already received.
+Cancellation records `cancelled`, which makes no claim that nothing was sent.
 
 ## HTTP collection contract
 
@@ -125,9 +144,15 @@ retained across reconnects. Excess frames are counted and dropped before file
 work: no receipt and no POST. Admitted requests have one 30-second absolute
 deadline including queueing and audit; upload work gets 28 seconds, reserving two
 for terminal audit. Connect timeout is five seconds, HTTP timeout fifteen.
-Blocking filesystem calls may outlive a deadline but cannot resume an upload.
-Only one collection can hold the cross-process flight lock, including unfinished
-blocking preparation. Durable receipt limits are one collection per five
+All collection filesystem work uses one bounded dedicated support worker
+thread: startup directory preparation, consent load/apply, snapshots/state, rate
+accounting and receipts, including terminal audit. Its pending job stays owned
+after caller cancellation/deadline. An overdue job denies new collection
+admission, shown in status. No job is enqueued after its deadline. The thread is
+never joined at shutdown, and stalled startup returns collector unavailable
+after two seconds. Individual I/O waits get at most two seconds (terminal audit
+uses the remaining absolute deadline). One collection at a time is admitted in
+this process, and the cross-process flight lock also covers unfinished snapshots. Durable receipt limits are one collection per five
 minutes and twelve per rolling day; refusals are charged and never refund quota.
 
 The body is either `application/gzip` of at most **921600 bytes**, with
@@ -142,8 +167,9 @@ The body is either `application/gzip` of at most **921600 bytes**, with
 | `no_log` | No active writer or no eligible complete records |
 | `failed` | Storage, snapshot, compression or preparation failure |
 
-A cancellation attempts a typed local `cancelled` receipt and sends no new
-refusal. Destination, audit, deadline or transport failure may leave no response.
+A request dropped before a response attempts a typed local `cancelled` receipt
+and sends no new refusal; its body may still be delivered. Pending/permanent
+denial, an overdue worker or another collection in flight causes no POST. Destination, audit, deadline or transport failure may leave no response.
 Only **2xx** is success (204 is sufficient); 3xx, 4xx and 5xx are upload failures,
 with no following or retry. Servers should use 400 for malformed bodies/headers,
 401/403 for authentication/authorization failures, 404/409 for unknown or closed
@@ -163,7 +189,8 @@ All gzip headers below are required; JSON refusals omit them:
 
 ## Snapshot and bundle
 
-All flush, copy, parse, state projection and gzip work runs on `spawn_blocking`.
+All flush, copy, parse, state projection and gzip work runs on the dedicated
+support I/O worker.
 The process's writer has 500 ms to flush. A flush failure refuses collection.
 The reader takes the cross-process rotation lock without waiting and copies
 only `support-v3.jsonl.1` and `support-v3.jsonl`, each at most 4 MiB. It closes
@@ -222,6 +249,31 @@ records even with completion records, so refusal floods cannot erase quota.
 `spawnd status` reports sharing, approving device/time, server-off and five recent
 receipts. These local records do not promise that a server stored an upload.
 
+## Requirements on the server and the apps
+
+Before the server half or either app ships:
+
+- Durable owner withdrawal is a signed `enabled:false` statement, not null.
+  Null is reversible by redelivery of the identical valid enabled statement.
+  Distinguish withdrawal requested from confirmation that a host applied it.
+- Persist and redeliver the current statement in `registered` before any
+  collection, including after restart. Capability is not current availability.
+- Attribute the statement to the verified device and use
+  `max(now, current issued_at_ms + 1)`. Handle overflow, clock disagreement and
+  the host's 24-hour future bound without showing false success. Off wins ties.
+  Missing local account proof stays unavailable.
+- Authenticate the bearer token as the host, bind the request ID to that host,
+  validate gzip/header limits and typed refusals, and treat only 2xx as success.
+- Expect no POST for excess/admission-dropped requests, unavailable collectors,
+  pending/permanent denial, overdue I/O, another in-flight collection,
+  cancellation, and some destination/audit/deadline/transport failures. Do not
+  interpret silence as either success or proof that no bytes arrived.
+- Disclose the restart residual: pending/permanent process denial is lost at
+  restart. Successful fallback unlink loses the timestamp/revocation floor and
+  permits replay of older valid on; failed unlink can leave the original on.
+  Honest redelivery does not prove durable withdrawal against an untrusted
+  server. A stronger promise needs additional design.
+
 ## Golden vectors and regression gates
 
 `support-log-consent-v1-vectors.json` contains synthetic on/off statements,
@@ -242,7 +294,7 @@ terminal canary remains Unix-only and now inspects the real compressed bundle
 builder, after decompression, in plain, hex, base64 and decimal-byte forms.
 
 The source guard pins the typed refusal enum, the two body call sites, reader
-construction and reviewed stream/upload source markers. Its mutations cover
+construction and reviewed upload source markers. Its mutations cover
 extra `.json`/`.body` sources, body shadowing and a helper returning other bytes.
 It is a source-marker regression check, not a proof of data provenance. Review
 of the surrounding code and decompressed-bundle canaries remain necessary.

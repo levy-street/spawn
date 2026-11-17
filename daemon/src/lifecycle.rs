@@ -54,28 +54,18 @@ pub fn disconnect(explicit_config: bool) -> Result<()> {
 }
 
 pub async fn logout(args: LogoutArgs, explicit_config: bool) -> Result<()> {
-    let mut failures = Vec::new();
     for dir in selected_dirs(explicit_config)? {
         let _guard = ConfigDirGuard::set(&dir);
         crate::service::uninstall(&dir)?;
-        let result = if args.wipe_identity {
-            crate::creds::logout().await
-        } else {
-            crate::creds::logout_keep_identity()
-        };
-        if let Err(error) = result {
-            // A support cleanup failure must not leave later instances signed in.
-            failures.push(format!("{error:#}"));
-            continue;
-        }
         if args.wipe_identity {
+            crate::creds::logout().await?;
             println!("spawn: signed out and removed this machine's local identity.");
         } else {
+            crate::creds::logout_keep_identity()?;
             println!("spawn: signed out. This machine's identity and approvals were kept.");
             println!("spawn: sign in again with: spawnd login");
         }
     }
-    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -136,17 +126,18 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
     }
     println!("spawn: terminated {terminated} session worker(s).");
 
-    let mut failures = Vec::new();
     for dir in dirs {
         let _guard = ConfigDirGuard::set(&dir);
         let _ = crate::service::uninstall(&dir);
         crate::possess::forget_release_selection(&dir);
-        let credentials = crate::creds::reset_local_credentials().map(|_| ());
-        if let Err(error) = crate::service::finish_local_removal(&dir, credentials) {
-            failures.push(format!("{error:#}"));
+        crate::creds::reset_local_credentials()?;
+        crate::service::purge_local_instance_data(&dir)?;
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("removing {}", dir.display()));
+            }
         }
     }
-    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     println!("spawn: This machine is clean. The old entry may still show under Hosts on the web — remove it there.");
     println!("spawn: To set up again: spawnd possess.");
     Ok(())
@@ -216,5 +207,120 @@ mod tests {
             instance_name(Path::new("/tmp/spawn/account-1")),
             "account-1"
         );
+    }
+    #[tokio::test]
+    async fn support_cleanup_failures_preserve_real_logout_and_reset_commands() {
+        crate::support::tests::bounded(async {
+            for action in [
+                "keep",
+                "wipe",
+                "reset",
+                "keep-error",
+                "wipe-error",
+                "reset-error",
+            ] {
+                let tmp = crate::support_log::capture::private_tempdir();
+                let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "lifecycle::tests::support_cleanup_command_child",
+                        "--nocapture",
+                    ])
+                    .env("SPAWN_TEST_SUPPORT_CLEANUP", action)
+                    .env("SPAWN_CONFIG_DIR", tmp.path().join("config"))
+                    .env("SPAWN_INSTALL_ROOT", tmp.path().join("install"))
+                    .env("XDG_CONFIG_HOME", tmp.path().join("settings"))
+                    .env("XDG_STATE_HOME", tmp.path().join("state"))
+                    .env("LOCALAPPDATA", tmp.path().join("local"))
+                    .env("SPAWND_NO_SERVICE", "1")
+                    .env("SPAWN_DISABLE_KEYRING", "1")
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("support sharing cleanup failed"));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !action.ends_with("error") {
+                    assert!(stdout.contains(match action {
+                        "keep" => "signed out. This machine's identity and approvals were kept.",
+                        "wipe" => "signed out and removed this machine's local identity.",
+                        _ => "This machine is clean.",
+                    }));
+                } else {
+                    assert!(
+                        !stdout.contains("signed out.")
+                            && !stdout.contains("This machine is clean.")
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn support_cleanup_command_child() {
+        let Ok(action) = std::env::var("SPAWN_TEST_SUPPORT_CLEANUP") else {
+            return;
+        };
+        // This child owns its entire process environment. The real command and
+        // complete-file credential paths run; native keyring calls use its mock
+        // provider, and the existing service-disable flag prevents OS effects.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let config = crate::config::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let mut record = crate::creds::StoredCreds::default();
+        let revision = crate::creds::credential_revision(&record).unwrap();
+        record.access_token = Some("test-token".into());
+        record.host_private_key_seed = Some(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [5; 32],
+        ));
+        crate::creds::save(&mut record, &revision).unwrap();
+        let identity = crate::creds::host_identity(&record).unwrap();
+        std::fs::write(config.join("support-log-consent.json"), b"{}").unwrap();
+        std::fs::create_dir(config.join("support-log-consent.lock")).unwrap();
+        let credential_error = action.ends_with("error");
+        let credential_path = crate::config::credentials_path().unwrap();
+        if credential_error {
+            std::fs::remove_file(&credential_path).unwrap();
+            std::fs::create_dir(&credential_path).unwrap();
+        }
+        let result = if action.starts_with("reset") {
+            reset(ResetArgs { yes: true }, true).await
+        } else {
+            logout(
+                LogoutArgs {
+                    wipe_identity: action.starts_with("wipe"),
+                },
+                true,
+            )
+            .await
+        };
+        assert_eq!(result.is_err(), credential_error);
+        if credential_error {
+            // Master stops on an ordinary credential error, preserving the
+            // directory and subsequent cleanup steps for explicit recovery.
+            assert!(config.exists());
+            assert!(credential_path.is_dir());
+        } else if action == "keep" {
+            let stored = crate::creds::load().unwrap();
+            assert!(stored.access_token.is_none());
+            assert_eq!(
+                crate::creds::host_identity(&stored)
+                    .unwrap()
+                    .map(|v| v.public_key),
+                identity.map(|v| v.public_key)
+            );
+        } else if action == "wipe" {
+            assert!(!credential_path.exists());
+        } else {
+            assert!(!config.exists());
+        }
     }
 }

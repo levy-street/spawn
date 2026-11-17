@@ -45,7 +45,7 @@ CONTENT_MODULES=(
   daemon/src/sessiond/emulator.rs
   daemon/src/sessiond/scrollback.rs
 )
-COLLECTION_MODULES=(daemon/src/support.rs daemon/src/support_store.rs daemon/src/support_consent.rs)
+COLLECTION_MODULES=(daemon/src/support.rs daemon/src/support_store.rs daemon/src/support_consent.rs daemon/src/support_io.rs)
 
 fail() {
   printf 'support-log: %s\n' "$1" >&2
@@ -307,7 +307,8 @@ upload = Path("daemon/src/support.rs").read_text()
 upload_compact = re.sub(r"\s+", "", upload)
 storage = Path("daemon/src/support_store.rs").read_text()
 consent = Path("daemon/src/support_consent.rs").read_text()
-for module in (upload, storage, consent):
+io_worker = Path("daemon/src/support_io.rs").read_text()
+for module in (upload, storage, consent, io_worker):
     code = "\n".join(line for line in module.splitlines() if not line.lstrip().startswith("//"))
     for marker in ("read_dir", ".entries(", "glob(", "glob::", "walkdir", "WalkDir", "read_link",
                    "scrollback", "REPLAY_DUMP", ".replay", "spawnd.log", "err.log", "journal"):
@@ -319,8 +320,8 @@ for marker in ("std::fs", "tokio::fs", "File::", "OpenOptions", "include_bytes!"
 require(upload_compact.count(".send().await") == 1 and upload.count("client.post(") == 1,
         "exactly one HTTP upload call site")
 require(upload_compact.count(".body(") == 1 and
-        ".body(reqwest::Body::wrap_stream(guarded_body(body,stop.clone())))" in upload_compact,
-        "only the reader stream may be a raw body")
+        ".body(body)" in upload_compact,
+        "only the reader gzip may be a raw body")
 require(upload_compact.count(".json(") == 1 and
         ".json(&RefusalBody::from(reason))" in upload_compact,
         "only the typed refusal enum may be JSON")
@@ -332,7 +333,7 @@ require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra
 # refusal representation/conversion and every function carrying upload bytes;
 # they are a regression guard, NOT a data-flow or security proof.
 import hashlib
-UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '70adb8f021e8cc302a0eb190ac6c63a89597eb412922fd2a067a1e636fb9e423'), ('struct Prepared {', 'fn endpoint(', '9e3490ca4819b4c11db81b805fd8f46db8b112e4a5fd5e873ad81c29a1370b54'), ('// UPLOAD_BODY_BEGIN: reviewed body provenance markers, pinned by the guard.', '// UPLOAD_BODY_END', 'fba9dc82d7ae2c533692ac18dae40562eef1de13c21988e00e57c1c5fa8ce730'), ('async fn collect(', '#[path = "support_tests.rs"]', 'e9873b47869ff10cf9f3e7e821186d70ecf39cab2b1dd78d51e9285fba51a1c9')]
+UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '01c0aab6daf9312876286ada3204b82f3f25d9a46edf3bc901582043e67efe02'), ('struct Prepared {', 'fn endpoint(', 'e20d6e9495ede29261791aee19016c0ae0ecc09822db5be43b9186a6f168ad27'), ('async fn collect(', '#[path = "support_tests.rs"]', 'a8f710ee9e7d88580cf268e5d8e70f54cc817b3aeec0757bb937dfaf9a413300')]
 for start, end, digest in UPLOAD_MARKERS:
     require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
     region = upload.split(start, 1)[1].split(end, 1)[0]
@@ -342,15 +343,17 @@ require(upload.count("support_log::collect_bundle(") == 1, "one support reader p
 require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(deadline" in upload_compact,
         "origin-pinned bounded upload required")
 require("request_id: Uuid" in upload and "crate::config::api_url(&base," in upload, "typed request path required")
-require("tokio::task::spawn_blocking(move || prepare(" in upload, "snapshot must run on a blocking worker")
+require("spawn_blocking" not in upload and "ctx.io.run_with(" in upload_compact,
+        "snapshot must run on the dedicated support worker")
 require("tokio::spawn(async move" in upload, "collection needs its own task")
-for module in (storage, consent):
+for module in (storage, consent, io_worker):
     require("reqwest" not in module and ".post(" not in module, "storage cannot upload")
 run = Path("daemon/src/run.rs").read_text()
 arm = run.split("Inbound::SupportLogCollect {", 1)[1].split("Inbound::Error", 1)[0]
 require(".await" not in arm and "support.collect(" in arm, "dispatch must only enqueue collection")
-require("crate::run::admitted_device(" in upload and "admitted_device(verified.sender_public_key()" in re.sub(r"\s+", "", run),
-        "consent and connections must share admission")
+require("crate::run::admitted_device(" in upload and "find_valid_chain(" in run and
+        "if revoked.contains(&verified.sender_public_key().to_bytes())" in run,
+        "support admission must preserve the unchanged connection verifier")
 PY_POLICY
 
 self_test() {
@@ -463,8 +466,8 @@ PY_REPLACE
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]); s = p.read_text()
-assert '.body(reqwest::Body::wrap_stream(guarded_body(body, stop.clone())))' in s
-p.write_text(s.replace('.body(reqwest::Body::wrap_stream(guarded_body(body, stop.clone())))', '.body(arbitrary)'))
+assert '.body(body)' in s
+p.write_text(s.replace('.body(body)', '.body(arbitrary)'))
 PY_MUTATE_UPLOAD
   expect_upload_failure "a body not supplied by the support reader"
 
@@ -476,7 +479,7 @@ PY_MUTATE_UPLOAD
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]); s = p.read_text()
-p.write_text(s.replace('guarded_body(body, stop.clone())', 'guarded_body(other_bytes(), stop.clone())') + '\nfn other_bytes() -> Vec<u8> { elsewhere() }\n')
+p.write_text(s.replace('.body(body)', '.body(other_bytes())') + '\nfn other_bytes() -> Vec<u8> { elsewhere() }\n')
 PY_MUTATE_UPLOAD
   expect_upload_failure "helper sourcing bytes elsewhere"
 
