@@ -30,11 +30,15 @@ pub fn server_url_for_instance(cli_value: Option<String>, stored: Option<&str>) 
 /// the platform-local SPAWN D config base; `SPAWN_CONFIG_DIR` overrides it so
 /// multiple daemons (e.g. one per server) can coexist without sharing
 /// credentials.
+pub(crate) fn config_path() -> Result<PathBuf> {
+    match std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => crate::platform::default_config_base().context("cannot resolve user config dir"),
+    }
+}
+
 pub fn config_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => crate::platform::default_config_base().context("cannot resolve user config dir")?,
-    };
+    let dir = config_path()?;
     #[cfg(unix)]
     {
         let existed = dir.exists();

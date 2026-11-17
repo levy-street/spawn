@@ -637,9 +637,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let ws_url = config::ws_url(&server_url)?;
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
-    let support =
-        crate::support::Collector::start(config_dir.clone(), server_url.to_string()).await;
-    let _support_shutdown = crate::support::Fence::shutdown(support.as_ref());
+    // Preparation is the actor's first job, never awaited by ordinary startup.
+    // Its delivery queue already exists, so early trust/withdrawal is retained.
+    let support = crate::support::Collector::start(config_dir.clone(), server_url.to_string());
     let registry = SessionRegistry::new();
     #[cfg(windows)]
     crate::service::instance_state_dir(&config_dir)?;
@@ -2075,6 +2075,8 @@ async fn dispatch_loop(
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
                     support: update,
+                    browser_device_ids,
+                    revoked_browser_keys,
                     host_id,
                     access_token,
                     account_id,
@@ -2083,8 +2085,6 @@ async fn dispatch_loop(
                     if let Some(support) = support {
                         support.update(&update);
                     }
-                    let browser_device_ids = &update.browser_device_ids;
-                    let revoked_browser_keys = &update.revoked_browser_keys;
                     if host_id != live_credentials.host_id {
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
@@ -2149,12 +2149,12 @@ async fn dispatch_loop(
                     account_id,
                     browser_pins,
                     support: update,
+                    browser_device_ids,
+                    revoked_browser_keys,
                 } => {
                     if let Some(support) = support {
                         support.update(&update);
                     }
-                    let browser_device_ids = &update.browser_device_ids;
-                    let revoked_browser_keys = &update.revoked_browser_keys;
                     // Pushed when the set changes, so endorsing OR revoking a
                     // device takes effect immediately instead of waiting for the
                     // daemon to happen to reconnect -- which could be hours.
@@ -2190,11 +2190,6 @@ async fn dispatch_loop(
                 Inbound::HostSupportLogConsent { support: update } => {
                     if let Some(support) = support {
                         support.update(&update);
-                    }
-                }
-                Inbound::InvalidSupport => {
-                    if let Some(support) = support {
-                        support.invalid();
                     }
                 }
                 Inbound::SupportLogCollect {
@@ -5890,7 +5885,7 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let pong = out_rx.recv().await.unwrap();
+                let pong = crate::support::tests::bounded(out_rx.recv()).await.unwrap();
                 let value: serde_json::Value = serde_json::from_str(pong.as_str()).unwrap();
                 assert_eq!(value["type"], "host.pong");
                 assert_eq!(value["request_id"], "during-upload");
@@ -5987,8 +5982,13 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let value: serde_json::Value =
-                    serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                let value: serde_json::Value = serde_json::from_str(
+                    crate::support::tests::bounded(responses.recv())
+                        .await
+                        .unwrap()
+                        .as_str(),
+                )
+                .unwrap();
                 assert_eq!(value["type"], "host.pong");
                 drop(input);
             };
@@ -6042,19 +6042,22 @@ mod tests {
                         serde_json::json!({"type":"support_log.collect", "request_id":null, "since_seconds":{}}),
                         serde_json::json!({"type":"host.ping", "request_id":"after"}),
                     ] {
-                        input.send(WsInbound::Json(Box::new(crate::proto::parse_inbound(&frame.to_string()).unwrap()))).await.unwrap();
+                        match crate::proto::parse_inbound(&frame.to_string()) {
+                            Ok(frame) => input.send(WsInbound::Json(Box::new(frame))).await.unwrap(),
+                            Err(_) => assert_eq!(frame["type"], "support_log.collect"),
+                        }
                     }
-                    let before: serde_json::Value = serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                    let before: serde_json::Value = serde_json::from_str(crate::support::tests::bounded(responses.recv()).await.unwrap().as_str()).unwrap();
                     assert_eq!(before["request_id"], "before");
                     let mut saw_foreground = false;
                     let mut saw_after = false;
                     for _ in 0..2 {
-                        let response: serde_json::Value = serde_json::from_str(responses.recv().await.unwrap().as_str()).unwrap();
+                        let response: serde_json::Value = serde_json::from_str(crate::support::tests::bounded(responses.recv()).await.unwrap().as_str()).unwrap();
                         if response["type"] == "session.foreground" { saw_foreground = true; }
                         else { assert_eq!(response["request_id"], "after"); saw_after = true; }
                     }
                     assert!(saw_foreground && saw_after);
-                    assert!(registered.lock().unwrap().is_some());
+                    assert!(registered.try_lock().expect("test registration lock busy").is_some());
                     drop(input);
                 };
                 let (result, ()) = tokio::join!(dispatch, exercise);

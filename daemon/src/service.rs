@@ -119,7 +119,10 @@ pub fn instance_log_path(config_dir: &Path) -> Result<PathBuf> {
         .join("spawn")
         .join("logs");
     #[cfg(not(windows))]
-    let base = state_dir("")?.join("logs");
+    let base = instance_state_path(config_dir)?
+        .parent()
+        .context("instance state parent")?
+        .join("logs");
     Ok(base.join(instance_name(config_dir)))
 }
 
@@ -254,13 +257,15 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
     )
 }
 
-fn systemd_unit_path(config_dir: &Path) -> Result<PathBuf> {
+fn systemd_unit_path(config_dir: &Path, create: bool) -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .context("cannot resolve the user config directory")?
         .join("systemd")
         .join("user");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if create {
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     Ok(dir.join(systemd_unit_name(config_dir)))
 }
 
@@ -275,7 +280,7 @@ fn systemctl(args: &[&str]) -> Result<bool> {
 
 fn systemd_install(config_dir: &Path, server: &str) -> Result<()> {
     let bin = launch_bin(config_dir)?;
-    let unit_path = systemd_unit_path(config_dir)?;
+    let unit_path = systemd_unit_path(config_dir, true)?;
     let contents = systemd_unit_contents(config_dir, &bin, server);
     std::fs::write(&unit_path, contents)
         .with_context(|| format!("writing {}", unit_path.display()))?;
@@ -293,7 +298,7 @@ fn systemd_install(config_dir: &Path, server: &str) -> Result<()> {
 fn systemd_uninstall(config_dir: &Path) -> Result<()> {
     let unit = systemd_unit_name(config_dir);
     let _ = systemctl(&["disable", "--now", &unit]);
-    if let Ok(path) = systemd_unit_path(config_dir) {
+    if let Ok(path) = systemd_unit_path(config_dir, true) {
         let _ = std::fs::remove_file(&path);
     }
     let _ = systemctl(&["daemon-reload"]);
@@ -356,12 +361,14 @@ fn launchd_plist(config_dir: &Path, bin: &Path, server: &str, state: &Path) -> S
     )
 }
 
-fn launchd_plist_path(config_dir: &Path) -> Result<PathBuf> {
+fn launchd_plist_path(config_dir: &Path, create: bool) -> Result<PathBuf> {
     let dir = dirs::home_dir()
         .context("cannot resolve the home directory")?
         .join("Library")
         .join("LaunchAgents");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if create {
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     Ok(dir.join(format!("{}.plist", launchd_label(config_dir))))
 }
 
@@ -378,7 +385,7 @@ fn effective_user_id() -> u32 {
 fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
     let bin = launch_bin(config_dir)?;
     let state = state_dir(&instance_tag(config_dir))?;
-    let plist_path = launchd_plist_path(config_dir)?;
+    let plist_path = launchd_plist_path(config_dir, true)?;
     std::fs::write(&plist_path, launchd_plist(config_dir, &bin, server, &state))
         .with_context(|| format!("writing {}", plist_path.display()))?;
 
@@ -410,7 +417,7 @@ fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
 fn launchd_uninstall(config_dir: &Path) -> Result<()> {
     let uid = effective_user_id();
     let domain = format!("gui/{uid}");
-    if let Ok(path) = launchd_plist_path(config_dir) {
+    if let Ok(path) = launchd_plist_path(config_dir, true) {
         let _ = Command::new("launchctl")
             .args(["bootout", &domain])
             .arg(&path)
@@ -468,7 +475,7 @@ pub fn rewrite_launch_path(config_dir: &Path, layout: &crate::install::Layout) -
 
 #[cfg(target_os = "linux")]
 fn systemd_rewrite(config_dir: &Path, bin: &Path) -> Result<()> {
-    let unit_path = systemd_unit_path(config_dir)?;
+    let unit_path = systemd_unit_path(config_dir, true)?;
     if !unit_path.is_file() {
         return Ok(());
     }
@@ -488,7 +495,7 @@ fn systemd_rewrite(config_dir: &Path, bin: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn launchd_rewrite(config_dir: &Path, bin: &Path) -> Result<()> {
-    let plist_path = launchd_plist_path(config_dir)?;
+    let plist_path = launchd_plist_path(config_dir, true)?;
     if !plist_path.is_file() {
         return Ok(());
     }
@@ -548,7 +555,7 @@ pub fn launch_report(config_dir: &Path) -> LaunchReport {
     }
     #[cfg(target_os = "macos")]
     {
-        let binary = launchd_plist_path(config_dir)
+        let binary = launchd_plist_path(config_dir, false)
             .ok()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .as_deref()
@@ -851,7 +858,7 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
     #[cfg(target_os = "macos")]
     {
         let label = launchd_label(config_dir);
-        let installed = launchd_plist_path(config_dir).is_ok_and(|path| path.is_file());
+        let installed = launchd_plist_path(config_dir, false).is_ok_and(|path| path.is_file());
         let uid = nix::unistd::Uid::effective().as_raw();
         let running = Command::new("launchctl")
             .args(["print", &format!("gui/{uid}/{label}")])
@@ -871,7 +878,7 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
     #[cfg(target_os = "linux")]
     {
         let name = systemd_unit_name(config_dir);
-        let installed = systemd_unit_path(config_dir).is_ok_and(|path| path.is_file());
+        let installed = systemd_unit_path(config_dir, false).is_ok_and(|path| path.is_file());
         let running = Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", &name])
             .stdout(std::process::Stdio::null())

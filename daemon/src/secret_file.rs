@@ -393,8 +393,9 @@ impl SecretFile {
     /// handle owns the lock until dropped, including across async deadlines.
     pub fn try_lock_file(&self, path: &Path) -> Result<std::fs::File> {
         let file = self.open_lock(path)?;
-        file.try_lock()
-            .map_err(|_| std::io::Error::other("secret file lock busy"))?;
+        file.try_lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "secret file lock busy")
+        })?;
         Ok(file)
     }
 

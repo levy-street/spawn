@@ -203,3 +203,63 @@ fn identical_effective_state_does_not_spend_control_writes() {
     apply_budgeted(tmp.path(), None, &trust, 1000, &mut budget).unwrap();
     assert_eq!(budget.0.len(), 2);
 }
+
+#[test]
+fn status_with_no_support_files_is_read_only() {
+    let tmp = crate::support_log::capture::private_tempdir();
+    let (trust, _) = fixture();
+    let config = tmp.path().join("absent-config");
+    let path = tmp.path().join("absent-log");
+    assert!(!status(&config, &trust, &path).enabled);
+    assert!(!config.exists() && !path.exists());
+}
+
+#[test]
+fn refreshed_carried_approval_is_persisted_for_the_same_signed_statement() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use spawnd::acct_endorsement::{sign_transcript, signature_to_wire, AcctEndorsementTranscript};
+    let tmp = crate::support_log::capture::private_tempdir();
+    let (mut trust, mut consent) = fixture();
+    let root = SigningKey::from_bytes(&[7; 32]);
+    let first = SigningKey::from_bytes(&[8; 32]);
+    let second = SigningKey::from_bytes(&[9; 32]);
+    let leaf = SigningKey::from_bytes(&[10; 32]);
+    let key = |signer: &SigningKey| URL_SAFE_NO_PAD.encode(signer.verifying_key().as_bytes());
+    consent.signer_public_key = key(&leaf);
+    consent.signer_device_id = Uuid::from_bytes([6; 16]).to_string();
+    consent.sign(&leaf).unwrap();
+    let edge = |from: &SigningKey, to: &SigningKey| {
+        let transcript = AcctEndorsementTranscript::from_wire(
+            &consent.account_id,
+            &key(from),
+            &key(to),
+            &consent.signer_device_id,
+        )
+        .unwrap();
+        spawnd::endorsement_chain::CarriedEndorsement {
+            account_id: consent.account_id.clone(),
+            endorser_public_key: key(from),
+            endorsed_public_key: key(to),
+            endorsed_device_id: consent.signer_device_id.clone(),
+            signature: signature_to_wire(&sign_transcript(from, &transcript)),
+        }
+    };
+    let first_path = vec![edge(&root, &first), edge(&first, &leaf)];
+    let second_path = vec![edge(&root, &second), edge(&second, &leaf)];
+    consent.carried_endorsements = first_path;
+    apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+    trust
+        .revoked
+        .insert(first.verifying_key().to_bytes())
+        .unwrap();
+    remember_revocations(tmp.path(), &trust).unwrap();
+    assert!(load(tmp.path(), &trust, 1000).is_err());
+    let old = consent.clone();
+    consent.carried_endorsements = second_path;
+    assert!(consent.same_statement(&old));
+    apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+    assert_eq!(
+        load(tmp.path(), &trust, 1000).unwrap().consent,
+        Some(consent)
+    );
+}

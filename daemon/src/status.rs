@@ -106,12 +106,12 @@ pub async fn run(
 
 fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     if explicit_config {
-        return Ok(vec![crate::config::config_dir()?]);
+        return Ok(vec![crate::config::config_path()?]);
     }
     let base = crate::possess::default_instance_base()?;
     let instances = crate::possess::account_dirs_with_creds(&base)?;
     if instances.is_empty() {
-        Ok(vec![crate::config::config_dir()?])
+        Ok(vec![crate::config::config_path()?])
     } else {
         Ok(instances)
     }
@@ -187,7 +187,7 @@ pub(crate) fn instance_build(config_dir: &Path) -> InstanceBuild {
 
 async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<InstanceStatus> {
     let _guard = crate::lifecycle::ConfigDirGuard::set(dir);
-    let stored = crate::creds::load().context("loading stored credentials")?;
+    let stored = crate::creds::load_for_status(dir).context("loading stored credentials")?;
     let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let build = instance_build(dir);
     let heartbeat = build.state.as_ref();
@@ -214,16 +214,17 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     let pair = pair_text(build.live());
     let support_config = dir.to_owned();
     let support_trust = crate::support::Trust::from_record(&stored);
-    let (support_log, support_sharing) = if let Some(worker) = crate::support_io::Worker::process()
-    {
+    // Path resolution is read-only and remains available even if the optional
+    // storage worker cannot start or its sharing inspection times out.
+    let support_log = crate::support_log::current_path(dir)
+        .ok()
+        .map(|path| path.display().to_string());
+    let support_sharing = if let Some(worker) = crate::support_io::Worker::process() {
         worker
             .run(
                 tokio::time::Instant::now() + crate::support_io::IO_DEADLINE,
                 move || {
-                    let log = crate::support_log::current_path(&support_config)
-                        .ok()
-                        .map(|path| path.display().to_string());
-                    let sharing = crate::support_log::support_dir(&support_config)
+                    crate::support_log::support_dir(&support_config)
                         .ok()
                         .map(|path| {
                             let mut sharing = crate::support_store::status(
@@ -238,15 +239,12 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
                                     crate::state::daemon_state_is_live(&support_config, state)
                                 })
                                 .and_then(|state| state.support_runtime);
-                            if sharing.runtime.is_none_or(|state| {
-                                state.pending || state.permanent_deny || state.io_overdue
-                            }) {
+                            if sharing.runtime.is_none_or(|state| state.denied.is_some()) {
                                 sharing.enabled = false;
                             }
                             sharing
                         })
-                        .unwrap_or_default();
-                    (log, sharing)
+                        .unwrap_or_default()
                 },
             )
             .await
@@ -489,27 +487,21 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
                 "               approved by device {device} at {at} ms since Unix epoch"
             );
         }
-        if sharing.account_unproven {
+        if sharing.account_unproven && sharing.signer_device_id.is_some() {
             let _ = writeln!(
                 text,
                 "               unavailable until a device approval proves the account"
             );
         }
-        if let Some(runtime) = sharing.runtime {
-            if runtime.permanent_deny {
+        if let Some(runtime) = sharing
+            .runtime
+            .filter(|r| r.denied.is_some() || r.dropped_requests > 0)
+        {
+            if let Some(reason) = runtime.denied {
                 let _ = writeln!(
                     text,
-                    "               denied until restart: support input, write budget or queue failure"
-                );
-            } else if runtime.io_overdue {
-                let _ = writeln!(
-                    text,
-                    "               denied while support filesystem work is overdue"
-                );
-            } else if runtime.pending {
-                let _ = writeln!(
-                    text,
-                    "               denied while a support update is pending; restart may be required"
+                    "               {}; restarting SPAWN D on this machine clears it",
+                    reason.reason()
                 );
             }
             let _ = writeln!(
@@ -517,8 +509,6 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
                 "               {} collection requests dropped by admission budget",
                 runtime.dropped_requests
             );
-        } else {
-            let _ = writeln!(text, "               collector unavailable");
         }
         if sharing.server_off {
             let _ = writeln!(text, "               the server switched sharing off");
@@ -537,7 +527,7 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             );
         }
         if let Some(path) = &instance.support_log {
-            let _ = writeln!(text, "  support log  {path}");
+            let _ = writeln!(text, "  support log  {path} · kept on this machine");
         }
     }
     let others = output.instances.len().saturating_sub(1);
@@ -696,7 +686,7 @@ mod tests {
         ));
         assert!(plain.contains("  pair         matches\n"));
         assert!(plain.contains(
-            "  support log  /Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl\n"
+            "  support log  /Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl · kept on this machine\n"
         ));
         assert!(plain.contains("Other instances on this machine: none\n"));
         assert!(plain.ends_with(&format!(

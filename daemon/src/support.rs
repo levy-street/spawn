@@ -12,7 +12,7 @@ use spawnd::support_consent::Consent;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
@@ -92,78 +92,141 @@ impl Trust {
         Ok(())
     }
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Denied {
+    Storage,
+    Lock,
+    Deadline,
+    WorkerStopped,
+    WriteBudget,
+    Revocations,
+    DeliveryOverflow,
+    InvalidUpdate,
+    GenerationExhausted,
+}
+impl Denied {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Storage => "support storage update failed",
+            Self::Lock => "support storage lock wait expired",
+            Self::Deadline => "support storage job deadline passed",
+            Self::WorkerStopped => "support storage worker stopped",
+            Self::WriteBudget => "more than 30 sharing changes in ten minutes",
+            Self::Revocations => "more than 256 removed devices",
+            Self::DeliveryOverflow => "support input delivery overflow",
+            Self::InvalidUpdate => "invalid support update",
+            Self::GenerationExhausted => "support generation exhausted",
+        }
+    }
+    fn storage(error: anyhow::Error) -> Self {
+        if error.is::<support_store::ControlOverflow>() {
+            Self::WriteBudget
+        } else if error.is::<support_store::RevocationOverflow>() {
+            Self::Revocations
+        } else if error.is::<support_store::LockExpired>() {
+            Self::Lock
+        } else {
+            Self::Storage
+        }
+    }
+}
+impl From<crate::support_io::Error> for Denied {
+    fn from(value: crate::support_io::Error) -> Self {
+        match value {
+            crate::support_io::Error::Deadline => Self::Deadline,
+            crate::support_io::Error::Stopped => Self::WorkerStopped,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeStatus {
-    pub permanent_deny: bool,
-    pub pending: bool,
+    pub denied: Option<Denied>,
     pub dropped_requests: u64,
-    #[serde(default)]
-    pub io_overdue: bool,
 }
 static ACTIVE: OnceLock<Weak<Delivery>> = OnceLock::new();
 pub(crate) fn runtime_status() -> Option<RuntimeStatus> {
     ACTIVE.get()?.upgrade().map(|d| d.status())
 }
 struct Delivery {
-    delivered: AtomicU64,
-    applied: AtomicU64, // actor writes only; never used to clear a denial flag
-    permanent: AtomicBool,
+    // Low bit: request started. Remaining bits: delivery generation.
+    word: AtomicU64,
+    denied: OnceLock<Denied>,
     dropped: AtomicU64,
     changed: Notify,
-    io: Arc<Worker>,
-    collecting: AtomicBool,
     #[cfg(test)]
     hooks: tests::Hooks,
 }
 impl Delivery {
-    fn new(io: Arc<Worker>) -> Self {
+    fn new() -> Self {
         Self {
-            delivered: AtomicU64::new(0),
-            applied: AtomicU64::new(0),
-            permanent: AtomicBool::new(false),
+            word: AtomicU64::new(0),
+            denied: OnceLock::new(),
             dropped: AtomicU64::new(0),
             changed: Notify::new(),
-            io,
-            collecting: AtomicBool::new(false),
             #[cfg(test)]
             hooks: tests::Hooks::default(),
         }
     }
-    fn advance(&self) -> u64 {
-        let generation = self
-            .delivered
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1));
-        self.changed.notify_one();
-        match generation {
-            Ok(n) => n + 1,
-            Err(n) => {
-                self.deny();
-                n
+    fn generation(&self) -> u64 {
+        self.word.load(Ordering::SeqCst) & !1
+    }
+    fn advance(&self) {
+        let mut old = self.word.load(Ordering::SeqCst);
+        loop {
+            // All ones is a terminal exhausted word. Even at exhaustion,
+            // delivery atomically makes a not-started claim impossible.
+            let next = (old & !1).saturating_add(2);
+            match self
+                .word
+                .compare_exchange_weak(old, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    if next == u64::MAX {
+                        self.deny(Denied::GenerationExhausted);
+                    } else {
+                        self.changed.notify_one();
+                    }
+                    return;
+                }
+                Err(current) => old = current,
             }
         }
     }
-    fn deny(&self) {
-        self.permanent.store(true, Ordering::SeqCst);
+    fn deny(&self, reason: Denied) {
+        let _ = self.denied.set(reason);
         self.changed.notify_one();
     }
     fn status(&self) -> RuntimeStatus {
         RuntimeStatus {
-            permanent_deny: self.permanent.load(Ordering::SeqCst),
-            pending: self.applied.load(Ordering::SeqCst) != self.delivered.load(Ordering::SeqCst),
+            denied: self.denied.get().copied(),
             dropped_requests: self.dropped.load(Ordering::Relaxed),
-            io_overdue: self.io.overdue(),
         }
     }
 }
-#[derive(Clone)]
 struct Stop {
     delivery: Arc<Delivery>,
     generation: u64,
 }
 impl Stop {
     fn stopped(&self) -> bool {
-        self.delivery.permanent.load(Ordering::SeqCst)
-            || self.delivery.delivered.load(Ordering::SeqCst) != self.generation
+        self.delivery.denied.get().is_some() || self.delivery.generation() != self.generation
+    }
+    fn claim_start(&self) -> bool {
+        // Request start is this single atomic transition from (generation, 0)
+        // to (generation, 1). Delivery before it prevents creating/polling send;
+        // delivery after it abandons the request best-effort (P2).
+        !self.stopped()
+            && self
+                .delivery
+                .word
+                .compare_exchange(
+                    self.generation,
+                    self.generation | 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
     }
     async fn changed(&self) {
         loop {
@@ -179,7 +242,6 @@ impl Stop {
 }
 struct Context {
     io: Arc<Worker>,
-    control_budget: Arc<Mutex<support_store::ControlBudget>>,
     config: PathBuf,
     path: PathBuf,
     source: Option<support_log::SupportLog>,
@@ -201,28 +263,27 @@ impl Budget {
 pub(crate) struct Collector {
     tx: mpsc::Sender<Command>,
     delivery: Arc<Delivery>,
-    budget: Mutex<Budget>,
+    gate: Mutex<()>,
 }
-#[derive(Clone)]
 enum Input {
     Trust {
         value: Arc<Trust>,
         live: Option<Arc<Vec<String>>>,
         revoked: Option<Arc<Vec<String>>>,
     },
+    #[cfg(test)]
     Consent(Option<Consent>),
     Update(Arc<crate::proto::SupportUpdate>),
-    Invalid,
     Fence,
     Shutdown,
 }
 enum Command {
-    Input(u64, Input),
+    Input(Input),
     Collect {
         request_id: Uuid,
         window: u64,
         deadline: tokio::time::Instant,
-        permit: CollectionPermit,
+        generation: u64,
         #[cfg(test)]
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
@@ -231,60 +292,27 @@ enum Command {
 }
 pub(crate) struct Fence<'a> {
     collector: Option<&'a Collector>,
-    shutdown: bool,
 }
 impl<'a> Fence<'a> {
     pub(crate) fn connection(collector: Option<&'a Collector>) -> Self {
-        Self {
-            collector,
-            shutdown: false,
-        }
-    }
-    pub(crate) fn shutdown(collector: Option<&'a Collector>) -> Self {
-        Self {
-            collector,
-            shutdown: true,
-        }
+        Self { collector }
     }
 }
 impl Drop for Fence<'_> {
     fn drop(&mut self) {
         if let Some(c) = self.collector {
-            c.deliver(if self.shutdown {
-                Input::Shutdown
-            } else {
-                Input::Fence
-            });
+            c.deliver(Input::Fence);
         }
     }
 }
 impl Collector {
-    pub(crate) async fn start(config: PathBuf, origin: String) -> Option<Self> {
-        let io = Worker::process()?;
-        let dir = config.clone();
-        let collector = Self::initialize(config, origin, io, move || {
-            let path = support_log::support_dir(&dir).ok()?;
-            crate::platform::open_support_dir(&path, true).ok()?;
-            let source = support_log::active_for(&path);
-            Some((path, source, crate::service::instance_name(&dir)))
-        })
-        .await?;
-        let _ = ACTIVE.set(Arc::downgrade(&collector.delivery));
-        Some(collector)
-    }
-    async fn initialize(
-        config: PathBuf,
-        origin: String,
-        io: Arc<Worker>,
-        prepare: impl FnOnce() -> Option<(PathBuf, Option<support_log::SupportLog>, String)>
-            + Send
-            + 'static,
-    ) -> Option<Self> {
-        let (path, source, instance) = io
-            .run(tokio::time::Instant::now() + IO_DEADLINE, prepare)
-            .await
-            .ok()??;
-        Self::start_ready(config, path, source, instance, origin, io)
+    pub(crate) fn start(config: PathBuf, origin: String) -> Option<Self> {
+        // Resolve paths only; the actor performs preparation as its first job.
+        // Its existing delivery queue preserves inputs arriving before readiness.
+        let path = support_log::support_dir(&config).ok()?;
+        let source = support_log::active_for(&path);
+        let instance = crate::service::instance_name(&config);
+        Self::start_ready(config, path, source, instance, origin, Worker::process()?)
     }
     #[cfg(test)]
     async fn start_at(
@@ -294,15 +322,7 @@ impl Collector {
         instance: String,
         origin: String,
     ) -> Option<Self> {
-        let io = Worker::start()?;
-        let dir = path.clone();
-        io.run(tokio::time::Instant::now() + IO_DEADLINE, move || {
-            crate::platform::open_support_dir(&dir, true)
-        })
-        .await
-        .ok()?
-        .ok()?;
-        Self::start_ready(config, path, source, instance, origin, io)
+        Self::start_ready(config, path, source, instance, origin, Worker::start()?)
     }
     fn start_ready(
         config: PathBuf,
@@ -320,11 +340,10 @@ impl Collector {
         #[cfg(test)]
         let builder = builder.no_proxy();
         let client = builder.build().ok()?;
-        let delivery = Arc::new(Delivery::new(Arc::clone(&io)));
+        let delivery = Arc::new(Delivery::new());
         let (tx, rx) = mpsc::channel(QUEUE);
         let context = Arc::new(Context {
             io,
-            control_budget: Arc::new(Mutex::new(support_store::ControlBudget::default())),
             config,
             path,
             source,
@@ -334,18 +353,16 @@ impl Collector {
         Some(Self {
             tx,
             delivery,
-            budget: Mutex::new(Budget {
-                next: tokio::time::Instant::now(),
-            }),
+            gate: Mutex::new(()),
         })
     }
     fn deliver(&self, input: Input) {
         // One short, nonwaiting delivery gate orders generation and enqueue even
         // if future callers use different tasks. Contention can only deny.
-        let guard = self.budget.try_lock();
-        let generation = self.delivery.advance();
-        if guard.is_err() || self.tx.try_send(Command::Input(generation, input)).is_err() {
-            self.delivery.deny();
+        let guard = self.gate.try_lock();
+        self.delivery.advance();
+        if guard.is_err() || self.tx.try_send(Command::Input(input)).is_err() {
+            self.delivery.deny(Denied::DeliveryOverflow);
         }
     }
     pub(crate) fn trust(
@@ -361,14 +378,9 @@ impl Collector {
         });
     }
     pub(crate) fn update(&self, update: &Arc<crate::proto::SupportUpdate>) {
-        // Delivery does one Arc clone, atomic generation changes, try_lock /
-        // try_send, and notify_one for the single collection waiter. No element
-        // moves, allocation, waiter-list broadcast, or large destruction: the
-        // caller retains the payload even when try_send rejects this clone.
+        // Clone the parsed payload, advance the generation, try the queue and
+        // notify the actor. No support filesystem or cryptographic work here.
         self.deliver(Input::Update(Arc::clone(update)));
-    }
-    pub(crate) fn invalid(&self) {
-        self.deliver(Input::Invalid);
     }
     #[cfg(test)]
     pub(crate) fn consent(&self, value: Option<Consent>) {
@@ -391,20 +403,12 @@ impl Collector {
         since_seconds: i64,
         #[cfg(test)] done: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
-        let Ok(mut budget) = self.budget.try_lock() else {
-            self.delivery.deny();
+        let Ok(_gate) = self.gate.try_lock() else {
+            self.delivery.advance();
+            self.delivery.deny(Denied::DeliveryOverflow);
             return;
         };
-        if self.delivery.io.overdue()
-            || self.delivery.permanent.load(Ordering::SeqCst)
-            || self.delivery.applied.load(Ordering::SeqCst)
-                != self.delivery.delivered.load(Ordering::SeqCst)
-            || !budget.admit(tokio::time::Instant::now())
-        {
-            self.delivery.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if self.delivery.collecting.swap(true, Ordering::SeqCst) {
+        if self.delivery.denied.get().is_some() {
             self.delivery.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -414,14 +418,14 @@ impl Collector {
                 request_id,
                 window: since_seconds.clamp(60, 259200) as u64,
                 deadline: tokio::time::Instant::now() + DEADLINE,
-                permit: CollectionPermit(Arc::clone(&self.delivery)),
+                generation: self.delivery.generation(),
                 #[cfg(test)]
                 done,
             })
             .is_err()
         {
             self.delivery.advance();
-            self.delivery.deny();
+            self.delivery.deny(Denied::DeliveryOverflow);
         }
     }
 }
@@ -431,164 +435,113 @@ impl Drop for Collector {
     }
 }
 
-struct CollectionPermit(Arc<Delivery>);
-impl Drop for CollectionPermit {
-    fn drop(&mut self) {
-        self.0.collecting.store(false, Ordering::SeqCst);
-    }
-}
-
-#[derive(PartialEq)]
-enum Apply {
-    Done,
-    Retry,
-    Permanent,
-}
-async fn apply(ctx: &Arc<Context>, input: &Input, trust: &mut Option<Arc<Trust>>) -> Apply {
-    if let Input::Update(update) = input {
-        if matches!(update.consent, crate::proto::ConsentInput::Invalid) {
-            return Apply::Permanent;
-        }
-        let Some(current) = trust.clone() else {
-            return Apply::Retry;
-        };
-        let next = Input::Trust {
-            value: current,
-            live: update.browser_device_ids.clone().map(Arc::new),
-            revoked: update.revoked_browser_keys.clone().map(Arc::new),
-        };
-        let result = apply_direct(ctx, &next, trust).await;
-        if result != Apply::Done {
-            return result;
-        }
-        return match &update.consent {
-            crate::proto::ConsentInput::Null => {
-                apply_direct(ctx, &Input::Consent(None), trust).await
-            }
-            crate::proto::ConsentInput::Valid(consent) => {
-                apply_direct(ctx, &Input::Consent(Some(consent.clone())), trust).await
-            }
-            crate::proto::ConsentInput::Absent => Apply::Done,
-            crate::proto::ConsentInput::Invalid => Apply::Permanent,
-        };
-    }
-    apply_direct(ctx, input, trust).await
-}
-async fn apply_direct(ctx: &Arc<Context>, input: &Input, trust: &mut Option<Arc<Trust>>) -> Apply {
-    match input {
-        Input::Fence | Input::Shutdown => Apply::Done,
-        Input::Invalid | Input::Update(_) => Apply::Permanent,
+async fn apply(
+    ctx: &Arc<Context>,
+    delivery: &Arc<Delivery>,
+    input: Input,
+    trust: &mut Option<Arc<Trust>>,
+) -> Result<(), Denied> {
+    use crate::proto::ConsentInput;
+    let (base, live, revoked, consent) = match input {
         Input::Trust {
             value,
             live,
             revoked,
-        } => {
-            let mut next = (**value).clone();
-            if let Some(previous) = trust {
-                if next.revoked.absorb(previous.revoked.clone()).is_err() {
-                    return Apply::Permanent;
-                }
-            }
-            if let Some(revoked) = revoked {
-                for key in revoked.iter() {
-                    if let Ok(key) = spawnd::signed_signal::public_key_from_wire(key) {
-                        if next.revoked.insert(key.to_bytes()).is_err() {
-                            return Apply::Permanent;
-                        }
-                    }
-                }
-            }
-            if let Some(live) = live {
-                for pin in next.pins.iter() {
-                    if !live
-                        .iter()
-                        .any(|id| Uuid::parse_str(id).ok() == Some(pin.device_id()))
-                    {
-                        if let Ok(key) =
-                            spawnd::signed_signal::public_key_from_wire(pin.public_key())
-                        {
-                            if next.revoked.insert(key.to_bytes()).is_err() {
-                                return Apply::Permanent;
-                            }
-                        }
-                    }
-                }
-            }
-            let next = Arc::new(next);
-            let config = ctx.config.clone();
-            let copy = Arc::clone(&next);
-            let result = ctx
-                .io
-                .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
-                    support_store::remember_revocations(&config, &copy)
-                })
-                .await;
-            match result {
-                Ok(Ok(revoked)) => {
-                    let mut next = (*next).clone();
-                    next.revoked = revoked;
-                    *trust = Some(Arc::new(next));
-                    Apply::Done
-                }
-                Ok(Err(error)) if error.is::<support_store::RevocationOverflow>() => {
-                    Apply::Permanent
-                }
-                _ => Apply::Retry,
+        } => (Some(value), live, revoked, ConsentInput::Absent),
+        Input::Update(update) => (
+            trust.clone(),
+            update.browser_device_ids.clone().map(Arc::new),
+            update.revoked_browser_keys.clone().map(Arc::new),
+            update.consent.clone(),
+        ),
+        #[cfg(test)]
+        Input::Consent(value) => (
+            trust.clone(),
+            None,
+            None,
+            value.map_or(ConsentInput::Null, ConsentInput::Valid),
+        ),
+        Input::Fence | Input::Shutdown => return Ok(()),
+    };
+    let Some(base) = base else {
+        return Err(Denied::InvalidUpdate);
+    };
+    let mut next = (*base).clone();
+    if let Some(previous) = trust.as_ref() {
+        next.revoked
+            .absorb(previous.revoked.clone())
+            .map_err(Denied::storage)?;
+    }
+    if let Some(revoked) = revoked {
+        for key in revoked.iter() {
+            if let Ok(key) = spawnd::signed_signal::public_key_from_wire(key) {
+                next.revoked
+                    .insert(key.to_bytes())
+                    .map_err(Denied::storage)?;
             }
         }
-        Input::Consent(value) => {
-            let Some(trust) = trust else {
-                return Apply::Retry;
-            };
-            // Unknown local account cannot store or honour any statement.
-            if trust.account.is_none() {
-                return Apply::Done;
+    }
+    if let Some(live) = live {
+        for pin in next.pins.iter() {
+            if !live
+                .iter()
+                .any(|id| Uuid::parse_str(id).ok() == Some(pin.device_id()))
+            {
+                if let Ok(key) = spawnd::signed_signal::public_key_from_wire(pin.public_key()) {
+                    next.revoked
+                        .insert(key.to_bytes())
+                        .map_err(Denied::storage)?;
+                }
             }
-            let config = ctx.config.clone();
-            let value = value.clone();
-            let trust = Arc::clone(trust);
-            let budget = Arc::clone(&ctx.control_budget);
-            let result = ctx
-                .io
-                .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
+        }
+    }
+    // Retain received trust BEFORE attempting any write. Any error is terminal;
+    // there is no later path which can authorize using an older projection.
+    let next = Arc::new(next);
+    *trust = Some(Arc::clone(&next));
+    if matches!(consent, ConsentInput::Invalid) {
+        return Err(Denied::InvalidUpdate);
+    }
+    let config = ctx.config.clone();
+    #[cfg(test)]
+    let delivery = Arc::clone(delivery);
+    #[cfg(not(test))]
+    let _ = delivery;
+    let revoked = ctx
+        .io
+        .run_with(tokio::time::Instant::now() + IO_DEADLINE, move |owned| {
+            #[cfg(test)]
+            {
+                delivery.hooks.apply.pause();
+                assert!(
+                    !delivery.hooks.panic.swap(false, Ordering::SeqCst),
+                    "injected support worker panic"
+                );
+            }
+            let revoked = support_store::remember_revocations(&config, &next)?;
+            if next.account.is_some() {
+                let incoming = match consent {
+                    ConsentInput::Null => Some(None),
+                    ConsentInput::Valid(value) => Some(Some(value)),
+                    _ => None,
+                };
+                if let Some(incoming) = incoming {
                     support_store::apply_budgeted(
                         &config,
-                        value,
-                        &trust,
+                        incoming,
+                        &next,
                         support_log::now_unix_millis(),
-                        &mut budget.lock().unwrap_or_else(|e| e.into_inner()),
-                    )
-                })
-                .await;
-            match result {
-                Ok(Ok(())) => Apply::Done,
-                Ok(Err(error))
-                    if error.is::<support_store::ControlOverflow>()
-                        || error.is::<support_store::RevocationOverflow>() =>
-                {
-                    Apply::Permanent
+                        &mut owned.control_budget,
+                    )?;
                 }
-                _ => Apply::Retry,
             }
-        }
-    }
-}
-fn consent_input(input: &Input) -> Option<Option<&Consent>> {
-    match input {
-        Input::Consent(value) => Some(value.as_ref()),
-        Input::Update(update) => match &update.consent {
-            crate::proto::ConsentInput::Null => Some(None),
-            crate::proto::ConsentInput::Valid(value) => Some(Some(value)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-fn supersedes(old: Option<&Consent>, new: &Consent) -> bool {
-    old.is_none_or(|old| {
-        new.issued_at_ms > old.issued_at_ms
-            || (new.issued_at_ms == old.issued_at_ms && (!new.enabled || new.same_statement(old)))
-    })
+            Ok::<_, anyhow::Error>(revoked)
+        })
+        .await
+        .map_err(Denied::from)?
+        .map_err(Denied::storage)?;
+    Arc::make_mut(trust.as_mut().expect("retained trust")).revoked = revoked;
+    Ok(())
 }
 async fn serve(
     ctx: Arc<Context>,
@@ -597,152 +550,136 @@ async fn serve(
     client: reqwest::Client,
     origin: String,
 ) {
+    let path = ctx.path.clone();
+    #[cfg(test)]
+    let starting = Arc::clone(&delivery);
+    let startup = ctx
+        .io
+        .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
+            #[cfg(test)]
+            starting.hooks.initialize.pause();
+            let result = crate::platform::open_support_dir(&path, true).map(|_| ());
+            #[cfg(test)]
+            starting.hooks.initialized.notify_one();
+            result
+        })
+        .await
+        .map_err(Denied::from)
+        .and_then(|r| r.map_err(|_| Denied::Storage));
+    if let Err(reason) = startup {
+        delivery.deny(reason);
+    }
+    #[cfg(not(test))]
+    let _ = ACTIVE.set(Arc::downgrade(&delivery));
     let mut trust = None;
-    let mut applied = 0;
     let mut active = false;
-    let mut deferred = std::collections::VecDeque::new();
+    let mut erased = false;
+    let mut budget = Budget {
+        next: tokio::time::Instant::now(),
+    };
     loop {
-        let command = if let Some(command) = deferred.pop_front() {
-            command
-        } else if let Some(command) = rx.recv().await {
-            command
-        } else {
-            break;
+        if delivery.denied.get().is_some() && !erased {
+            erased = true;
+            let config = ctx.config.clone();
+            // Exactly one best-effort removal. A dead or unfinished worker may
+            // prevent it; nothing is submitted behind an unfinished job.
+            let _ = ctx
+                .io
+                .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
+                    support_store::erase_statement(&config)
+                })
+                .await;
+        }
+        let receive = async {
+            #[cfg(not(test))]
+            {
+                rx.recv().await
+            }
+            #[cfg(test)]
+            {
+                tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("support actor input wait exceeded test deadline")
+            }
         };
+        let command = tokio::select! { biased;
+            _ = delivery.changed.notified() => continue,
+            command = receive => match command { Some(command) => command, None => break },
+        };
+        #[cfg(test)]
+        if let Command::Barrier(done) = command {
+            let _ = done.send(());
+            continue;
+        }
+        if delivery.denied.get().is_some() {
+            continue;
+        }
         match command {
-            Command::Input(generation, input) => {
-                let mut backoff = Duration::from_millis(10);
-                // Retain the actual failed input, not just a denial bit. Later
-                // inputs cannot overtake it; collection cannot erase it either.
-                loop {
-                    #[cfg(test)]
-                    delivery.hooks.apply_attempts.fetch_add(1, Ordering::SeqCst);
-                    match apply(&ctx, &input, &mut trust).await {
-                        Apply::Done => break,
-                        Apply::Permanent => {
-                            delivery.deny();
-                            return;
-                        }
-                        Apply::Retry => {}
-                    }
-                    #[cfg(test)]
-                    delivery.hooks.apply_failed.notify_one();
-                    if consent_input(&input).is_some_and(|value| value.is_none_or(|c| !c.enabled)) {
-                        let config = ctx.config.clone();
-                        if !matches!(
-                            ctx.io
-                                .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
-                                    support_store::erase_statement(&config)
-                                })
-                                .await,
-                            Ok(Ok(()))
-                        ) {
-                            delivery.deny();
-                        }
-                        #[cfg(test)]
-                        delivery.hooks.after_fallback.pause().await;
-                    }
-                    if delivery.permanent.load(Ordering::SeqCst) || rx.is_closed() {
-                        return;
-                    }
-                    // Keep arrival order, but allow a later verified consent to
-                    // supersede this failed consent. Intervening commands stay
-                    // queued, and delivered > applied blocks every collection
-                    // until that replacement itself has successfully applied.
-                    let superseded =
-                        if let (Some(old), Some(current)) = (consent_input(&input), &trust) {
-                            let replacement = deferred.iter().find_map(|command| match command {
-                                Command::Input(_, input) => consent_input(input)
-                                    .flatten()
-                                    .filter(|new| supersedes(old, new))
-                                    .cloned(),
-                                _ => None,
-                            });
-                            if let Some(new) = replacement {
-                                let current = Arc::clone(current);
-                                ctx.io
-                                    .run(tokio::time::Instant::now() + IO_DEADLINE, move || {
-                                        current.verify(&new, support_log::now_unix_millis()).is_ok()
-                                    })
-                                    .await
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                    if superseded {
-                        break;
-                    }
-                    let retry_at = tokio::time::Instant::now() + backoff;
-                    loop {
-                        tokio::select! { biased;
-                            _ = tokio::time::sleep_until(retry_at) => break,
-                            command = rx.recv() => {
-                                let Some(command) = command else { return; };
-                                if deferred.len() == QUEUE { delivery.deny(); return; }
-                                deferred.push_back(command);
-                            }
-                        }
-                    }
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-                // Only the actor writes applied, and only the generation just
-                // applied. A late operation cannot grant a newer generation:
-                // delivered has already advanced, so equality is impossible.
-                #[cfg(test)]
-                delivery.hooks.after_apply.pause().await;
+            Command::Input(input) => {
+                let shutdown = matches!(input, Input::Shutdown);
                 match &input {
                     Input::Trust { .. } => active = true,
                     Input::Fence | Input::Shutdown => active = false,
-                    Input::Consent(_) | Input::Update(_) | Input::Invalid => {}
+                    _ => {}
                 }
-                applied = generation;
-                delivery.applied.store(applied, Ordering::SeqCst);
+                if let Err(reason) = apply(&ctx, &delivery, input, &mut trust).await {
+                    delivery.deny(reason);
+                }
                 #[cfg(test)]
-                delivery.hooks.after_recorded.pause().await;
-                if matches!(input, Input::Shutdown) {
-                    return;
+                delivery.hooks.after_apply.pause().await;
+                if shutdown {
+                    break;
                 }
             }
             Command::Collect {
                 request_id,
                 window,
                 deadline,
-                permit,
+                generation,
                 #[cfg(test)]
                 done,
             } => {
-                let ctx = Arc::clone(&ctx);
-                let client = client.clone();
-                let origin = origin.clone();
                 let stop = Stop {
                     delivery: Arc::clone(&delivery),
-                    generation: applied,
+                    generation,
                 };
-                let current = trust.clone();
-                let auth = if !active || stop.stopped() {
-                    Err(Refusal::NotConsented)
-                } else {
+                if !budget.admit(tokio::time::Instant::now()) || stop.stopped() {
+                    delivery.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let auth = if active {
                     Ok(())
+                } else {
+                    Err(Refusal::NotConsented)
                 };
-                tokio::spawn(async move {
-                    collect(
-                        ctx, &client, &origin, request_id, window, deadline, stop, current, auth,
-                    )
-                    .await;
-                    drop(permit);
-                    #[cfg(test)]
-                    if let Some(done) = done {
-                        let _ = done.send(());
-                    }
-                });
+                if let Err(reason) = collect(
+                    Arc::clone(&ctx),
+                    &client,
+                    &origin,
+                    request_id,
+                    window,
+                    deadline,
+                    &stop,
+                    trust.clone(),
+                    auth,
+                )
+                .await
+                {
+                    delivery.deny(reason);
+                }
+                let _ = delivery.word.compare_exchange(
+                    generation | 1,
+                    generation,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                #[cfg(test)]
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
             #[cfg(test)]
-            Command::Barrier(done) => {
-                let _ = done.send(());
-            }
+            Command::Barrier(_) => unreachable!(),
         }
     }
 }
@@ -821,36 +758,46 @@ async fn collect(
     request_id: Uuid,
     window: u64,
     deadline: tokio::time::Instant,
-    stop: Stop,
+    stop: &Stop,
     trust: Option<Arc<Trust>>,
     auth: Result<(), Refusal>,
-) {
+) -> Result<(), Denied> {
     let mut receipt = Receipt::new(request_id, window, Outcome::Failed);
-    let mut request_started = false;
-    // Reserve time for the terminal audit within the same absolute deadline.
+    let work_deadline = deadline - AUDIT_RESERVE;
     let work = async {
-        let url = endpoint(origin, request_id)?;
-        let prepared = match auth {
-            Ok(()) => {
+        let url = match endpoint(origin, request_id) {
+            Ok(url) => url,
+            Err(_) => return Ok(()),
+        };
+        let prepared = match (auth, trust.clone()) {
+            (Ok(()), Some(current)) => {
                 let work = Arc::clone(&ctx);
-                let current = trust.clone().ok_or(Refusal::NotConsented)?;
+                #[cfg(test)]
+                let delivery = Arc::clone(&stop.delivery);
                 ctx.io
                     .run_with(
-                        (tokio::time::Instant::now() + IO_DEADLINE).min(deadline - AUDIT_RESERVE),
+                        (tokio::time::Instant::now() + IO_DEADLINE).min(work_deadline),
                         move |owned| {
+                            #[cfg(test)]
+                            delivery.hooks.prepare.pause();
                             authorize(&work.config, &current)?;
                             prepare(&work, request_id, window, deadline, owned)
                         },
                     )
                     .await
-                    .unwrap_or(Err(Refusal::Failed))
+                    .map_err(Denied::from)?
             }
-            Err(reason) => Err(reason),
+            (Err(reason), _) => Err(reason),
+            _ => Err(Refusal::NotConsented),
         };
+        if stop.stopped() {
+            receipt.outcome = Outcome::Cancelled;
+            return Ok(());
+        }
         let token = trust
             .as_ref()
             .and_then(|t| t.token.as_ref())
-            .ok_or(Refusal::Failed)?;
+            .ok_or(Denied::InvalidUpdate)?;
         let mut request = client.post(url).bearer_auth(token.as_ref());
         let mut sending_bundle = false;
         match prepared {
@@ -888,8 +835,8 @@ async fn collect(
                         move || support_store::append(&path, &refusal),
                     )
                     .await
-                    .map_err(|_| Refusal::Failed)?
-                    .map_err(|_| Refusal::Failed)?;
+                    .map_err(Denied::from)?
+                    .map_err(Denied::storage)?;
                 request = request.json(&RefusalBody::from(reason));
             }
         }
@@ -897,46 +844,52 @@ async fn collect(
         stop.delivery.hooks.before_send.pause().await;
         if sending_bundle {
             let config = ctx.config.clone();
-            let current = trust.clone().ok_or(Refusal::NotConsented)?;
-            // Last filesystem operation before creating/polling the request.
-            // Only the unavoidable worker reply crosses an await here.
-            ctx.io
+            let current = trust.clone().ok_or(Denied::InvalidUpdate)?;
+            // Final disk authorization, after all body/header preparation.
+            let authorized = ctx
+                .io
                 .run(
-                    (tokio::time::Instant::now() + IO_DEADLINE).min(deadline - AUDIT_RESERVE),
+                    (tokio::time::Instant::now() + IO_DEADLINE).min(work_deadline),
                     move || authorize(&config, &current),
                 )
                 .await
-                .map_err(|_| Refusal::Failed)??;
+                .map_err(Denied::from)?;
+            if authorized.is_err() {
+                receipt.outcome = Outcome::Cancelled;
+                return Ok(());
+            }
         }
-        if stop.stopped() {
-            return Err(Refusal::NotConsented);
+        #[cfg(test)]
+        stop.delivery.hooks.before_claim.pause().await;
+        if tokio::time::Instant::now() >= work_deadline {
+            receipt.outcome = Outcome::Failed;
+            return Ok(());
         }
-        // Starting is the boundary. A later change drops this future, including
-        // a stalled connect/TLS handshake, but the one body may still arrive.
-        request_started = true;
-        let result = request.send().await;
-        if !matches!(result, Ok(response) if response.status().is_success()) {
-            receipt.outcome = Outcome::UploadFailed;
+        if !stop.claim_start() {
+            receipt.outcome = Outcome::Cancelled;
+            return Ok(());
         }
-        Ok::<(), Refusal>(())
-    };
-    let result = tokio::select! { biased;
-        _ = stop.changed() => None,
-        result = tokio::time::timeout_at(deadline - AUDIT_RESERVE, work) => Some(result),
-    };
-    match result {
-        None => receipt.outcome = Outcome::Cancelled,
-        Some(Ok(Ok(()))) => {}
-        Some(Err(_)) if request_started => receipt.outcome = Outcome::Cancelled,
-        _ if stop.stopped() => receipt.outcome = Outcome::Cancelled,
-        _ => receipt.outcome = Outcome::Failed,
+        // No await between the atomic start claim and creation/polling of send.
+        receipt.outcome = tokio::select! { biased;
+            _ = stop.changed() => Outcome::Cancelled,
+            response = tokio::time::timeout_at(work_deadline, request.send()) => match response {
+                Ok(Ok(response)) if response.status().is_success() => receipt.outcome,
+                Ok(_) => Outcome::UploadFailed,
+                Err(_) => Outcome::Cancelled,
+            },
+        };
+        Ok::<(), Denied>(())
     }
-    // run refuses an expired deadline and retains any unfinished job. There
-    // is no detached Tokio blocking job and no late audit enqueue.
+    .await;
+    if work.is_err() {
+        receipt.outcome = Outcome::Failed;
+    }
+    // Never cancel a healthy filesystem job. Even a delivered off waits for
+    // preparation to complete, then this receipt, before the actor applies it.
     let path = ctx.path.clone();
     #[cfg(test)]
     let delivery = Arc::clone(&stop.delivery);
-    let _ = ctx
+    let audit = ctx
         .io
         .run_with(deadline, move |owned| {
             #[cfg(test)]
@@ -944,7 +897,10 @@ async fn collect(
             owned.flight = None;
             support_store::append(&path, &receipt)
         })
-        .await;
+        .await
+        .map_err(Denied::from)
+        .and_then(|r| r.map_err(Denied::storage));
+    work.and(audit)
 }
 
 #[cfg(test)]

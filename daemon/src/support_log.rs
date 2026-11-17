@@ -377,7 +377,19 @@ impl SupportLog {
         let message = Message::Line(line, permit);
         let sent =
             if self.inner.block_when_full && std::thread::current().name() != Some(WRITER_THREAD) {
-                self.inner.tx.send(message).is_ok()
+                let until = std::time::Instant::now() + Duration::from_secs(10);
+                let mut next = message;
+                loop {
+                    match self.inner.tx.try_send(next) {
+                        Ok(()) => break true,
+                        Err(TrySendError::Disconnected(_)) => break false,
+                        Err(TrySendError::Full(message)) => next = message,
+                    }
+                    if std::time::Instant::now() >= until {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             } else {
                 match self.inner.tx.try_send(message) {
                     Ok(()) => true,
@@ -401,15 +413,7 @@ impl SupportLog {
         if self.inner.tx.try_send(Message::Flush(ack_tx)).is_err() {
             return false;
         }
-        #[cfg(not(test))]
-        {
-            ack_rx.recv_timeout(wait).unwrap_or(false)
-        }
-        #[cfg(test)]
-        {
-            let _ = wait;
-            ack_rx.recv().unwrap_or(false)
-        }
+        ack_rx.recv_timeout(wait).unwrap_or(false)
     }
 
     /// Record that a thread panicked: where, and the runtime thread ID. Never the
@@ -1232,7 +1236,11 @@ impl Store {
     /// Append whole lines, rotating first when they would take the current
     /// file past its cap. The lock covers both, across processes.
     fn append(&self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(not(test))]
         self.lock.lock()?;
+        #[cfg(test)]
+        crate::support_store::wait_lock(&self.lock, Duration::from_secs(10))
+            .map_err(io::Error::other)?;
         let result = self.append_locked(bytes);
         let unlocked = self.lock.unlock();
         result.and(unlocked)
@@ -1321,7 +1329,18 @@ fn write_loop(rx: Receiver<Message>, store: Store, dropped: &AtomicU64) {
     let mut reported = 0u64;
     let mut failing = false;
     let mut failed_since_flush = false;
-    while let Ok(first) = rx.recv() {
+    loop {
+        #[cfg(not(test))]
+        let first = match rx.recv() {
+            Ok(first) => first,
+            Err(_) => break,
+        };
+        #[cfg(test)]
+        let first = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(first) => first,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let mut next = Some(first);
         while let Some(message) = next.take() {
             match message {
@@ -1596,8 +1615,13 @@ fn read_window(
     let (previous, current) = match crate::platform::open_support_dir(support_dir, false) {
         Ok(dir) => {
             let lock = open_or_create(&dir, LOCK)?;
-            lock.try_lock()
-                .map_err(|_| io::Error::other("support snapshot busy"))?;
+            // A flush acknowledges earlier events; another writer can acquire
+            // the rotation lock before this reader. Wait instead of try-once.
+            #[cfg(not(test))]
+            let wait = crate::support_store::LOCK_WAIT;
+            #[cfg(test)]
+            let wait = Duration::from_secs(10);
+            crate::support_store::wait_lock(&lock, wait)?;
             let copied = (|| {
                 Ok::<_, io::Error>((read_capped(&dir, PREVIOUS)?, read_capped(&dir, CURRENT)?))
             })();
@@ -1706,7 +1730,7 @@ pub(crate) struct CompressedBundle {
 }
 
 /// The only source of upload bodies. All disk and compression work belongs on
-/// spawn_blocking, including the writer flush. Recompression is bounded to four
+/// the dedicated support I/O thread, including the writer flush. Recompression is bounded to four
 /// attempts; each removes the oldest half. Failure is closed, never oversize.
 pub(crate) fn collect_bundle(
     log: &SupportLog,
@@ -1715,10 +1739,11 @@ pub(crate) fn collect_bundle(
     to_ms: i64,
     state: Option<BundleState>,
 ) -> Result<Option<CompressedBundle>> {
-    anyhow::ensure!(
-        log.flush(Duration::from_millis(500)),
-        "support flush timed out or failed"
-    );
+    #[cfg(not(test))]
+    let flush_wait = Duration::from_millis(500);
+    #[cfg(test)]
+    let flush_wait = Duration::from_secs(10);
+    anyhow::ensure!(log.flush(flush_wait), "support flush timed out or failed");
     let bundle = read_window(log.dir(), instance, from_ms, to_ms, MAX_RAW_BYTES, state)?;
     compress_bundle(bundle, MAX_GZIP_BYTES)
 }

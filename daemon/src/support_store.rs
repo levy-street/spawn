@@ -132,24 +132,43 @@ pub(crate) fn load(config: &Path, trust: &Trust, now: u64) -> Result<Stored, Ref
     }
     Ok(stored)
 }
-// A bounded wait handles ordinary overlap with status/another writer. Actor
-// retries keep the input pending after this wait, with a capped async backoff.
+#[derive(Debug, thiserror::Error)]
+#[error("support storage lock wait expired")]
+pub(crate) struct LockExpired;
+pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Blocking, bounded lock acquisition on the support worker, also in tests.
+pub(crate) fn wait_lock(file: &File, wait: std::time::Duration) -> Result<()> {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if std::time::Instant::now() >= until {
+            return Err(LockExpired.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
 fn consent_lock(config: &Path) -> Result<File> {
-    let mut last = None;
-    for _attempt in 0..5 {
+    let until = std::time::Instant::now() + LOCK_WAIT;
+    loop {
         match CONSENT.try_lock_file(&config.join(CONSENT_LOCK)) {
             Ok(lock) => return Ok(lock),
-            Err(error) => last = Some(error),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => return Err(error),
         }
-        #[cfg(not(test))]
-        if _attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        if std::time::Instant::now() >= until {
+            return Err(LockExpired.into());
         }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    Err(last.expect("lock attempted"))
 }
-/// Allocation-free fallback when a delivered off cannot be stored. The actor
-/// still retains that input and denies; losing this file loses the replay floor.
+/// One best-effort removal on terminal denial. Losing it loses the replay floor.
 pub(crate) fn erase_statement(config: &Path) -> Result<()> {
     match std::fs::remove_file(config.join(CONSENT_NAME)) {
         Ok(()) => spawnd::secret_file::sync_parent_directory(config).map_err(Into::into),
@@ -198,7 +217,7 @@ pub(crate) fn apply_budgeted(
     }
     let same_statement = match (&old_consent, &stored.consent) {
         (None, None) => true,
-        (Some(old), Some(new)) => old.same_statement(new),
+        (Some(old), Some(new)) => old == new,
         _ => false,
     };
     if same_statement && old_off == stored.server_off && !revocations_changed {
@@ -405,8 +424,7 @@ fn append_locked(dir: &cap_std::fs::Dir, receipt: &Receipt) -> Result<()> {
 fn locked_dir(path: &Path) -> Result<(cap_std::fs::Dir, File)> {
     let dir = crate::platform::open_support_dir(path, true)?;
     let lock = open(&dir, SENT_LOCK)?;
-    lock.try_lock()
-        .map_err(|_| std::io::Error::other("support receipts busy"))?;
+    wait_lock(&lock, LOCK_WAIT)?;
     Ok((dir, lock))
 }
 pub(crate) fn append(path: &Path, receipt: &Receipt) -> Result<()> {
@@ -415,7 +433,9 @@ pub(crate) fn append(path: &Path, receipt: &Receipt) -> Result<()> {
     append_locked(&dir, receipt)
 }
 pub(crate) fn recent(path: &Path) -> Result<Vec<Receipt>> {
-    let (dir, _lock) = locked_dir(path)?;
+    // Status reads only existing files. A concurrent partial append can make
+    // this best-effort view unavailable; it must never create a lock or folder.
+    let dir = crate::platform::open_support_dir(path, false)?;
     let mut receipts = read_receipts(&dir)?;
     receipts.drain(..receipts.len().saturating_sub(5));
     Ok(receipts)
@@ -430,7 +450,7 @@ pub(crate) struct Flight {
 pub(crate) fn begin(path: &Path, receipt: &Receipt) -> Result<Flight, Refusal> {
     let (dir, _lock) = locked_dir(path).map_err(|_| Refusal::Failed)?;
     let flight = open(&dir, FLIGHT_LOCK).map_err(|_| Refusal::Failed)?;
-    flight.try_lock().map_err(|_| Refusal::RateLimited)?;
+    wait_lock(&flight, LOCK_WAIT).map_err(|_| Refusal::RateLimited)?;
     let receipts = read_receipts(&dir).map_err(|_| Refusal::Failed)?;
     if rate_limited(&receipts, receipt.time) {
         return Err(Refusal::RateLimited);

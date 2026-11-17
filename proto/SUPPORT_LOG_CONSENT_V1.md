@@ -67,53 +67,70 @@ statement exists, cleanup does not create a lock file.
   or null.
 - `{"type":"support_log.collect","request_id":"<uuid>","since_seconds":N}`
   requests collection. UUID parsing and signed-integer parsing happen before
-  dispatch. N is clamped to 60–259200. Malformed support extensions and frames deny support
-  only. Registration parses its ordinary fields independently, including for a
-  wrong type, unknown consent field or over-cap carried list.
+  dispatch. N is clamped to 60–259200. Malformed support extensions deny support only; malformed ordinary frames
+  retain the ordinary parser result. Registration parses its ordinary fields independently, including for a
+  wrong type, unknown consent field or over-cap carried list. The ordinary parse
+  runs first, with master's field types and JSON features. Only `registered` and
+  `host.support_log_consent` get a second extension parse, into absent/null/valid/
+  invalid. Duplicate support fields and frames over 64 KiB are invalid support;
+  the ordinary parser keeps its existing WebSocket bound and duplicate semantics.
 
-One optional actor is created at daemon startup and survives all control
-reconnects. Unavailable storage leaves it absent: collections receive no answer;
-startup, registration, sessions and cleanup otherwise proceed normally.
-Consent (including null), actual credential/trust changes, failed or timed-out
-credential loads, teardown and shutdown advance one delivered generation before
-their bounded, nonwaiting enqueue. Unchanged credential polls are not inputs and
-do not cancel collections or charge quota. One notification wakes the single
-collection waiter; dispatch delivery only clones the already shared input. Trust inputs share
-immutable pin/account/token projections, not whole credential records.
+One optional sequential actor owns sharing across control reconnects. Startup
+schedules its preparation without waiting; collection is unavailable until ready.
+The existing delivery queue is present immediately, so early trust and withdrawal
+cannot be lost during preparation. Preparation is the actor's first awaited job;
+failure enters the same terminal denial. Dispatch
+clones the parsed support payload, advances one generation with a compare-exchange
+loop, clears the request-started bit, tries the bounded queue and notifies the
+actor. It does no support filesystem or cryptographic work. Queue operations may
+allocate and payload destruction may occur. Actual trust changes, failed or
+timed-out credential observations, consent, teardown and shutdown advance the
+generation; unchanged observations deliver nothing.
 
-The actor applies inputs in arrival order. Its dedicated worker rereads and reverifies disk before preparation and again
-as the last operation before the request is created. Allowed requires
-its applied generation to equal delivered for the collection's stop token.
-An old operation can record only its own generation, so finishing after a newer
-delivery cannot grant that newer generation. A failed input stays pending and
-denies; retries wait for the consent lock up to 40 ms per attempt, with actor
-backoff from 10 ms to one second. These are minimum retry intervals even when
-other inputs arrive. Later trust never clears a failed consent.
-A later verified consent that outranks the pending one may supersede it; queued
-inputs still apply in order and collection stays blocked until the replacement
-is applied. Replacement checks use the current trust; a queued new signer or
-an invalid pending timestamp can prevent replacement until restart. Status says
-that restart may be required. The inbox and retry backlog each have at most 32 entries. Overflow
-permanently denies this process, without closing the control connection.
+The actor takes one input at a time, in arrival order, and finishes it before
+taking another. A combined trust/consent update stays one input. Received trust
+and revocations are retained before writes. Collection runs inside that same
+loop: admission budget, one preparation job (authorization, durable reservation,
+snapshot and compression), one final disk authorization job, atomic start claim,
+request selected against generation change, then one final receipt job. During
+collection, delivery still advances the generation immediately, while queued
+updates wait for collection to finish. Every filesystem job is awaited to
+completion or its deadline; healthy work is never abandoned. Lock waits are
+bounded at about two seconds. No job queues behind unfinished work. The dedicated
+thread is not joined at daemon shutdown.
 
-If off cannot be persisted, the actor attempts an allocation-free unlink of the
-stored statement, retains the pending off, and continues denying. Failed unlink
-or directory sync permanently denies this process. This condition and admission
-drop counts appear in status via the daemon heartbeat (up to its 30-second
-refresh interval; unavailable storage can prevent reporting). Support revocations
-are accumulated separately, capped at 256 distinct keys; the next distinct key
-permanently denies support alone. Connection admission retains master's uncapped
-revocation set. Consent has its own process-wide budget: at most 30 state-changing
-write attempts per rolling ten minutes. Exhaustion permanently denies support
-until restart, rather than discarding an input and continuing to share.
+Any update failure enters terminal `Denied(reason)` for the rest of this process:
+storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
+storage worker, the consent write budget, the 256-key support revocation floor,
+delivery queue overflow or delivery-gate contention, invalid support update, or
+generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
+write failures also deny. Later inputs are drained and ignored, and stored consent
+is removed once, best-effort; a dead or unfinished worker can prevent that removal.
+No collection is admitted in `Denied`. Status gives the reason in plain words and
+says restarting SPAWN D on that machine clears the process denial. The normal
+heartbeat can be up to 30 seconds old, and storage failure can prevent reporting.
 
-Successful persistence survives restart; in-memory pending work, overflow deny,
-and the admission bucket do not. A fallback unlink also loses timestamp and
-revocation floors. An **honest server must redeliver current consent in
-`registered`, before collection**, including after a failed persistence/restart.
-A dishonest server could already withhold a turn-off; after state loss it can
-also replay an old valid on. This is a residual, not restart durability for a
-failed write. Direct device delivery of withdrawal is not implemented here.
+An account whose server delivers more than 256 removed devices cannot share from
+that host. Restart does not cure it while that history is redelivered. Connection
+revocations remain uncapped, as on master. More than 30 sharing changes in ten
+minutes pauses sharing on that host until restart; ordinary toggles across devices
+can reach this budget. Unchanged effective state skips writes, including a
+comparison of the carried approvals: a refreshed approval path is persisted.
+
+Successful persistence survives restart; terminal process denial and the admission
+bucket do not. Removing the statement also removes its timestamp/revocation floor;
+failed removal can leave an old on. An honest server must redeliver current consent
+in `registered` before collection. A dishonest server can withhold withdrawal or
+replay an old valid on after state loss. There is no host acknowledgement that it
+applied a turn-off; apps must not claim one. Capability, silence and collection
+receipts do not provide that confirmation.
+
+Request start means the single atomic compare-exchange from
+`(collection generation, not started)` to `(collection generation, started)`,
+after the final disk authorization job returns and immediately before `send()`
+is created and polled. Generation and started bit occupy one atomic word.
+Delivery before this transition makes the claim fail: no request is created,
+and the receipt is `cancelled`. Delivery after it abandons the request best-effort.
 
 A collection may begin sending only if, immediately before the request is
 started, the statement stored on this host is valid, enabled, not switched off,
@@ -144,15 +161,11 @@ retained across reconnects. Excess frames are counted and dropped before file
 work: no receipt and no POST. Admitted requests have one 30-second absolute
 deadline including queueing and audit; upload work gets 28 seconds, reserving two
 for terminal audit. Connect timeout is five seconds, HTTP timeout fifteen.
-All collection filesystem work uses one bounded dedicated support worker
-thread: startup directory preparation, consent load/apply, snapshots/state, rate
-accounting and receipts, including terminal audit. Its pending job stays owned
-after caller cancellation/deadline. An overdue job denies new collection
-admission, shown in status. No job is enqueued after its deadline. The thread is
-never joined at shutdown, and stalled startup returns collector unavailable
-after two seconds. Individual I/O waits get at most two seconds (terminal audit
-uses the remaining absolute deadline). One collection at a time is admitted in
-this process, and the cross-process flight lock also covers unfinished snapshots. Durable receipt limits are one collection per five
+All collection filesystem work uses the dedicated support worker. Jobs have a
+three-second deadline, allowing the two-second lock wait to finish and report its
+reason; the final receipt uses the collection's remaining absolute deadline.
+No expired job is submitted. One collection runs at a time in this process, and
+the cross-process flight lock also covers unfinished snapshots. Durable receipt limits are one collection per five
 minutes and twelve per rolling day; refusals are charged and never refund quota.
 
 The body is either `application/gzip` of at most **921600 bytes**, with
@@ -161,15 +174,16 @@ The body is either `application/gzip` of at most **921600 bytes**, with
 
 | Code | Meaning |
 | --- | --- |
-| `not_consented` | Unknown locally proven account, absent/invalid/off/server-disabled statement, or unapplied input |
+| `not_consented` | Unknown locally proven account, absent/invalid/off/server-disabled statement, or stale queued request |
 | `signer_untrusted` | Signer/chain revoked or untrusted, or verified device attribution mismatches |
 | `rate_limited` | Flight lock busy or durable collection quota exhausted |
 | `no_log` | No active writer or no eligible complete records |
 | `failed` | Storage, snapshot, compression or preparation failure |
 
 A request dropped before a response attempts a typed local `cancelled` receipt
-and sends no new refusal; its body may still be delivered. Pending/permanent
-denial, an overdue worker or another collection in flight causes no POST. Destination, audit, deadline or transport failure may leave no response.
+and sends no new refusal; its body may still be delivered. Terminal denial or a
+stale queued generation causes no POST. Destination, audit, deadline or transport
+failure may leave no response.
 Only **2xx** is success (204 is sufficient); 3xx, 4xx and 5xx are upload failures,
 with no following or retry. Servers should use 400 for malformed bodies/headers,
 401/403 for authentication/authorization failures, 404/409 for unknown or closed
@@ -265,10 +279,10 @@ Before the server half or either app ships:
 - Authenticate the bearer token as the host, bind the request ID to that host,
   validate gzip/header limits and typed refusals, and treat only 2xx as success.
 - Expect no POST for excess/admission-dropped requests, unavailable collectors,
-  pending/permanent denial, overdue I/O, another in-flight collection,
+  terminal denial, stale queued requests,
   cancellation, and some destination/audit/deadline/transport failures. Do not
   interpret silence as either success or proof that no bytes arrived.
-- Disclose the restart residual: pending/permanent process denial is lost at
+- Disclose the restart residual: terminal process denial is lost at
   restart. Successful fallback unlink loses the timestamp/revocation floor and
   permits replay of older valid on; failed unlink can leave the original on.
   Honest redelivery does not prove durable withdrawal against an untrusted

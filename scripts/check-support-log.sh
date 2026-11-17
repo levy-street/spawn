@@ -317,7 +317,7 @@ for marker in ("std::fs", "tokio::fs", "File::", "OpenOptions", "include_bytes!"
                "Command::new", "read_to_end", "read_to_string", "crate::host_files", "crate::host_control",
                "crate::upload", "crate::worker_backend", "crate::sessions", "crate::pty"):
     require(marker not in upload, "uploader must not open or produce another byte source: " + marker)
-require(upload_compact.count(".send().await") == 1 and upload.count("client.post(") == 1,
+require(upload_compact.count("request.send()") == 1 and upload.count("client.post(") == 1,
         "exactly one HTTP upload call site")
 require(upload_compact.count(".body(") == 1 and
         ".body(body)" in upload_compact,
@@ -333,19 +333,20 @@ require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra
 # refusal representation/conversion and every function carrying upload bytes;
 # they are a regression guard, NOT a data-flow or security proof.
 import hashlib
-UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '01c0aab6daf9312876286ada3204b82f3f25d9a46edf3bc901582043e67efe02'), ('struct Prepared {', 'fn endpoint(', 'e20d6e9495ede29261791aee19016c0ae0ecc09822db5be43b9186a6f168ad27'), ('async fn collect(', '#[path = "support_tests.rs"]', 'a8f710ee9e7d88580cf268e5d8e70f54cc817b3aeec0757bb937dfaf9a413300')]
+UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '01c0aab6daf9312876286ada3204b82f3f25d9a46edf3bc901582043e67efe02'), ('struct Prepared {', 'fn endpoint(', 'e20d6e9495ede29261791aee19016c0ae0ecc09822db5be43b9186a6f168ad27'), ('async fn collect(', '#[path = "support_tests.rs"]', 'c3742b01347f9c6e339b9a35860074a1a3d4d6724fca18339159d3073156be20')]
 for start, end, digest in UPLOAD_MARKERS:
     require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
     region = upload.split(start, 1)[1].split(end, 1)[0]
     marked = " ".join(value for value, _, _ in tokens(region))
     require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review upload marker: " + start)
 require(upload.count("support_log::collect_bundle(") == 1, "one support reader per collection")
-require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(deadline" in upload_compact,
+require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(work_deadline" in upload_compact,
         "origin-pinned bounded upload required")
 require("request_id: Uuid" in upload and "crate::config::api_url(&base," in upload, "typed request path required")
 require("spawn_blocking" not in upload and "ctx.io.run_with(" in upload_compact,
         "snapshot must run on the dedicated support worker")
-require("tokio::spawn(async move" in upload, "collection needs its own task")
+require(upload.count("tokio::spawn(") == 1 and "tokio::spawn(serve(" in upload_compact,
+        "only the sequential support actor may be spawned")
 for module in (storage, consent, io_worker):
     require("reqwest" not in module and ".post(" not in module, "storage cannot upload")
 run = Path("daemon/src/run.rs").read_text()

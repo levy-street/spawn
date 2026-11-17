@@ -25,7 +25,10 @@ struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl io::Write for Sink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.0
+            .try_lock()
+            .expect("test sink busy")
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -63,7 +66,7 @@ fn rust_log_trace_and_verbose_flags_do_not_widen_the_support_log() {
         tracing::info!(target: "spawnd::run", "inside-a-span");
     });
     assert!(log.flush(Duration::from_secs(10)));
-    let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let stderr = String::from_utf8(sink.0.try_lock().expect("test sink busy").clone()).unwrap();
     assert!(stderr.contains("spawnd-trace") && stderr.contains("tungstenite-trace"));
     let lines = read_lines(log.dir());
     let mut targets = vec!["spawnd::rtc", "tungstenite::protocol", "spawnd::run"];
@@ -412,7 +415,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     // event waited for the writer, this test would never finish.
     let store = Store::open(&path).unwrap();
     let log = SupportLog::open_with(&path, 4, false).unwrap();
-    store.lock.lock().unwrap();
+    crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
     let subscriber = tracing_subscriber::registry().with(log.layer());
     tracing::subscriber::with_default(subscriber, || {
         for index in 0..EVENTS {
@@ -422,13 +425,26 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     // The writer holds at most one batch (64 KiB, a few hundred of these
     // lines) and the channel four more; everything else was dropped.
     let dropped = log.dropped();
-    assert!(dropped >= 1_000, "{dropped}");
     store.lock.unlock().unwrap();
+    assert!(dropped >= 1_000, "{dropped}");
     // Once the writer moves again, everything it had is written and it
     // says how many it lost.
     let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-    log.inner.tx.send(Message::Flush(ack_tx)).unwrap();
-    assert!(ack_rx.recv().unwrap());
+    let mut message = Message::Flush(ack_tx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match log.inner.tx.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(value)) => message = value,
+            Err(TrySendError::Disconnected(_)) => panic!("writer stopped"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer queue stayed full"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(ack_rx.recv_timeout(Duration::from_secs(10)).unwrap());
     let written = read_lines(&path)
         .iter()
         .filter(|line| line["target"] == "spawnd::run")
@@ -550,7 +566,7 @@ fn a_panic_records_location_and_runtime_thread_id_never_payload_or_name() {
         })
         .unwrap();
     let thread_id = format!("{:?}", joined.thread().id());
-    let joined = joined.join();
+    let joined = crate::support::tests::join_thread(joined);
     assert!(joined.is_err());
     let contents = capture.contents();
     let record = contents
@@ -789,10 +805,18 @@ fn legacy_history_is_discarded_and_cannot_enter_the_new_pair() {
 fn dropping_the_last_handle_stops_the_writer() {
     let tmp = capture::private_tempdir();
     let log = SupportLog::open(&tmp.path().join(DIR_NAME)).unwrap();
-    let stopped = log.inner.stopped.lock().unwrap().take().unwrap();
+    let stopped = log
+        .inner
+        .stopped
+        .try_lock()
+        .expect("test stop receiver busy")
+        .take()
+        .unwrap();
     log.push(b"{}\n".to_vec());
     drop(log);
-    stopped.recv().expect("writer retained its sender");
+    stopped
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer retained its sender");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(DIR_NAME).join(CURRENT)).unwrap(),
         "{}\n"
@@ -830,7 +854,7 @@ fn construction_withholds_dynamic_messages_unknown_fields_and_unlisted_errors() 
         },
     );
     assert!(
-        String::from_utf8(sink.0.lock().unwrap().clone())
+        String::from_utf8(sink.0.try_lock().expect("test sink busy").clone())
             .unwrap()
             .contains(&marker),
         "stderr lost its original detail"
@@ -887,16 +911,16 @@ fn startup_refuses_a_busy_lock_without_waiting_for_its_owner() {
     let tmp = capture::private_tempdir();
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
-    store.lock.lock().unwrap();
+    crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
     // Completion is explicit; scheduler delays cannot be mistaken for lock
     // contention. The source guard also pins try_lock at startup.
     let (tx, rx) = mpsc::sync_channel(1);
     let attempt = std::thread::spawn(move || {
         tx.send(SupportLog::open(&path).is_err()).unwrap();
     });
-    let result = rx.recv();
+    let result = rx.recv_timeout(Duration::from_secs(2));
     store.lock.unlock().unwrap();
-    attempt.join().unwrap();
+    crate::support::tests::join_thread(attempt).unwrap();
     assert!(result.unwrap());
 }
 
@@ -934,7 +958,7 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
     }
     assert!(lines.last().unwrap()["fields"].get("message").is_none());
     assert!(lines.last().unwrap()["fields"].get("error").is_none());
-    let stderr = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let stderr = String::from_utf8(sink.0.try_lock().expect("test sink busy").clone()).unwrap();
     assert!(stderr.contains(error) && stderr.contains(&marker));
     let stderr_lines: Vec<_> = stderr.lines().collect();
     assert_eq!(
@@ -1025,11 +1049,11 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
     file.write_all(&padding).unwrap();
     drop(file);
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let writer = std::thread::spawn(move || {
-        store.lock.lock().unwrap();
+        crate::support_store::wait_lock(&store.lock, Duration::from_secs(10)).unwrap();
         locked_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
         store
             .append_locked(&render_line(
                 &rfc3339_millis(1000),
@@ -1042,14 +1066,24 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
             .unwrap();
         store.lock.unlock().unwrap();
     });
-    locked_rx.recv().unwrap();
-    let busy = read_window(&path, "00000000", 0, 5000, 4096, None);
-    release_tx.send(()).unwrap();
-    writer.join().unwrap();
-    assert!(
-        busy.is_err(),
-        "a snapshot must not race the writer's rotation"
-    );
+    let locked = locked_rx.recv_timeout(Duration::from_secs(5));
+    let (done, read) = mpsc::channel();
+    let snapshot_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        let _ = done.send(read_window(&snapshot_path, "00000000", 0, 5000, 4096, None));
+    });
+    let early = read.recv_timeout(Duration::from_millis(50));
+    // Always release the writer before asserting or joining either thread.
+    drop(release_tx);
+    crate::support::tests::join_thread(writer).unwrap();
+    let result = if early.is_err() {
+        read.recv_timeout(Duration::from_secs(10))
+    } else {
+        early
+    };
+    crate::support::tests::join_thread(reader).unwrap();
+    locked.unwrap();
+    assert_eq!(result.unwrap().unwrap().lines.len(), 2);
     let bundle = read_window(&path, "00000000", 0, 5000, 4096, None).unwrap();
     assert_eq!(bundle.lines.len(), 2);
     assert!(bundle.lines[0].contains("current"));

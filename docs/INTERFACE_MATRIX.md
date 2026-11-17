@@ -91,11 +91,73 @@ a UUID `request_id` and integer `since_seconds`, clamped to 60–259200. Respons
 use a bounded HTTPS POST to the configured origin and path prefix, with bearer
 daemon token, locally proven account/device consent and current actor generation.
 The process-wide admission bucket survives reconnects; excess frames have no
-POST/receipt. All trust/consent/reload/teardown inputs cancel running collections;
-already released transport bytes cannot be recalled. Pending failure/overflow
-denies in this process; honest `registered` redelivers current consent after
-restart. Only 2xx succeeds. The full frames, headers, refusal enum and limits are in
-[`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
+POST/receipt. Only 2xx succeeds. The full frames, headers, refusal enum and limits
+are in [`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
+
+One optional sequential actor owns sharing across control reconnects. Startup
+schedules its preparation without waiting; collection is unavailable until ready.
+The existing delivery queue is present immediately, so early trust and withdrawal
+cannot be lost during preparation. Preparation is the actor's first awaited job;
+failure enters the same terminal denial. Dispatch
+clones the parsed support payload, advances one generation with a compare-exchange
+loop, clears the request-started bit, tries the bounded queue and notifies the
+actor. It does no support filesystem or cryptographic work. Queue operations may
+allocate and payload destruction may occur. Actual trust changes, failed or
+timed-out credential observations, consent, teardown and shutdown advance the
+generation; unchanged observations deliver nothing.
+
+The actor takes one input at a time, in arrival order, and finishes it before
+taking another. A combined trust/consent update stays one input. Received trust
+and revocations are retained before writes. Collection runs inside that same
+loop: admission budget, one preparation job (authorization, durable reservation,
+snapshot and compression), one final disk authorization job, atomic start claim,
+request selected against generation change, then one final receipt job. During
+collection, delivery still advances the generation immediately, while queued
+updates wait for collection to finish. Every filesystem job is awaited to
+completion or its deadline; healthy work is never abandoned. Lock waits are
+bounded at about two seconds. No job queues behind unfinished work. The dedicated
+thread is not joined at daemon shutdown.
+
+Any update failure enters terminal `Denied(reason)` for the rest of this process:
+storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
+storage worker, the consent write budget, the 256-key support revocation floor,
+delivery queue overflow or delivery-gate contention, invalid support update, or
+generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
+write failures also deny. Later inputs are drained and ignored, and stored consent
+is removed once, best-effort; a dead or unfinished worker can prevent that removal.
+No collection is admitted in `Denied`. Status gives the reason in plain words and
+says restarting SPAWN D on that machine clears the process denial. The normal
+heartbeat can be up to 30 seconds old, and storage failure can prevent reporting.
+
+An account whose server delivers more than 256 removed devices cannot share from
+that host. Restart does not cure it while that history is redelivered. Connection
+revocations remain uncapped, as on master. More than 30 sharing changes in ten
+minutes pauses sharing on that host until restart; ordinary toggles across devices
+can reach this budget. Unchanged effective state skips writes, including a
+comparison of the carried approvals: a refreshed approval path is persisted.
+
+Successful persistence survives restart; terminal process denial and the admission
+bucket do not. Removing the statement also removes its timestamp/revocation floor;
+failed removal can leave an old on. An honest server must redeliver current consent
+in `registered` before collection. A dishonest server can withhold withdrawal or
+replay an old valid on after state loss. There is no host acknowledgement that it
+applied a turn-off; apps must not claim one. Capability, silence and collection
+receipts do not provide that confirmation.
+
+Request start means the single atomic compare-exchange from
+`(collection generation, not started)` to `(collection generation, started)`,
+after the final disk authorization job returns and immediately before `send()`
+is created and polled. Generation and started bit occupy one atomic word.
+Delivery before this transition makes the claim fail: no request is created,
+and the receipt is `cancelled`. Delivery after it abandons the request best-effort.
+
+A collection may begin sending only when this process's final disk read finds a
+valid, enabled statement, not switched off, with its signer still admitted for
+the locally proven account. An input received before request start prevents it.
+After request start, cancellation is best effort: one bundle, at most 900 KiB,
+may still arrive within the 15-second request timeout. Another process's change
+is seen at the next authorization read. A `cancelled` receipt does not prove
+that nothing arrived.
 
 As implemented:
 

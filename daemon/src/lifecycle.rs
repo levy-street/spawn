@@ -208,6 +208,7 @@ mod tests {
             "account-1"
         );
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn support_cleanup_failures_preserve_real_logout_and_reset_commands() {
         crate::support::tests::bounded(async {
@@ -218,6 +219,7 @@ mod tests {
                 "keep-error",
                 "wipe-error",
                 "reset-error",
+                "status",
             ] {
                 let tmp = crate::support_log::capture::private_tempdir();
                 let output = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -227,8 +229,11 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("SPAWN_TEST_SUPPORT_CLEANUP", action)
+                    .env("SPAWN_TEST_TEMP_ROOT", tmp.path())
                     .env("SPAWN_CONFIG_DIR", tmp.path().join("config"))
                     .env("SPAWN_INSTALL_ROOT", tmp.path().join("install"))
+                    .env("SPAWND_WORKER_DIR", tmp.path().join("workers"))
+                    .env("XDG_RUNTIME_DIR", tmp.path().join("runtime"))
                     .env("XDG_CONFIG_HOME", tmp.path().join("settings"))
                     .env("XDG_STATE_HOME", tmp.path().join("state"))
                     .env("LOCALAPPDATA", tmp.path().join("local"))
@@ -243,6 +248,13 @@ mod tests {
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
+                if action == "status" {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(stdout.contains("sharing      off"));
+                    assert!(stdout.contains("kept on this machine"));
+                    assert!(!stdout.contains("collector unavailable"));
+                    continue;
+                }
                 assert!(String::from_utf8_lossy(&output.stderr)
                     .contains("support sharing cleanup failed"));
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -263,6 +275,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn support_cleanup_command_child() {
         let Ok(action) = std::env::var("SPAWN_TEST_SUPPORT_CLEANUP") else {
@@ -272,8 +285,70 @@ mod tests {
         // complete-file credential paths run; native keyring calls use its mock
         // provider, and the existing service-disable flag prevents OS effects.
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
-        let config = crate::config::config_dir().unwrap();
-        std::fs::create_dir_all(&config).unwrap();
+        let config = crate::config::config_path().unwrap();
+        let root =
+            PathBuf::from(std::env::var_os("SPAWN_TEST_TEMP_ROOT").expect("isolated test root"));
+        // Resolve exactly the helpers the real commands use, before invoking
+        // any command. On other platforms the tests are disabled: XDG cannot
+        // redirect native state/log locations there.
+        for path in [
+            config.clone(),
+            config.join("credentials.json"),
+            dirs::config_dir().unwrap(),
+            PathBuf::from(std::env::var_os("SPAWND_WORKER_DIR").expect("isolated worker path")),
+            crate::service::instance_state_path(&config).unwrap(),
+            crate::service::instance_log_path(&config).unwrap(),
+            crate::support_log::support_dir(&config).unwrap(),
+            crate::install::layout_for_instance(&config)
+                .unwrap()
+                .root()
+                .to_owned(),
+        ] {
+            assert!(
+                path.starts_with(&root) && path != root,
+                "command path escapes test root"
+            );
+        }
+        if action == "status" {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener); // only loopback can be contacted, and it refuses at once
+            crate::status::run(
+                Some(origin.clone()),
+                crate::cli::StatusArgs { json: false },
+                true,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_dir(&root).unwrap().count(),
+                0,
+                "status created a path"
+            );
+            crate::platform::create_private_dir_all(&config).unwrap();
+            spawnd::secret_file::SecretFile::new("test", ".test.", 4096)
+                .write(&config.join("credentials.json"), b"{}")
+                .unwrap();
+            crate::status::run(
+                Some(origin),
+                crate::cli::StatusArgs { json: false },
+                true,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read_dir(&config).unwrap().count(),
+                1,
+                "status created a file or lock"
+            );
+            return;
+        }
+        crate::platform::create_private_dir_all(&config).unwrap();
         let mut record = crate::creds::StoredCreds::default();
         let revision = crate::creds::credential_revision(&record).unwrap();
         record.access_token = Some("test-token".into());
@@ -292,6 +367,9 @@ mod tests {
             std::fs::create_dir(&credential_path).unwrap();
         }
         let result = if action.starts_with("reset") {
+            assert!(crate::worker_backend::worker_dir()
+                .unwrap()
+                .starts_with(&root));
             reset(ResetArgs { yes: true }, true).await
         } else {
             logout(

@@ -1193,6 +1193,50 @@ pub fn load() -> Result<StoredCreds> {
     })
 }
 
+/// Status inspects the same records without a lock, temp cleanup, migration,
+/// or directory creation. Atomic credential replacement gives a coherent file.
+pub(crate) fn load_for_status(config: &Path) -> Result<StoredCreds> {
+    if !config.try_exists()? {
+        return Ok(StoredCreds::default());
+    }
+    let from_file = load_file_record_at(&config.join("credentials.json"))?;
+    #[cfg(windows)]
+    {
+        load_without_keyring(from_file)
+    }
+    #[cfg(not(windows))]
+    {
+        if keyring_disabled() {
+            return load_without_keyring(from_file);
+        }
+        let default = crate::platform::default_config_base()
+            .context("cannot resolve default user config dir")?;
+        let scope = keyring_scope_at(config, &default)?;
+        // Calculate a legacy migration's view in memory; status never writes
+        // or deletes keyring records either.
+        let keyring = read_scoped_keyring_record_with(
+            &scope,
+            from_file.as_ref(),
+            platform_policy(),
+            keyring_get_for_user,
+            |_, _| Ok(()),
+            |_| Ok(()),
+        );
+        #[cfg(unix)]
+        {
+            resolve_unix_keyring_read_with_warning(from_file, keyring, true)
+        }
+        #[cfg(not(unix))]
+        {
+            reconcile_backend_records(
+                from_file,
+                keyring.map_err(|failure| failure.error)?,
+                platform_policy(),
+            )
+        }
+    }
+}
+
 fn load_unlocked() -> Result<StoredCreds> {
     load_unlocked_with_keyring_warning(true)
 }

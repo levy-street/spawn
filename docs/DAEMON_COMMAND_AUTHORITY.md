@@ -41,9 +41,16 @@ not deleted.
 | Host file operations | Authenticated host DataChannel with capability-rooted operations | Preserve admission, revocation, filesystem capabilities, and replay/cancellation rules during the durable-state work |
 | Conversation inspect (pair-admitted device over `spawn.host.ctl`; reads, and notes Codex threads) | `conv.inspect` is answered only on a host channel admitted through an authenticated device pair; a legacy protocol-1 host channel, admitted on the server's binding alone, answers `pair_required`. It reads the window's own process tree, Claude Code's live-session registry, which Codex thread files the window's Codex holds open (with the first line of each held rollout, to tell a subagent's thread apart), and Codex's shared server's own record (`<CODEX_HOME>/app-server-daemon/daemon.pid`), to say a window's Codex is on that server. It executes nothing, reads no process arguments or environment, and has no effect on the host beyond noting each Codex window's thread id in spawnd's own folder for them (`<config>/conversations/`, one file per window, removed when the server stops the window for good with `session.kill`) | Keep it to reads and those notes. Later `conv.*` operations that act on a conversation inherit the same pair admission and still need durable effect identity before execution |
 | Codex launch probe (pair-admitted device over `spawn.host.ctl`, `conv.launch`) | When a device about to type Codex into a window asks `conv.launch`, the daemon runs one fixed command, `codex --no-daemon --version`, by the path the `PATH` of the environment it started that window's shell with finds, with that environment, in the window's folder, with a 5 s timeout; only on Linux and macOS, and only for a window whose shell this daemon started (none for an adopted worker). Relative `PATH` entries (`node_modules/.bin`) are looked up from the window's folder, as its shell would. It runs no shell to learn that environment, keeps nothing between asks, and runs on no timer. The run is spawnd's own child, as its user — on Linux in spawnd's service cgroup, outside every window's scope and its limits — in a process group of its own that is killed whole at the timeout; at most 3 run at once across the daemon, and a launch that cannot start one within 1 s is answered null (plain `codex`) rather than queued. A legacy host channel answers `pair_required`; the server never sees the request. The device naming the window chooses which window's environment, never the program or its arguments; such a device can already type into the window. The answer (does that Codex accept `--no-daemon`, or unknown) goes only to the asking device. Like any `codex` run it refreshes Codex's own scratch folder under `<CODEX_HOME>/tmp/`; a `codex` an agent planted on that `PATH` runs at the next launch's ask, as it would at the launch itself | Keep it to that one invocation (pinned by `scripts/check-no-server-agent-upload.sh`); any further probe needs its own review |
-| Support log collection (`support_log.collect`) | Optional process-wide actor; locally proven account, verified signer/device attribution and enabled signed consent. Inputs advance one generation and cancel running work; only equal applied/delivered generations authorize from reverified disk. Failed inputs remain pending; queue overflow denies permanently for this process. Admission bucket bounds requests/refusals across reconnects; durable quota bounds bundles. Typed gzip/refusal bodies use one prefix-preserving HTTPS POST with bearer daemon token; only 2xx succeeds | Daemon-only; no server sender/storage or app switch. Persisted state survives restart; pending/overflow denial does not. Honest registration redelivers current consent before collection; withholding remains a dishonest-server residual. Starting a request is the authorization boundary; cancellation is best effort and may leave one full 900 KiB bundle delivered within the 15-second request timeout. Cross-process changes are seen at the next authorization read. See `proto/SUPPORT_LOG_CONSENT_V1.md` and `TRUST.md` |
+| Support log collection (`support_log.collect`) | One optional sequential actor; locally proven account, verified signer/device attribution and enabled signed consent. Dispatch advances a generation immediately; each input and collection finishes before the next. Any update failure enters terminal `Denied(reason)`. Admission budget and durable quota bound collection. One prefix-preserving HTTPS POST carries a typed gzip/refusal body and bearer token; only 2xx succeeds | Daemon-only; no server sender/storage or app switch. Honest registration redelivers current consent. Request start is the atomic generation/start-bit claim after final disk authorization; later cancellation is best effort, with at most one 900 KiB bundle within the 15-second timeout. Cross-process changes are seen at the next authorization read. See `proto/SUPPORT_LOG_CONSENT_V1.md` and `TRUST.md` |
 | Daemon self-update | Server requests an update; daemon verifies signed artifacts and its local rollback policy | Audit request authority separately from artifact authenticity; retain local downgrade consent and pair rollback guarantees |
 | Device/root trust changes | Endpoint signatures plus local pins; revocation is deny-direction | Preserve these boundaries while resolving custody and offline root-rotation transitions |
+
+Request start means the single atomic compare-exchange from
+`(collection generation, not started)` to `(collection generation, started)`,
+after the final disk authorization job returns and immediately before `send()`
+is created and polled. Generation and started bit occupy one atomic word.
+Delivery before this transition makes the claim fail: no request is created,
+and the receipt is `cancelled`. Delivery after it abandons the request best-effort.
 
 A collection may begin sending only if, immediately before the request is
 started, the statement stored on this host is valid, enabled, not switched off,
@@ -54,10 +61,55 @@ change arrives, but its body (one bundle, at most 900 KiB) may still be delivere
 and it ends within the 15-second request timeout in any case. A change written
 by another process of the same instance is seen at the next authorisation read.
 
-Consent writes are deduplicated and limited to 30 changes per ten minutes;
-exhaustion denies support until restart. A pending replacement may require
-restart too. One dedicated worker retains unfinished I/O; overdue work blocks
-collection, and the worker cannot hold daemon shutdown.
+One optional sequential actor owns sharing across control reconnects. Startup
+schedules its preparation without waiting; collection is unavailable until ready.
+The existing delivery queue is present immediately, so early trust and withdrawal
+cannot be lost during preparation. Preparation is the actor's first awaited job;
+failure enters the same terminal denial. Dispatch
+clones the parsed support payload, advances one generation with a compare-exchange
+loop, clears the request-started bit, tries the bounded queue and notifies the
+actor. It does no support filesystem or cryptographic work. Queue operations may
+allocate and payload destruction may occur. Actual trust changes, failed or
+timed-out credential observations, consent, teardown and shutdown advance the
+generation; unchanged observations deliver nothing.
+
+The actor takes one input at a time, in arrival order, and finishes it before
+taking another. A combined trust/consent update stays one input. Received trust
+and revocations are retained before writes. Collection runs inside that same
+loop: admission budget, one preparation job (authorization, durable reservation,
+snapshot and compression), one final disk authorization job, atomic start claim,
+request selected against generation change, then one final receipt job. During
+collection, delivery still advances the generation immediately, while queued
+updates wait for collection to finish. Every filesystem job is awaited to
+completion or its deadline; healthy work is never abandoned. Lock waits are
+bounded at about two seconds. No job queues behind unfinished work. The dedicated
+thread is not joined at daemon shutdown.
+
+Any update failure enters terminal `Denied(reason)` for the rest of this process:
+storage I/O failure, lock wait expiry, storage job deadline, stopped/panicked
+storage worker, the consent write budget, the 256-key support revocation floor,
+delivery queue overflow or delivery-gate contention, invalid support update, or
+generation exhaustion (a terminal atomic word prevents any start claim). Collection storage-job deadlines, worker death and receipt
+write failures also deny. Later inputs are drained and ignored, and stored consent
+is removed once, best-effort; a dead or unfinished worker can prevent that removal.
+No collection is admitted in `Denied`. Status gives the reason in plain words and
+says restarting SPAWN D on that machine clears the process denial. The normal
+heartbeat can be up to 30 seconds old, and storage failure can prevent reporting.
+
+An account whose server delivers more than 256 removed devices cannot share from
+that host. Restart does not cure it while that history is redelivered. Connection
+revocations remain uncapped, as on master. More than 30 sharing changes in ten
+minutes pauses sharing on that host until restart; ordinary toggles across devices
+can reach this budget. Unchanged effective state skips writes, including a
+comparison of the carried approvals: a refreshed approval path is persisted.
+
+Successful persistence survives restart; terminal process denial and the admission
+bucket do not. Removing the statement also removes its timestamp/revocation floor;
+failed removal can leave an old on. An honest server must redeliver current consent
+in `registered` before collection. A dishonest server can withhold withdrawal or
+replay an old valid on after state loss. There is no host acknowledgement that it
+applied a turn-off; apps must not claim one. Capability, silence and collection
+receipts do not provide that confirmation.
 
 Installation containment does not prevent arbitrary execution through the
 remaining launch or probe surfaces. Do not describe this release as making a

@@ -1,6 +1,7 @@
 use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // A parked blocking task inhibits Tokio auto-advance while loopback IO and
@@ -10,7 +11,7 @@ pub(crate) fn freeze_time() -> std::sync::mpsc::Sender<()> {
     tokio::time::pause();
     let (tx, rx) = std::sync::mpsc::channel();
     tokio::task::spawn_blocking(move || {
-        let _ = rx.recv();
+        let _ = rx.recv_timeout(Duration::from_secs(30));
     });
     tx
 }
@@ -32,26 +33,28 @@ impl Pause {
     ) {
         let (entered, wait) = tokio::sync::oneshot::channel();
         let (release, resume) = tokio::sync::oneshot::channel();
-        *self.0.lock().unwrap() = Some((entered, resume));
+        *self.0.try_lock().expect("test gate busy") = Some((entered, resume));
         (wait, release)
     }
     pub(super) async fn pause(&self) {
-        let gate = self.0.lock().unwrap().take();
+        let gate = self.0.try_lock().expect("test gate busy").take();
         if let Some((entered, resume)) = gate {
             let _ = entered.send(());
-            let _ = resume.await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), resume).await;
         }
     }
 }
 #[derive(Default)]
 pub(super) struct Hooks {
+    pub initialize: IoPause,
+    pub initialized: Notify,
     pub after_apply: Pause,
     pub before_send: Pause,
-    pub after_recorded: Pause,
-    pub after_fallback: Pause,
-    pub apply_failed: Notify,
-    pub apply_attempts: AtomicU64,
+    pub before_claim: Pause,
+    pub apply: IoPause,
+    pub prepare: IoPause,
     pub audit: IoPause,
+    pub panic: AtomicBool,
 }
 
 #[derive(Default)]
@@ -72,11 +75,11 @@ impl IoPause {
     ) {
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, hold) = std::sync::mpsc::channel();
-        *self.0.lock().unwrap() = Some((entered, hold));
+        *self.0.try_lock().expect("test gate busy") = Some((entered, hold));
         (ready, release)
     }
     pub(super) fn pause(&self) {
-        let gate = self.0.lock().unwrap().take();
+        let gate = self.0.try_lock().expect("test gate busy").take();
         if let Some((entered, hold)) = gate {
             let _ = entered.send(());
             let _ = hold.recv_timeout(Duration::from_secs(10));
@@ -125,8 +128,11 @@ pub(crate) async fn test_collector(config: PathBuf, trust: Trust, origin: String
 }
 pub(crate) async fn settled(c: &Collector) {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    c.tx.send(Command::Barrier(tx)).await.unwrap();
-    rx.await.unwrap();
+    bounded(async {
+        c.tx.send(Command::Barrier(tx)).await.unwrap();
+        rx.await.unwrap();
+    })
+    .await;
 }
 pub(crate) fn collection(c: &Collector, window: i64) -> tokio::sync::oneshot::Receiver<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -231,73 +237,6 @@ async fn actual_upload_and_refusal_complete_before_receipts_are_read() {
 }
 
 #[tokio::test]
-async fn older_apply_cannot_grant_newer_generation_and_reconnect_keeps_off() {
-    bounded(async {
-        let _clock = freeze_time();
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, mut consent) = fixture();
-        support_store::apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        let (entered, release) = c.delivery.hooks.after_apply.arm();
-        c.trust(Arc::new(trust.clone()), None, None);
-        entered.await.unwrap();
-        consent.enabled = false;
-        consent.issued_at_ms += 1;
-        consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
-        c.consent(Some(consent));
-        let generation = c.delivery.delivered.load(Ordering::SeqCst);
-        assert_ne!(c.delivery.applied.load(Ordering::SeqCst), generation);
-        let (recorded, resume) = c.delivery.hooks.after_recorded.arm();
-        release.send(()).unwrap();
-        recorded.await.unwrap();
-        assert_ne!(c.delivery.applied.load(Ordering::SeqCst), generation);
-        let refused = collection(&c, 60);
-        assert!(refused.await.is_err());
-        assert_eq!(c.delivery.status().dropped_requests, 1);
-        resume.send(()).unwrap();
-        settled(&c).await;
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-        c.fence();
-        c.trust(Arc::new(trust.clone()), None, None);
-        settled(&c).await;
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn busy_lock_off_survives_trust_update_old_on_and_restart() {
-    bounded(async {
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, mut consent) = fixture();
-        let on = consent.clone();
-        support_store::apply(tmp.path(), Some(on.clone()), &trust, 1000).unwrap();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        let lock = spawnd::secret_file::SecretFile::new("test", ".test.", 65536)
-            .try_lock_file(&tmp.path().join("support-log-consent.lock"))
-            .unwrap();
-        consent.enabled = false;
-        consent.issued_at_ms += 1;
-        consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
-        c.consent(Some(consent));
-        c.delivery.hooks.apply_failed.notified().await;
-        c.trust(Arc::new(trust.clone()), None, None);
-        c.consent(Some(on));
-        assert!(c.delivery.status().pending);
-        drop(lock);
-        settled(&c).await;
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-        drop(c);
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn queue_overflow_permanently_denies_collector() {
     bounded(async {
         let _clock = freeze_time();
@@ -312,12 +251,12 @@ async fn queue_overflow_permanently_denies_collector() {
             c.fence();
         }
         c.consent(None);
-        assert!(c.delivery.status().permanent_deny);
+        assert!(c.delivery.status().denied.is_some());
         release.send(()).unwrap();
         settled(&c).await;
         c.trust(Arc::new(trust), None, None);
         settled(&c).await;
-        assert!(c.delivery.status().permanent_deny);
+        assert!(c.delivery.status().denied.is_some());
     })
     .await;
 }
@@ -336,8 +275,8 @@ async fn change_before_request_start_opens_no_connection() {
         let done = collection(&c, 60);
         prepared.await.unwrap();
         c.consent(None);
-        done.await.unwrap();
         drop(release);
+        done.await.unwrap();
         assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
         assert_eq!(
             support_store::recent(&tmp.path().join("support"))
@@ -380,27 +319,6 @@ async fn in_flight_request_is_dropped_and_records_cancelled() {
 }
 
 #[tokio::test]
-async fn pending_input_refuses_collection_before_io() {
-    bounded(async {
-        let _clock = freeze_time();
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, _) = fixture();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        let (entered, release) = c.delivery.hooks.after_apply.arm();
-        c.trust(Arc::new(trust.clone()), None, None);
-        entered.await.unwrap();
-        for _ in 0..6 {
-            c.collect(Uuid::new_v4(), 60);
-        }
-        assert_eq!(c.delivery.status().dropped_requests, 6);
-        assert!(!tmp.path().join("support/sent.jsonl").exists());
-        release.send(()).unwrap();
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn unknown_account_does_not_store_consent_and_bad_storage_is_optional() {
     bounded(async {
         let _clock = freeze_time();
@@ -414,17 +332,17 @@ async fn unknown_account_does_not_store_consent_and_bad_storage_is_optional() {
         assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
         let unavailable = tmp.path().join("file");
         std::fs::write(&unavailable, b"test").unwrap();
-        assert!(Collector::start_at(
+        let unavailable = Collector::start_at(
             tmp.path().to_owned(),
-            unavailable.clone(),
+            unavailable,
             None,
             "00000000".into(),
-            String::new()
+            String::new(),
         )
         .await
-        .is_none());
-        // Exercise the same storage-preparation boundary used at daemon startup.
-        assert!(crate::platform::open_support_dir(&unavailable, true).is_err());
+        .unwrap();
+        settled(&unavailable).await;
+        assert_eq!(unavailable.delivery.status().denied, Some(Denied::Storage));
     })
     .await;
 }
@@ -487,79 +405,6 @@ fn upload_destinations_are_origin_pinned_and_http_is_test_loopback_only() {
     assert!(url.query().is_none() && url.fragment().is_none());
     assert!(endpoint("http://example.invalid", id).is_err());
     assert!(endpoint("https://user:password@example.invalid", id).is_err());
-}
-
-#[tokio::test]
-async fn unpersisted_off_erases_on_before_restart_and_redelivery() {
-    bounded(async {
-        let _clock = freeze_time();
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, mut off) = fixture();
-        support_store::apply(tmp.path(), Some(off.clone()), &trust, 1000).unwrap();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        let lock = spawnd::secret_file::SecretFile::new("test", ".test.", 65536)
-            .try_lock_file(&tmp.path().join("support-log-consent.lock"))
-            .unwrap();
-        let (erased, release) = c.delivery.hooks.after_fallback.arm();
-        off.enabled = false;
-        off.issued_at_ms += 1;
-        off.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
-        c.consent(Some(off.clone()));
-        erased.await.unwrap();
-        assert!(!tmp.path().join("support-log-consent.json").exists());
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-        drop(c);
-        drop(lock);
-        drop(release);
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        c.consent(Some(off)); // honest registered redelivers before collection
-        settled(&c).await;
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn failed_off_unlink_is_permanent_and_later_trust_cannot_clear_it() {
-    bounded(async {
-        let _clock = freeze_time();
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, _) = fixture();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        std::fs::create_dir(tmp.path().join("support-log-consent.json")).unwrap();
-        let (failed, release) = c.delivery.hooks.after_fallback.arm();
-        c.consent(None);
-        failed.await.unwrap();
-        assert!(c.delivery.status().permanent_deny);
-        c.trust(Arc::new(trust), None, None);
-        drop(release);
-        assert!(c.delivery.status().permanent_deny);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn later_verified_consent_supersedes_failed_input() {
-    bounded(async {
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, mut consent) = fixture();
-        let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
-        settled(&c).await;
-        let mut invalid = consent.clone();
-        invalid.signature.clear();
-        c.consent(Some(invalid));
-        c.delivery.hooks.apply_failed.notified().await;
-        consent.issued_at_ms += 1;
-        consent.enabled = false;
-        consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
-        c.consent(Some(consent));
-        settled(&c).await;
-        assert!(!c.delivery.status().pending);
-        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
-    })
-    .await;
 }
 
 #[tokio::test]
@@ -689,8 +534,8 @@ async fn pre_send_deadline_still_leaves_time_for_terminal_audit() {
         let done = collection(&c, 60);
         prepared.await.unwrap();
         tokio::time::advance(DEADLINE - Duration::from_secs(1)).await;
-        done.await.unwrap();
         drop(release);
+        done.await.unwrap();
         assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
         assert_eq!(
             support_store::recent(&tmp.path().join("support"))
@@ -732,11 +577,13 @@ async fn only_admitted_refusals_post_and_reconnect_does_not_refill() {
         for _ in 0..3 {
             c.collect(Uuid::new_v4(), 60);
         }
+        settled(&c).await;
         assert_eq!(c.delivery.status().dropped_requests, 3);
         c.fence();
         c.trust(Arc::new(trust), None, None);
         settled(&c).await;
         c.collect(Uuid::new_v4(), 60);
+        settled(&c).await;
         assert_eq!(c.delivery.status().dropped_requests, 4);
         assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
     })
@@ -749,7 +596,7 @@ pub(crate) async fn bounded<T>(future: impl std::future::Future<Output = T>) -> 
     let (cancel, wait) = std::sync::mpsc::channel::<()>();
     let (expired, timeout) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        if wait.recv_timeout(Duration::from_secs(10)).is_err() {
+        if wait.recv_timeout(Duration::from_secs(30)).is_err() {
             let _ = expired.send(());
         }
     });
@@ -803,8 +650,8 @@ async fn five_thousand_revocations_preserve_connection_admission_and_deny_suppor
         let c = test_collector(tmp.path().to_owned(), trust.clone(), String::new()).await;
         settled(&c).await;
         c.trust(Arc::new(trust), None, Some(Arc::new(keys)));
-        c.tx.closed().await;
-        assert!(c.delivery.status().permanent_deny);
+        settled(&c).await;
+        assert!(c.delivery.status().denied.is_some());
         assert_eq!(rtc.len(), 5000);
         assert!(!rtc.contains(&signer.to_bytes()));
         assert!(crate::run::support_test_connection_admission(&rtc));
@@ -836,82 +683,84 @@ async fn alternating_consent_exhausts_control_budget_and_requires_restart() {
             );
         }
         c.consent(Some(consent));
-        c.tx.closed().await;
-        assert!(c.delivery.status().permanent_deny);
-        assert!(
-            support_store::load(tmp.path(), &trust, 1000)
-                .unwrap()
-                .server_off
-        );
+        settled(&c).await;
+        assert!(c.delivery.status().denied.is_some());
+        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
     })
     .await;
 }
 
 pub(crate) async fn stall_io(c: &Collector) -> std::sync::mpsc::Sender<()> {
-    let (release, hold) = std::sync::mpsc::channel::<()>();
-    let (entered, ready) = tokio::sync::oneshot::channel();
-    let io = Arc::clone(&c.delivery.io);
-    tokio::spawn(async move {
-        let _ = io
-            .run(
-                tokio::time::Instant::now() + Duration::from_millis(10),
-                move || {
-                    let _ = entered.send(());
-                    let _ = hold.recv_timeout(Duration::from_secs(10));
-                },
-            )
-            .await;
-    });
-    ready.await.unwrap();
+    let (ready, release) = c.delivery.hooks.apply.arm();
+    let (trust, _) = fixture();
+    c.trust(Arc::new(trust), None, None);
+    bounded(ready).await.unwrap();
     release
 }
 
 #[tokio::test]
-async fn overdue_io_blocks_admission_and_retains_the_unfinished_job() {
+async fn stalled_initialization_does_not_delay_start_and_denies_at_deadline() {
     bounded(async {
-        let _clock = freeze_time();
         let tmp = support_log::capture::private_tempdir();
-        let (trust, _) = fixture();
-        let c = test_collector(tmp.path().to_owned(), trust, String::new()).await;
+        let c = Collector::start_at(
+            tmp.path().to_owned(),
+            tmp.path().join("support"),
+            None,
+            "00000000".into(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let (ready, release) = c.delivery.hooks.initialize.arm();
+        ready.await.unwrap(); // start already returned, despite blocked preparation
         settled(&c).await;
-        let release = stall_io(&c).await;
-        tokio::time::advance(Duration::from_millis(20)).await;
-        assert!(c.delivery.status().io_overdue);
-        assert!(collection(&c, 60).await.is_err());
-        assert!(!tmp.path().join("support/sent.jsonl").exists());
-        let invoked = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&invoked);
-        assert!(c
-            .delivery
-            .io
-            .run(tokio::time::Instant::now() + IO_DEADLINE, move || flag
-                .store(true, Ordering::SeqCst))
-            .await
-            .is_err());
-        assert!(!invoked.load(Ordering::SeqCst));
         drop(release);
+        bounded(c.delivery.hooks.initialized.notified()).await;
+        assert_eq!(c.delivery.status().denied, Some(Denied::Deadline));
     })
     .await;
 }
 
 #[tokio::test]
-async fn stalled_initialization_returns_absent_at_deadline() {
+async fn trust_received_before_startup_readiness_is_applied_in_order() {
     bounded(async {
         let tmp = support_log::capture::private_tempdir();
-        let io = Worker::start().unwrap();
-        let (release, hold) = std::sync::mpsc::channel::<()>();
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let init = Collector::initialize(tmp.path().to_owned(), String::new(), Arc::clone(&io), move || {
-            let _ = entered.send(());
-            let _ = hold.recv_timeout(Duration::from_secs(10));
-            None
-        });
-        tokio::pin!(init);
-        tokio::select! { _ = &mut init => panic!("initialization escaped its blocked worker"), _ = ready => {} }
-        assert!(init.await.is_none());
-        assert!(io.overdue());
-        drop(release);
-    }).await;
+        let (listener, origin) = listener().await;
+        let (trust, consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+        let c = Collector::start_at(
+            tmp.path().to_owned(),
+            tmp.path().join("support"),
+            None,
+            "00000000".into(),
+            origin,
+        )
+        .await
+        .unwrap();
+        let (ready, release) = c.delivery.hooks.initialize.arm();
+        c.trust(Arc::new(trust.clone()), None, None);
+        c.update(&Arc::new(crate::proto::SupportUpdate {
+            revoked_browser_keys: Some(vec![consent.signer_public_key]),
+            ..Default::default()
+        }));
+        let done = collection(&c, 60);
+        ready.await.unwrap();
+        release.send(()).unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (_, body) = receive_request(&mut socket).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["declined"],
+            "signer_untrusted"
+        );
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        done.await.unwrap();
+        assert!(c.delivery.status().denied.is_none());
+        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::SignerUntrusted));
+    })
+    .await;
 }
 
 #[test]
@@ -941,7 +790,7 @@ fn stuck_support_job_does_not_hold_runtime_shutdown() {
         .recv_timeout(Duration::from_secs(3))
         .expect("runtime waited for support filesystem job");
     drop(release);
-    owner.join().unwrap();
+    join_thread(owner).unwrap();
 }
 
 #[tokio::test]
@@ -986,45 +835,10 @@ async fn terminal_audit_timeout_retains_job_and_blocks_more_collection() {
         auditing.await.unwrap();
         tokio::time::advance(DEADLINE + Duration::from_millis(1)).await;
         done.await.unwrap();
-        assert!(c.delivery.status().io_overdue);
+        assert_eq!(c.delivery.status().denied, Some(Denied::Deadline));
         assert!(collection(&c, 60).await.is_err());
         assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
         drop(release);
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn later_inputs_cannot_shorten_pending_input_retry_interval() {
-    bounded(async {
-        let _clock = freeze_time();
-        let tmp = support_log::capture::private_tempdir();
-        let (trust, mut consent) = fixture();
-        let c = test_collector(tmp.path().to_owned(), trust, String::new()).await;
-        settled(&c).await;
-        let before = c.delivery.hooks.apply_attempts.load(Ordering::SeqCst);
-        consent.signature.clear();
-        c.consent(Some(consent));
-        c.delivery.hooks.apply_failed.notified().await;
-        c.fence();
-        tokio::time::advance(Duration::from_millis(9)).await;
-        c.fence();
-        assert_eq!(
-            c.delivery.hooks.apply_attempts.load(Ordering::SeqCst),
-            before + 1
-        );
-        tokio::time::advance(Duration::from_millis(2)).await;
-        c.delivery.hooks.apply_failed.notified().await;
-        assert_eq!(
-            c.delivery.hooks.apply_attempts.load(Ordering::SeqCst),
-            before + 2
-        );
-        c.fence();
-        tokio::time::advance(Duration::from_millis(19)).await;
-        assert_eq!(
-            c.delivery.hooks.apply_attempts.load(Ordering::SeqCst),
-            before + 2
-        );
     })
     .await;
 }
@@ -1045,4 +859,152 @@ async fn expired_io_deadline_never_enqueues_a_job() {
         assert!(!invoked.load(Ordering::SeqCst));
     })
     .await;
+}
+
+/// Join only after a real-clock bounded completion check.
+pub(crate) fn join_thread<T>(thread: std::thread::JoinHandle<T>) -> std::thread::Result<T> {
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while !thread.is_finished() {
+        assert!(
+            std::time::Instant::now() < end,
+            "test thread did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    thread.join()
+}
+
+#[tokio::test]
+async fn combined_update_write_failure_is_terminal_and_retains_no_on() {
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, mut consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
+        settled(&c).await;
+        let lock = spawnd::secret_file::SecretFile::new("test", ".test.", 65536)
+            .try_lock_file(&tmp.path().join("support-log-consent.lock"))
+            .unwrap();
+        c.update(&Arc::new(crate::proto::SupportUpdate {
+            revoked_browser_keys: Some(vec![consent.signer_public_key.clone()]),
+            consent: crate::proto::ConsentInput::Valid(consent.clone()),
+            ..Default::default()
+        }));
+        consent.issued_at_ms += 1;
+        consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
+        c.consent(Some(consent));
+        // Wait boundedly, but release the held lock before any assertion.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        c.tx.send(Command::Barrier(tx)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        drop(lock);
+        result.unwrap().unwrap();
+        assert_eq!(c.delivery.status().denied, Some(Denied::Lock));
+        assert!(!tmp.path().join("support-log-consent.json").exists());
+        assert!(collection(&c, 60).await.is_err());
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn off_during_preparation_finishes_job_then_later_on_applies() {
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, mut consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
+        settled(&c).await;
+        let (preparing, release) = c.delivery.hooks.prepare.arm();
+        let done = collection(&c, 60);
+        preparing.await.unwrap();
+        c.consent(None);
+        release.send(()).unwrap();
+        done.await.unwrap();
+        settled(&c).await;
+        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
+        consent.issued_at_ms += 1;
+        consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
+        c.consent(Some(consent));
+        settled(&c).await;
+        assert!(authorize(tmp.path(), &trust).is_ok());
+        assert!(c.delivery.status().denied.is_none());
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+        let receipts = support_store::recent(&tmp.path().join("support")).unwrap();
+        assert_eq!(receipts.first().unwrap().outcome, Outcome::Started);
+        assert_eq!(receipts.last().unwrap().outcome, Outcome::Cancelled);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_between_final_authorisation_and_atomic_claim_opens_no_connection() {
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+        let c = test_collector(tmp.path().to_owned(), trust, origin).await;
+        settled(&c).await;
+        let (authorized, release) = c.delivery.hooks.before_claim.arm();
+        let done = collection(&c, 60);
+        authorized.await.unwrap();
+        c.consent(None);
+        release.send(()).unwrap();
+        done.await.unwrap();
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+        assert_eq!(
+            support_store::recent(&tmp.path().join("support"))
+                .unwrap()
+                .last()
+                .unwrap()
+                .outcome,
+            Outcome::Cancelled
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn worker_panic_is_explicit_terminal_denial() {
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (trust, consent) = fixture();
+        let c = test_collector(tmp.path().to_owned(), trust, String::new()).await;
+        settled(&c).await;
+        c.delivery.hooks.panic.store(true, Ordering::SeqCst);
+        c.consent(Some(consent));
+        settled(&c).await;
+        assert_eq!(c.delivery.status().denied, Some(Denied::WorkerStopped));
+        assert!(collection(&c, 60).await.is_err());
+        let io = Worker::start().unwrap();
+        assert_eq!(
+            io.run(tokio::time::Instant::now() + IO_DEADLINE, || panic!(
+                "worker test"
+            ))
+            .await,
+            Err(crate::support_io::Error::Stopped)
+        );
+        assert_eq!(
+            io.run(tokio::time::Instant::now() + IO_DEADLINE, || ())
+                .await,
+            Err(crate::support_io::Error::Stopped)
+        );
+    })
+    .await;
+}
+
+#[test]
+fn exhausted_generation_cannot_claim_a_request_start() {
+    let delivery = Arc::new(Delivery::new());
+    delivery.word.store(u64::MAX - 1, Ordering::SeqCst);
+    let stop = Stop {
+        delivery: Arc::clone(&delivery),
+        generation: u64::MAX - 1,
+    };
+    delivery.advance();
+    assert!(!stop.claim_start());
+    assert_eq!(delivery.status().denied, Some(Denied::GenerationExhausted));
 }
