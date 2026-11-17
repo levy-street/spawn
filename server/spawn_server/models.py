@@ -24,6 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
 from .limits import MAX_SAFE_FENCING_GENERATION
+from .support_log_types import UnsignedMillis
 
 
 def _utcnow() -> datetime:
@@ -473,6 +474,10 @@ class Host(Base):
     # the legacy per-host device-endorsement path is refused for this host so a
     # hostile server cannot steer admission onto the weaker rail. Ratchets up
     # only — an old build reconnecting must not reopen the retired path.
+    # Unused until the later support collection dispatch change.
+    support_log_capable: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     supports_account_chains: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Nullable only for hosts created before the 0017 pairing migration. Every
     # new device-code approval stores an immutable Ed25519 pin here.
@@ -1379,4 +1384,63 @@ class EmailLog(Base):
     body_redacted: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class SupportLogConsent(Base):
+    __tablename__ = "support_log_consents"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    issued_at_ms: Mapped[int] = mapped_column(UnsignedMillis(), nullable=False)
+    signer_device_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="SET NULL"), nullable=True
+    )
+    # The signed attribution survives roster pruning; the FK above can become NULL.
+    signed_device_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    signer_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    signature: Mapped[str] = mapped_column(String(86), nullable=False)
+    carried_endorsements: Mapped[list] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SupportLogCollection(Base):
+    __tablename__ = "support_log_collections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    host_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    decline_code: Mapped[str | None] = mapped_column(String(24))
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    requested_by: Mapped[str] = mapped_column(Text, nullable=False)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    line_count: Mapped[int | None] = mapped_column(Integer)
+    log_from: Mapped[int | None] = mapped_column(BigInteger)
+    log_to: Mapped[int | None] = mapped_column(BigInteger)
+    digest: Mapped[str | None] = mapped_column(String(64))
+    truncated: Mapped[bool | None] = mapped_column(Boolean)
+
+    __table_args__ = (
+        CheckConstraint("state IN ('requested','dispatched','collected','declined','failed',"
+                        "'expired','cancelled','deleted')", name="ck_support_log_state"),
+        CheckConstraint("length(reason) BETWEEN 1 AND 200", name="ck_support_log_reason"),
+        CheckConstraint("window_seconds BETWEEN 60 AND 259200", name="ck_support_log_window"),
+        Index("ix_support_log_state_expiry", "state", "expires_at"),
+        Index("ix_support_log_requested_at", "requested_at"),
+        Index("ix_support_log_state_requested", "state", "requested_at"),
+        Index("ix_support_log_state_dispatched", "state", "dispatched_at"),
     )

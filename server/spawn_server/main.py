@@ -36,10 +36,12 @@ from .routes import push as push_routes
 from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
+from .routes import support_log as support_log_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import waitlist as waitlist_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .support_log_retention import start_sweeps, stop_sweeps
 from .turn import validate_and_log_ice_config
 from .ws import alerts as alerts_ws
 from .ws import browser as browser_ws
@@ -97,9 +99,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:  # noqa: BLE001
             log.warning("builtin agent seed skipped: %s", e)
 
+    support_sweeps = start_sweeps() if settings.support_log_dir else None
     try:
         yield
     finally:
+        if support_sweeps is not None:
+            await stop_sweeps(support_sweeps)
         await get_broker().shutdown()
         await redis_shutdown()
         await dispose_engine()
@@ -136,6 +141,7 @@ def create_app() -> FastAPI:
     app.include_router(push_routes.router)
     app.include_router(release_routes.router)
     app.include_router(sessions_routes.router)
+    app.include_router(support_log_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
     app.include_router(agents_routes.router)

@@ -15,7 +15,7 @@ spawn_server/
                 auth_providers, account_recovery, admin, agents,
                 browser_devices, capabilities, device, device_pairing,
                 host_introductions, hosts, install, profile, push, release,
-                root_introductions, sessions, trust_bundle, waitlist,
+                root_introductions, sessions, support_log, trust_bundle, waitlist,
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
                 broker.py, alerts.py, activity.py, host_signal.py,
@@ -24,6 +24,11 @@ spawn_server/
   models.py     SQLAlchemy models — the schema of record
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
+  support_consent.py       signed statement encoding, validation and current storage
+  support_log.py           collection records and conditional state transitions
+  support_log_types.py     exact unsigned timestamps on SQLite and PostgreSQL
+  support_log_files.py     private atomic disk writes and file presence checks
+  support_log_retention.py bounded sweeps, withdrawal and account deletion cleanup
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
                 web_push, release, invites, limits, rate_limit, trust_events,
                 data_events, host_status, …
@@ -72,6 +77,55 @@ authorization and durable-state requirements for their replacement.
   host-v1 and session-v2 routes remain supported. The daemon advertises
   `supports_device_connections`; an old daemon must produce an explicit update
   refusal. Session channel attachment never becomes a server signaling route.
+
+## Support log storage
+
+`POST /api/support-log/uploads/{request_id}` accepts only a daemon token bound
+to a dispatched collection. No code creates or dispatches a collection yet;
+the functions are reserved for later work. There is no app or download route,
+no operator command and no new websocket behavior. `hosts.support_log_capable`
+is reserved for that later dispatch change.
+
+`SPAWN_SUPPORT_LOG_DIR` is unset by default. Unset means 404 without reading
+the body, no support file access and no sweep task. Set it only to an absolute
+private storage directory outside the repository checkout. The startup sweep
+creates it with mode 0700 in a background thread; uploads stay off until that
+check succeeds. An unusable directory logs one error and leaves storage off.
+Keeping bundles outside the checkout prevents a deploy or source backup from
+copying plain diagnostic logs. They are separate from database backups.
+
+Files are `<record id>.ndjson`, mode 0600, written through a flushed and synced
+temporary file in the same directory before rename and database completion.
+A directory lock coordinates publication and deletion across server workers.
+Database transactions never span a body read or filesystem work. File status
+reports a missing collected file explicitly; it never substitutes an empty log.
+
+Retention starts in the background at startup and repeats every 15 minutes.
+Each pass handles at most 100 entries in each category: expired bundles,
+old requested records, old dispatched records, year-old records and directory
+entries. Directory scanning resumes across passes. Bundles expire after seven
+days; orphans get ten minutes of grace. Open requests expire after 24 hours or
+fail five minutes after dispatch. Collection records last at most 365 days,
+subject to the bounded sweep backlog. Signed statements have no expiry.
+
+The statement table retains the original signed device ID alongside the nullable
+roster reference, so pruning a removed device preserves the signed artifact.
+Unsigned millisecond timestamps use 20-digit decimal text: SQLite integers
+cannot represent all of u64. This preserves ordering without rounding.
+Removing a signer makes every sharing check false without rewriting the statement.
+After storing a signed off statement, a future app route must call
+`sharing_turned_off` to cancel open requests and delete collected files.
+Account deletion already removes those files after its database commit.
+
+HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
+first NDJSON object is the header and is excluded from the event count. The
+server checks JSON object framing, not a new event schema. Content types are
+the two exact wire values, without parameters. Malformed refusals and
+unsupported content types close the attempt as failed, as malformed bundles do.
+JSON refusals have a 256-byte cap. An oversized declared body is refused before
+parsing support headers; absent Content-Length still uses the streaming bound.
+The daemon independently checks consent and trust; these server checks cannot
+enable sharing.
 
 ## Before calling a change done
 
