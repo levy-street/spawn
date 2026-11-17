@@ -591,10 +591,9 @@ mod tests {
     #[test]
     fn state_json_has_the_stable_contract_shape_and_writes_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = StateStore::new(dir.path(), "https://spawnd.dev/");
-        store.path = dir.path().join("state.json");
+        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
         store.disconnected("auth", "token_revoked", 2);
-        let state = read_path(&store.path).unwrap().unwrap();
+        let state = read(dir.path()).unwrap().unwrap();
         let value = serde_json::to_value(&state).unwrap();
         assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["connected"], false);
@@ -642,10 +641,9 @@ mod tests {
     #[test]
     fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = StateStore::new(dir.path(), "https://spawnd.dev/");
-        store.path = dir.path().join("state.json");
+        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
         store.heartbeat(0, None);
-        let state = read_path(&store.path).unwrap().unwrap();
+        let state = read(dir.path()).unwrap().unwrap();
         assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
         assert!(state
             .exe
@@ -653,7 +651,7 @@ mod tests {
             .is_some_and(|exe| std::path::Path::new(exe).is_absolute()));
         assert!(!state.worker_mismatch);
         store.worker_mismatch(true);
-        let state = read_path(&store.path).unwrap().unwrap();
+        let state = read(dir.path()).unwrap().unwrap();
         assert!(state.worker_mismatch);
         assert_eq!(
             serde_json::to_value(&state).unwrap()["worker_mismatch"],

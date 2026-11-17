@@ -21,6 +21,8 @@ struct Request {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
+    ExpiredBeforeSubmission,
+    Busy,
     Deadline,
     Stopped,
 }
@@ -92,13 +94,15 @@ impl Worker {
         if self.stopped.load(Ordering::SeqCst) {
             return Err(Error::Stopped);
         }
-        if Instant::now() >= deadline
-            || self
-                .busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
+        if Instant::now() >= deadline {
+            return Err(Error::ExpiredBeforeSubmission);
+        }
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
-            return Err(Error::Deadline);
+            return Err(Error::Busy);
         }
         let (reply, rx) = oneshot::channel();
         self.tx

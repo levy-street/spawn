@@ -112,7 +112,9 @@ impl Denied {
 impl From<crate::support_io::Error> for Denied {
     fn from(value: crate::support_io::Error) -> Self {
         match value {
-            crate::support_io::Error::Deadline => Self::Deadline,
+            crate::support_io::Error::ExpiredBeforeSubmission
+            | crate::support_io::Error::Busy
+            | crate::support_io::Error::Deadline => Self::Deadline,
             crate::support_io::Error::Stopped => Self::WorkerStopped,
         }
     }
@@ -764,6 +766,8 @@ async fn collect(
     let current = trust.clone();
     #[cfg(test)]
     let delivery = Arc::clone(&stop.delivery);
+    #[cfg(test)]
+    stop.delivery.hooks.before_prepare.pause().await;
     // Absence is checked before authorization, reservation, snapshot or HTTP.
     let prepared = ctx
         .io
@@ -782,9 +786,15 @@ async fn collect(
                 })()))
             },
         )
-        .await
-        .map_err(Denied::from)?
-        .map_err(|_| Denied::Storage)?;
+        .await;
+    let prepared = match prepared {
+        // Only the initial submission can drop: no collection work has started.
+        Err(crate::support_io::Error::ExpiredBeforeSubmission) => {
+            stop.delivery.drop_request();
+            return Ok(());
+        }
+        result => result.map_err(Denied::from)?.map_err(|_| Denied::Storage)?,
+    };
     let Some(prepared) = prepared else {
         stop.delivery.drop_request();
         return Ok(());

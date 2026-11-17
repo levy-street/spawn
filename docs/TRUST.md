@@ -327,8 +327,8 @@ Cancellation attempts a typed `cancelled` receipt and never promises that no
 bytes were sent. The server can ask before relaying off; transport buffering
 cannot strengthen that ordering guarantee.
 
-Collector preparation is scheduled without waiting; ordinary startup never
-waits for support I/O. Logout (both variants), reset and exorcise retain master's
+Collector construction starts no storage job; inputs are processed lazily as
+they arrive. Logout (both variants), reset and exorcise retain master's
 ordinary error behavior and cleanup order; support failure adds a warning only.
 Without a proven account no consent statement is stored or honoured; lock,
 receipt and revocation files may still exist. Status explains unavailable account

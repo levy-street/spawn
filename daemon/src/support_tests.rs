@@ -48,6 +48,7 @@ impl Pause {
 pub(super) struct Hooks {
     pub resolve: IoPause,
     pub after_apply: Pause,
+    pub before_prepare: Pause,
     pub before_send: Pause,
     pub before_claim: Pause,
     pub apply: IoPause,
@@ -1142,6 +1143,45 @@ async fn three_slow_queued_collections_drop_expiry_without_denying() {
         settled(&c).await;
         assert_eq!(c.delivery.status().denied, None);
         assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn expiry_before_initial_submission_drops_without_denying() {
+    bounded(async {
+        let _clock = freeze_time();
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, consent) = fixture();
+        support_store::apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
+        settled(&c).await;
+        let (before_submission, release) = c.delivery.hooks.before_prepare.arm();
+        let (mut preparing, _release) = c.delivery.hooks.prepare.arm();
+        let done = collection(&c, 60);
+        before_submission.await.unwrap();
+        // Dequeue passed, but the first worker submission has not happened.
+        tokio::time::advance(DEADLINE - AUDIT_RESERVE + Duration::from_secs(1)).await;
+        drop(release);
+        done.await.unwrap();
+        settled(&c).await;
+        assert!(matches!(
+            preparing.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(support_store::recent(&tmp.path().join("support"))
+            .unwrap()
+            .is_empty());
+        assert!(futures_util::FutureExt::now_or_never(listener.accept()).is_none());
+        assert_eq!(c.delivery.status().dropped_requests, 1);
+        assert_eq!(c.delivery.status().denied, None);
+        assert!(authorize(tmp.path(), &trust).is_ok());
+        c.consent(None);
+        settled(&c).await;
+        assert_eq!(authorize(tmp.path(), &trust), Err(Refusal::NotConsented));
+        assert_eq!(c.delivery.status().dropped_requests, 1);
+        assert_eq!(c.delivery.status().denied, None);
     })
     .await;
 }

@@ -637,7 +637,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let ws_url = config::ws_url(&server_url)?;
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
-    // Preparation is the actor's first job, never awaited by ordinary startup.
+    // The actor processes inputs lazily as they arrive; startup opens no support storage.
     // Its delivery queue already exists, so early trust/withdrawal is retained.
     let support = crate::support::Collector::start(config_dir.clone(), server_url.to_string());
     let registry = SessionRegistry::new();

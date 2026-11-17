@@ -333,7 +333,7 @@ require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra
 # refusal representation and every function carrying upload bytes;
 # they are a regression guard, NOT a data-flow or security proof.
 import hashlib
-UPLOAD_MARKERS = [('#[serde(tag = "declined", rename_all = "snake_case")]', 'pub(crate) struct Trust {', '851d0947e59bb94da22450470376692fcae746c02fb7df3e6ffa26baec323296'), ('fn prepare(', 'fn endpoint(', 'a00b4d7b12bf5e35d0e0a39fcc142614f4821c6b7cdc96387d063e4d9fb11555'), ('async fn collect(', '#[path = "support_tests.rs"]', 'ada9bbb56aae3050ff2955dd02670fd62f7410b7dfbecbb2ab0866be103c6ae6')]
+UPLOAD_MARKERS = [('#[serde(tag = "declined", rename_all = "snake_case")]', 'pub(crate) struct Trust {', '851d0947e59bb94da22450470376692fcae746c02fb7df3e6ffa26baec323296'), ('fn prepare(', 'fn endpoint(', 'a00b4d7b12bf5e35d0e0a39fcc142614f4821c6b7cdc96387d063e4d9fb11555'), ('async fn collect(', '#[path = "support_tests.rs"]', 'f5b389e55f2043f6a35bb17cff87c5b7075a204b2c41f7255c65b36ff3174a73')]
 for start, end, digest in UPLOAD_MARKERS:
     require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
     region = upload.split(start, 1)[1].split(end, 1)[0]

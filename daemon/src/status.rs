@@ -491,7 +491,7 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
                 "               approved by device {device} at {at} ms since Unix epoch"
             );
         }
-        if sharing.account_unproven && sharing.signer_device_id.is_some() {
+        if sharing.account_unproven {
             let _ = writeln!(
                 text,
                 "               unavailable until a device approval proves the account"
@@ -716,6 +716,52 @@ mod tests {
             json["instances"][0]["support_log"],
             "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl"
         );
+    }
+
+    #[test]
+    fn unproven_account_explains_unavailable_sharing_without_a_signer() {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let (mut trust, _) = crate::support::tests::fixture();
+        trust.account = None;
+        let sharing = crate::support_store::status(tmp.path(), &trust, &tmp.path().join("support"));
+        assert!(sharing.account_unproven);
+        assert!(sharing.signer_device_id.is_none());
+        let output = StatusOutput {
+            host: "host".into(),
+            instances: vec![InstanceStatus {
+                account: "account".into(),
+                config_dir: tmp.path().display().to_string(),
+                server: "https://spawnd.dev/".into(),
+                signed_in: true,
+                connection: "connected".into(),
+                service: crate::service::ServiceStatus {
+                    installed: false,
+                    running: false,
+                    name: String::new(),
+                    manager: None,
+                    stdout_log: None,
+                    stderr_log: None,
+                },
+                sessions: 0,
+                rtc_peers: None,
+                version: "0.1.0".into(),
+                update: String::new(),
+                host_key: None,
+                browser_pins: 1,
+                cli_version: "0.1.0".into(),
+                running: None,
+                release: None,
+                launch: String::new(),
+                pair: String::new(),
+                support_sharing: sharing,
+                support_log: None,
+            }],
+        };
+        let plain = format_plain(&output, 0);
+        assert!(plain.contains(
+            "  sharing      off\n               unavailable until a device approval proves the account\n"
+        ));
+        assert!(!plain.contains("approved by device"));
     }
 
     #[test]
