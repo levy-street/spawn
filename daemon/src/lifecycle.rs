@@ -54,18 +54,28 @@ pub fn disconnect(explicit_config: bool) -> Result<()> {
 }
 
 pub async fn logout(args: LogoutArgs, explicit_config: bool) -> Result<()> {
+    let mut failures = Vec::new();
     for dir in selected_dirs(explicit_config)? {
         let _guard = ConfigDirGuard::set(&dir);
         crate::service::uninstall(&dir)?;
+        let result = if args.wipe_identity {
+            crate::creds::logout().await
+        } else {
+            crate::creds::logout_keep_identity()
+        };
+        if let Err(error) = result {
+            // A support cleanup failure must not leave later instances signed in.
+            failures.push(format!("{error:#}"));
+            continue;
+        }
         if args.wipe_identity {
-            crate::creds::logout().await?;
             println!("spawn: signed out and removed this machine's local identity.");
         } else {
-            crate::creds::logout_keep_identity()?;
             println!("spawn: signed out. This machine's identity and approvals were kept.");
             println!("spawn: sign in again with: spawnd login");
         }
     }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -126,18 +136,17 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
     }
     println!("spawn: terminated {terminated} session worker(s).");
 
+    let mut failures = Vec::new();
     for dir in dirs {
         let _guard = ConfigDirGuard::set(&dir);
         let _ = crate::service::uninstall(&dir);
         crate::possess::forget_release_selection(&dir);
-        crate::creds::reset_local_credentials()?;
-        crate::service::purge_local_instance_data(&dir)?;
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error).with_context(|| format!("removing {}", dir.display()));
-            }
+        let credentials = crate::creds::reset_local_credentials().map(|_| ());
+        if let Err(error) = crate::service::finish_local_removal(&dir, credentials) {
+            failures.push(format!("{error:#}"));
         }
     }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     println!("spawn: This machine is clean. The old entry may still show under Hosts on the web — remove it there.");
     println!("spawn: To set up again: spawnd possess.");
     Ok(())

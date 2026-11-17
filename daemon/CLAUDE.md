@@ -594,39 +594,58 @@ approving device/time, server-off and five recent local receipts.
 
 `support_consent.rs` implements the 102-byte `SPAWN-SUPPORT-LOG-CONSENT-V1`
 statement, specified with generated vectors in `proto/SUPPORT_LOG_CONSENT_V1.md`.
-The same `run::admitted_device` function admits both signed RTC connections and
-consent signers. Require the same account, a valid strict signature and direct
-or carried-chain trust, with at most 64 carried approvals and no revoked party.
-Check on apply, load and every collection, and again after building a snapshot.
-No expiry; newest timestamp wins; reject over 24 hours in the future. Preserve
-the timestamp floor after signer removal. Only a verified newer or identical
-statement clears server-off; null only reduces sharing. An absent registered
-field leaves local state alone. Local support revocations are subtract-only and
-persist across restarts.
+The shared `run::admitted_device` rule verifies direct pins or carried chains;
+consent additionally requires this host's locally proven account and verified
+device attribution. Unknown account means unavailable sharing, without changing
+legacy RTC admission. Newest timestamp wins, off wins an equal-time tie, and
+signers use `max(now, current + 1)` within the 24-hour future bound.
 
-The collection arm only enqueues. `support.rs` owns a bounded queue, independent
-30-second request tasks, and reqwest/rustls with redirects/retries disabled,
-a five-second connect timeout and fifteen-second HTTP timeout. Its only POST
-uses the configured HTTPS origin, existing daemon token and a parsed UUID;
-never accept an upload URL from a frame. An overloaded queue ends that control
-connection and fences its pending uploads. A cross-process lock permits one
-collection through completion, including blocking work surviving a deadline.
-Nothing here takes a lock used by dispatch. Snapshot, state projection,
-compression, consent verification and audit IO run on blocking workers.
+`support.rs` owns one optional process-lifetime actor, outside control tasks.
+Storage failure cannot fail daemon startup. Dispatch hands it Arc snapshots of
+pins/account/token and moved trust inputs; it never clones whole credentials.
+Every consent/trust/reload-start/teardown/shutdown input synchronously advances
+one generation and cancels uploads before a nonwaiting enqueue. Only the actor
+applies inputs, authorizes from reverified disk, and records the exact applied
+generation. Applied must equal delivered for a collection token; an older apply
+cannot grant a newer delivery. Failed inputs remain pending with bounded lock
+wait/retry; unrelated trust cannot clear them. A later verified consent that
+outranks a pending consent may supersede it. Queue overflow, an unremovable off,
+or more than 256 support revocations permanently denies this process. Status
+shows pending/permanent denial and dropped frames through the normal heartbeat.
+The connection revocation accumulator caps at 4096, then denies all identities.
 
-`support_store.rs` alone owns `support-log-consent.json`, through `SecretFile`'s
-atomic owner-only handling. Logout (including keeping identity), reset and
-exorcise remove it. `support/sent.jsonl` rotates once at 128 KiB: 256 KiB total,
-append-only time/UUID/outcome/bytes/lines/window receipts, no general text.
-Durable started reservations and refusals enforce at most one collection per
-five minutes and twelve per rolling day across restarts. Refusals consume quota;
-failures never refund it. Corrupt history fails closed, and retained charged
-records cannot be displaced by a refusal flood. No server receipt is authority.
+A process-wide one-per-minute, burst-three bucket drops excess collection frames
+before file work, receipt or POST, and survives reconnects. Admitted jobs include
+audit within 30 seconds (two seconds reserved for final audit); HTTP gets 15
+seconds, connect five. Snapshot/state/crypto/audit work uses blocking workers.
+The actor rechecks disk before preparation and sending. Each gzip stream chunk
+(at most 4096 bytes) checks the same generation; a select drops a request even
+while connect/TLS stalls. No chunk is released after invalidation, but bytes
+already released to the transport/socket cannot be recalled. Blocking disk work
+may outlive a deadline; its result cannot resume a cancelled upload.
 
-Collection sends gzip at most 900 KiB or one of `not_consented`,
-`signer_untrusted`, `rate_limited`, `no_log`, `failed`. The local file guard
-checks the single POST/body source, forbids additional file opens in the uploader,
-and keeps consent/receipt storage from gaining an upload path.
+`support_store.rs` owns atomic owner-only consent and bounded append-only
+receipts. Failed off persistence falls back to unlinking stored on, while keeping
+off pending; failed unlink/sync permanently denies. Persisted state survives
+restart; pending/overflow deny and the process bucket do not. An honest server
+redelivers current consent in `registered` before collection. A dishonest one
+could already withhold off, and state loss permits old-on replay. Logout (both
+variants), reset and exorcise complete ordinary cleanup before reporting support
+cleanup failures; absent consent needs no new lock.
+
+The only POST uses `config::api_url` (append to the configured path prefix),
+HTTPS, the daemon token and a parsed request UUID. Redirects/retries are disabled;
+only 2xx succeeds. Body sources are the compressed support reader and one typed
+refusal enum. Receipt files rotate once at 128 KiB; durable started/refusal
+charges enforce one bundle per five minutes and twelve per day across restarts.
+Cancellation has a typed `cancelled` terminal receipt. The protocol specifies
+headers, statuses, limits and the full server contract.
+
+The guard pins reviewed body construction, stream/upload markers and the typed
+refusal enum. It rejects extra body/json call sites, shadowed bodies and changed
+byte helpers; this is marker checking, not a provenance proof. Tests use explicit
+completion/barriers and frozen Tokio time, including withdrawal before the
+listener receives body bytes, stalled TLS, apply failures, restart and overflow.
 
 - **Storage.** `support/support-v3.jsonl` and `support-v3.jsonl.1` under the
   instance log directory, rotated at 4 MiB each. These two names occupy at most

@@ -1,5 +1,43 @@
 {
   "contract": "SPAWN-SUPPORT-LOG-CONSENT-V1",
+  "negative": [
+    {
+      "case": "direct_device_mismatch",
+      "consent": {
+        "account_id": "01010101-0101-0101-0101-010101010101",
+        "carried_endorsements": [],
+        "enabled": true,
+        "issued_at_ms": 1700000000000,
+        "signature": "9v7CAzthTtOpW6Z7ujJfGa1zIfwARpobkCaWCEUXC9yH2xS_mPjJEBqmCUTlVWyrpu69uaUieE_aYS2JWW1HBA",
+        "signer_device_id": "08080808-0808-0808-0808-080808080808",
+        "signer_public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+        "version": 1
+      },
+      "expected": "signer_untrusted"
+    },
+    {
+      "case": "chain_device_mismatch",
+      "consent": {
+        "account_id": "01010101-0101-0101-0101-010101010101",
+        "carried_endorsements": [
+          {
+            "account_id": "01010101-0101-0101-0101-010101010101",
+            "endorsed_device_id": "06060606-0606-0606-0606-060606060606",
+            "endorsed_public_key": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+            "endorser_public_key": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+            "signature": "QcWPbE6qDxbS-RaDNgJr8FihIpSQgQue7P1ZvltF9wcrSPCmQFprM4DpLHkn9FW6H1UlO2KZ6EbepkbF6nDmCQ"
+          }
+        ],
+        "enabled": true,
+        "issued_at_ms": 1700000000000,
+        "signature": "Ypydm3-qgyMWfH5Y2xmfydadfYQqZnGZH3p9repvYUZY4iVpCu6XGugQeIcFO-oPtwzgAl94Qonf7X4M3ShdDQ",
+        "signer_device_id": "08080808-0808-0808-0808-080808080808",
+        "signer_public_key": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+        "version": 1
+      },
+      "expected": "signer_untrusted"
+    }
+  ],
   "positive": [
     {
       "consent": {
@@ -33,5 +71,6 @@
     }
   ],
   "producer": "spawnd Rust ed25519-dalek 2.2",
+  "trusted_device_id": "02020202-0202-0202-0202-020202020202",
   "version": 1
 }

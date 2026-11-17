@@ -318,13 +318,30 @@ for marker in ("std::fs", "tokio::fs", "File::", "OpenOptions", "include_bytes!"
     require(marker not in upload, "uploader must not open or produce another byte source: " + marker)
 require(upload_compact.count(".send().await") == 1 and upload.count("client.post(") == 1,
         "exactly one HTTP upload call site")
-require(re.findall(r"\.body\(([^)]*)\)", upload) == ["body"], "only the reader body may be uploaded")
-require("let support_log::CompressedBundle { header, body } = prepared.bundle;" in upload,
+require(upload_compact.count(".body(") == 1 and
+        ".body(reqwest::Body::wrap_stream(guarded_body(body,stop.clone())))" in upload_compact,
+        "only the reader stream may be a raw body")
+require(upload_compact.count(".json(") == 1 and
+        ".json(&RefusalBody::from(reason))" in upload_compact,
+        "only the typed refusal enum may be JSON")
+require(upload.count("let support_log::CompressedBundle { header, body } = prepared.bundle;") == 1,
         "gzip bytes must come from the support reader")
+require(not re.search(r"\blet\s+(?:mut\s+)?body\b", upload), "body shadowing requires review")
+require(not re.search(r"->\s*(?:Vec\s*<\s*u8\s*>|bytes::Bytes)", upload), "extra byte-returning helper")
+# Hash reviewed token markers, not whitespace or line numbers. These pin the
+# refusal representation/conversion and every function carrying upload bytes;
+# they are a regression guard, NOT a data-flow or security proof.
+import hashlib
+UPLOAD_MARKERS = [('enum RefusalBody {', 'pub(crate) struct Trust {', '70adb8f021e8cc302a0eb190ac6c63a89597eb412922fd2a067a1e636fb9e423'), ('struct Prepared {', 'fn endpoint(', '9e3490ca4819b4c11db81b805fd8f46db8b112e4a5fd5e873ad81c29a1370b54'), ('// UPLOAD_BODY_BEGIN: reviewed body provenance markers, pinned by the guard.', '// UPLOAD_BODY_END', 'fba9dc82d7ae2c533692ac18dae40562eef1de13c21988e00e57c1c5fa8ce730'), ('async fn collect(', '#[path = "support_tests.rs"]', 'e9873b47869ff10cf9f3e7e821186d70ecf39cab2b1dd78d51e9285fba51a1c9')]
+for start, end, digest in UPLOAD_MARKERS:
+    require(upload.count(start) == 1 and upload.count(end) == 1, "unique upload marker")
+    region = upload.split(start, 1)[1].split(end, 1)[0]
+    marked = " ".join(value for value, _, _ in tokens(region))
+    require(hashlib.sha256(marked.encode()).hexdigest() == digest, "review upload marker: " + start)
 require(upload.count("support_log::collect_bundle(") == 1, "one support reader per collection")
 require("Policy::none()" in upload and "retry::never()" in upload and "connect_timeout(" in upload and "timeout_at(deadline" in upload_compact,
         "origin-pinned bounded upload required")
-require("request_id: Uuid" in upload and "url.set_path(&format!(" in upload, "typed request path required")
+require("request_id: Uuid" in upload and "crate::config::api_url(&base," in upload, "typed request path required")
 require("tokio::task::spawn_blocking(move || prepare(" in upload, "snapshot must run on a blocking worker")
 require("tokio::spawn(async move" in upload, "collection needs its own task")
 for module in (storage, consent):
@@ -446,10 +463,22 @@ PY_REPLACE
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]); s = p.read_text()
-assert '.body(body)' in s
-p.write_text(s.replace('.body(body)', '.body(arbitrary)'))
+assert '.body(reqwest::Body::wrap_stream(guarded_body(body, stop.clone())))' in s
+p.write_text(s.replace('.body(reqwest::Body::wrap_stream(guarded_body(body, stop.clone())))', '.body(arbitrary)'))
 PY_MUTATE_UPLOAD
   expect_upload_failure "a body not supplied by the support reader"
+
+  for mutation in 'request = request.json(&credentials);' 'request = request.body(arbitrary);' 'let body = arbitrary;' 'fn other_bytes() -> Vec<u8> { elsewhere() }'; do
+    printf '%s\n' "$mutation" >>"$upload_file"
+    expect_upload_failure "extra, shadowed or helper body: $mutation"
+  done
+  python3 -I - "$upload_file" <<'PY_MUTATE_UPLOAD'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+p.write_text(s.replace('guarded_body(body, stop.clone())', 'guarded_body(other_bytes(), stop.clone())') + '\nfn other_bytes() -> Vec<u8> { elsewhere() }\n')
+PY_MUTATE_UPLOAD
+  expect_upload_failure "helper sourcing bytes elsewhere"
 
   local original_policy
   original_policy="$(cat "$fixture/$POLICY")"

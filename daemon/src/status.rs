@@ -240,17 +240,23 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         support_sharing: crate::support_log::support_dir(dir)
             .ok()
             .map(|path| {
-                crate::support_store::status(
+                let mut sharing = crate::support_store::status(
                     dir,
-                    &crate::support::Trust {
-                        account: stored
-                            .proven_account_id()
-                            .and_then(|id| spawnd::host_pair_approval::account_id_bytes(&id).ok()),
-                        record: stored.clone(),
-                        revoked: Default::default(),
-                    },
+                    &crate::support::Trust::from_record(&stored),
                     &path,
-                )
+                );
+                sharing.runtime = crate::state::read(dir)
+                    .ok()
+                    .flatten()
+                    .filter(|state| crate::state::daemon_state_is_live(dir, state))
+                    .and_then(|state| state.support_runtime);
+                if sharing
+                    .runtime
+                    .is_none_or(|state| state.pending || state.permanent_deny)
+                {
+                    sharing.enabled = false;
+                }
+                sharing
             })
             .unwrap_or_default(),
     })
@@ -465,6 +471,32 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
                 "               approved by device {device} at {at} ms since Unix epoch"
             );
         }
+        if sharing.account_unproven {
+            let _ = writeln!(
+                text,
+                "               unavailable until a device approval proves the account"
+            );
+        }
+        if let Some(runtime) = sharing.runtime {
+            if runtime.permanent_deny {
+                let _ = writeln!(
+                    text,
+                    "               denied for this process: support update or queue failure"
+                );
+            } else if runtime.pending {
+                let _ = writeln!(
+                    text,
+                    "               denied while a support update is pending"
+                );
+            }
+            let _ = writeln!(
+                text,
+                "               {} collection requests dropped by admission budget",
+                runtime.dropped_requests
+            );
+        } else {
+            let _ = writeln!(text, "               collector unavailable");
+        }
         if sharing.server_off {
             let _ = writeln!(text, "               the server switched sharing off");
         }
@@ -512,6 +544,7 @@ mod tests {
 
     fn state(version: &str, exe: Option<&str>, worker_mismatch: bool) -> crate::state::StateFile {
         crate::state::StateFile {
+            support_runtime: None,
             pid: std::process::id(),
             process_started_100ns: None,
             task_breakaway_denied: None,

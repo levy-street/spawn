@@ -132,7 +132,7 @@ fn status_reports_verified_attribution_server_off_and_refusals() {
     assert_eq!(shown.issued_at_ms, Some(1000));
     let mut legacy = trust.clone();
     legacy.account = None;
-    assert!(status(tmp.path(), &legacy, &path).enabled);
+    assert!(!status(tmp.path(), &legacy, &path).enabled);
     apply(tmp.path(), None, &trust, 1000).unwrap();
     append(
         &path,
@@ -143,4 +143,100 @@ fn status_reports_verified_attribution_server_off_and_refusals() {
     assert!(!shown.enabled && shown.server_off);
     assert_eq!(shown.recent.len(), 1);
     assert_eq!(shown.recent[0].outcome, Outcome::NotConsented);
+}
+
+#[test]
+fn equal_timestamp_off_wins_and_unproven_account_cannot_store() {
+    let tmp = crate::support_log::capture::private_tempdir();
+    let (mut trust, mut consent) = fixture();
+    apply(tmp.path(), Some(consent.clone()), &trust, 1000).unwrap();
+    consent.enabled = false;
+    consent.sign(&SigningKey::from_bytes(&[7; 32])).unwrap();
+    apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+    assert!(
+        !load(tmp.path(), &trust, 1000)
+            .unwrap()
+            .consent
+            .unwrap()
+            .enabled
+    );
+    trust.account = None;
+    assert!(apply(tmp.path(), None, &trust, 1000).is_err());
+}
+
+#[test]
+fn logout_variants_reset_and_exorcise_finish_ordinary_cleanup_on_support_failure() {
+    for keep_identity in [false, true] {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let (trust, consent) = fixture();
+        apply(tmp.path(), Some(consent), &trust, 1000).unwrap();
+        let lock = CONSENT
+            .try_lock_file(&tmp.path().join(CONSENT_LOCK))
+            .unwrap();
+        let credentials = tmp.path().join("test-credentials");
+        std::fs::write(&credentials, b"test-token").unwrap();
+        let result = cleanup_after(
+            || {
+                if keep_identity {
+                    std::fs::write(&credentials, b"signed-out")?;
+                } else {
+                    std::fs::remove_file(&credentials)?;
+                }
+                Ok(())
+            },
+            || remove(tmp.path()),
+        );
+        assert!(result.is_err());
+        if keep_identity {
+            assert_eq!(std::fs::read(&credentials).unwrap(), b"signed-out");
+        } else {
+            assert!(!credentials.exists());
+        }
+        drop(lock);
+    }
+    // The same aggregator is used by reset/exorcise's local purge; later cleanup
+    // executes even when an earlier support operation failed.
+    let ordinary = std::cell::Cell::new(false);
+    assert!(cleanup_after(
+        || {
+            ordinary.set(true);
+            Ok(())
+        },
+        || anyhow::bail!("injected cleanup failure")
+    )
+    .is_err());
+    assert!(ordinary.get());
+    let tmp = crate::support_log::capture::private_tempdir();
+    std::fs::create_dir(tmp.path().join(CONSENT_LOCK)).unwrap();
+    remove(tmp.path()).unwrap(); // no statement: do not open/create a lock
+}
+
+#[test]
+fn reset_and_exorcise_final_removal_runs_after_consent_lock_failure() {
+    let tmp = crate::support_log::capture::private_tempdir();
+    let config = tmp.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    // A directory at the lock path fails on every supported platform, without
+    // environment changes or touching a service or credential backend.
+    std::fs::write(config.join(CONSENT_NAME), b"{}").unwrap();
+    std::fs::create_dir(config.join(CONSENT_LOCK)).unwrap();
+    assert!(crate::service::finish_local_removal(&config, Ok(())).is_err());
+    assert!(!config.exists());
+}
+
+#[test]
+fn cancellations_without_started_reservations_still_preserve_quota() {
+    let tmp = crate::support_log::capture::private_tempdir();
+    let path = tmp.path().join("support");
+    let mut cancelled = Receipt::new(Uuid::new_v4(), 60, Outcome::Cancelled);
+    for n in 0..12 {
+        // exactly the daily quota, not a load test
+        cancelled.time = 1_000_000 + n * 300_000;
+        append(&path, &cancelled).unwrap();
+    }
+    cancelled.time += 300_000;
+    assert!(matches!(
+        begin(&path, &cancelled),
+        Err(Refusal::RateLimited)
+    ));
 }

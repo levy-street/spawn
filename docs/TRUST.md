@@ -225,38 +225,67 @@ folder, and never reads ordinary daemon output or terminal storage. A typed
 header adds only the documented state counters, classified error kind/time and
 parsed build identity; it never adds general state-file text.
 
-The owner decides through a statement signed by an approved device, checked by
-each host against its own account and the **same device admission function** used
-for signed connections. Direct approval or a carried chain to a trusted device
-must remain valid, with no removed party. The server can say no, never manufacture
-a yes: null disables, while enabling requires a valid device statement. An
-identical still-current statement can clear the server-off flag. The host checks
-the signature and signer on application, on load and at every collection, and
-checks again after preparing the bundle. Newest timestamp wins, statements over
-24 hours in the future are rejected, and consent has no expiry. Support sharing
-retains delivered revocations locally. Logout, reset and exorcise remove consent.
+The owner decides through a statement signed by an approved device. Each host
+requires an account proven by its own retained device approvals; a server-named
+account never enables support sharing. Unknown account disables sharing until
+a device approval establishes it. The same direct-pin/carried-chain admission
+rule is used for connections, with an additional attribution check: the signed
+device ID must match the pin or verified final approval. Legacy connection
+admission and its direct-pin-before-chain-cap order are preserved. Newest time
+wins, off wins a tie, and signers use `max(now, current + 1)` within the 24-hour
+future bound. Consent has no expiry. Null disables; an identical current valid
+statement can clear server-off.
 
-Each host enforces one collection in flight, at most one per five minutes and
-twelve per rolling day from its own durable receipts (refusals count too), a
-60-second to 72-hour window, a 1 MiB complete uncompressed bundle, and a 900 KiB
-gzip body. Every request runs outside control dispatch with a 30-second deadline;
-disk and compression work runs on blocking workers. HTTPS goes only to the host's
-configured server origin with redirects and retries disabled. The host's bounded
-append-only receipts record attempts, results and refusals, and `spawnd status`
-shows sharing, the approving device/time, server-off and recent receipts. Audit
-or verification failure does not authorize disclosure.
+One optional actor owns sharing for the whole process, across reconnects.
+Every delivered consent/trust/reload-start/teardown/shutdown input advances one
+generation and cancels existing work before enqueueing. Only the actor can
+authorize, from reverified disk before preparation and sending, when its applied
+generation equals delivered. “Pending updates block” means a delivered input
+has not successfully applied; a late older apply cannot clear that block. Failed
+inputs stay pending with bounded lock waits and retry backoff. A later verified
+consent that outranks a failed consent may supersede it; unrelated trust never
+does. Inbox/retry queues have 32 slots each; overflow permanently denies this
+process without ending control service. Support revocations cap at 256 then
+deny permanently. The shared connection revocation accumulator caps at 4096,
+then denies all identities, rather than forgetting earlier removals.
 
-A dishonest server can still collect within those limits while sharing is on,
-hold back a signed turn-off, or replay the last on statement to a host that lost
-its local consent state and still trusts that signer. It can withhold evidence
-of a device's removal before a host learns it. It can omit a collection from any
-future server-side history, although the host keeps its own receipts. An upload
-already sent cannot be recalled by a later turn-off. Direct withdrawal over a
-device connection is not implemented in this change. A maliciously delivered
-app or hosted web client could sign without the person's action; this is the
-existing client-delivery residual risk, not protection signatures can provide.
-The exact daemon contract and counter meanings are in
-[`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
+If off cannot be written, unlinking stored on is attempted without allocation.
+Off remains pending; failed unlink or sync permanently denies for this process.
+An honest server redelivers current consent in `registered`, applied before
+collection, including after restart. Only successful persistence survives a
+restart: pending inputs, overflow denial and the process admission bucket do
+not. Unlink fallback or other state loss loses replay/revocation floors. A
+dishonest server could already withhold off and can replay an old valid on after
+state loss. Direct device withdrawal delivery is not implemented here.
+
+A process-wide admission budget allows one request per minute, burst three,
+across reconnects. Excess requests are counted and dropped without file work,
+receipts or POSTs. Admitted collection has one 30-second deadline including
+audit (two seconds reserved for final audit), a five-second connect and
+15-second HTTP timeout. One flight, durable limits of one bundle per five
+minutes/twelve per day (refusals count), a 60-second to 72-hour window, 1 MiB raw
+and 900 KiB gzip cap bound disclosure. Filesystem/compression work runs on blocking
+workers. HTTPS uses the configured origin and path prefix, the daemon token,
+no redirects/retries, and only 2xx succeeds. Body provenance is guarded by typed
+construction, source markers and canaries; the guard is not a proof.
+
+Later inputs discard snapshot results and drop the HTTP future even during
+connect/TLS. Each bounded stream chunk checks its generation before release;
+no further chunk is released after the change. Bytes already handed to the
+transport, including bytes already written to the socket, cannot be recalled.
+The host cannot erase what the server already received. Blocking filesystem
+calls may finish after the deadline, but cannot resume a cancelled upload.
+Cancellation attempts a typed `cancelled` local receipt within that deadline.
+
+Collector startup failure leaves normal daemon service working. Logout (both
+variants), reset and exorcise finish their ordinary cleanup even if support
+cleanup fails, reporting errors afterward. Status explains unavailable account
+proof, pending/permanent deny and admission drops using the normal heartbeat
+(up to 30 seconds old; storage failure may prevent reporting), alongside bounded
+local receipts. No receipt proves server retention. A dishonest server can
+collect within the limits while sharing is on, withhold removals/withdrawal, or
+omit a request from its future history. A maliciously delivered app or web client
+could sign without the person's action; trusted client delivery remains required.
 
 ### Host capacity (2026-08-21)
 

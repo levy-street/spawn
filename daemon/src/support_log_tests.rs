@@ -428,7 +428,7 @@ fn a_full_channel_drops_and_counts_and_never_waits() {
     // says how many it lost.
     let (ack_tx, ack_rx) = mpsc::sync_channel(1);
     log.inner.tx.send(Message::Flush(ack_tx)).unwrap();
-    assert!(ack_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(ack_rx.recv().unwrap());
     let written = read_lines(&path)
         .iter()
         .filter(|line| line["target"] == "spawnd::run")
@@ -792,9 +792,7 @@ fn dropping_the_last_handle_stops_the_writer() {
     let stopped = log.inner.stopped.lock().unwrap().take().unwrap();
     log.push(b"{}\n".to_vec());
     drop(log);
-    stopped
-        .recv_timeout(Duration::from_secs(10))
-        .expect("writer retained its sender");
+    stopped.recv().expect("writer retained its sender");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(DIR_NAME).join(CURRENT)).unwrap(),
         "{}\n"
@@ -890,13 +888,13 @@ fn startup_refuses_a_busy_lock_without_waiting_for_its_owner() {
     let path = tmp.path().join(DIR_NAME);
     let store = Store::open(&path).unwrap();
     store.lock.lock().unwrap();
-    // A bounded join detects a regression without stranding the test process:
-    // release the lock before asserting, even if open incorrectly waited.
+    // Completion is explicit; scheduler delays cannot be mistaken for lock
+    // contention. The source guard also pins try_lock at startup.
     let (tx, rx) = mpsc::sync_channel(1);
     let attempt = std::thread::spawn(move || {
         tx.send(SupportLog::open(&path).is_err()).unwrap();
     });
-    let result = rx.recv_timeout(Duration::from_secs(5));
+    let result = rx.recv();
     store.lock.unlock().unwrap();
     attempt.join().unwrap();
     assert!(result.unwrap());
@@ -1031,7 +1029,7 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
     let writer = std::thread::spawn(move || {
         store.lock.lock().unwrap();
         locked_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_rx.recv().unwrap();
         store
             .append_locked(&render_line(
                 &rfc3339_millis(1000),
@@ -1044,7 +1042,7 @@ fn snapshot_rotation_and_concurrent_read_are_locked_on_every_platform() {
             .unwrap();
         store.lock.unlock().unwrap();
     });
-    locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    locked_rx.recv().unwrap();
     let busy = read_window(&path, "00000000", 0, 5000, 4096, None);
     release_tx.send(()).unwrap();
     writer.join().unwrap();

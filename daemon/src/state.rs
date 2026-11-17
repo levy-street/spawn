@@ -50,6 +50,8 @@ pub struct StateFile {
     /// predates the gauge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc_peers: Option<RtcPeerGauge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) support_runtime: Option<crate::support::RuntimeStatus>,
 }
 
 /// How full the RTC peer cap is. `in_use` is the slots charged, by peers in
@@ -147,6 +149,7 @@ impl StateStore {
                 release: provenance.release_id().map(str::to_owned),
                 worker_mismatch: false,
                 rtc_peers: None,
+                support_runtime: crate::support::runtime_status(),
             }),
         }
     }
@@ -168,6 +171,7 @@ impl StateStore {
         state.connected_at = Some(now_rfc3339());
         state.last_error = None;
         state.sessions = sessions;
+        state.support_runtime = crate::support::runtime_status();
         state.rtc_peers = Some(rtc_peers);
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
@@ -184,6 +188,7 @@ impl StateStore {
             at: now_rfc3339(),
         });
         state.sessions = sessions;
+        state.support_runtime = crate::support::runtime_status();
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
@@ -194,6 +199,7 @@ impl StateStore {
     pub fn heartbeat(&self, sessions: usize, rtc_peers: Option<RtcPeerGauge>) {
         let mut state = self.state.lock().expect("state heartbeat lock");
         state.sessions = sessions;
+        state.support_runtime = crate::support::runtime_status();
         if let Some(rtc_peers) = rtc_peers {
             state.rtc_peers = Some(rtc_peers);
         }

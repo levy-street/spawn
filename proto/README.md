@@ -37,7 +37,7 @@ Daemon host-key proof during pairing uses
 `host-pair-possession-v1-vectors.json` corpus.
 
 The daemon-only support sharing statement is specified in
-[`SUPPORT_LOG_CONSENT_V1.md`](SUPPORT_LOG_CONSENT_V1.md), with generated on/off
+[`SUPPORT_LOG_CONSENT_V1.md`](SUPPORT_LOG_CONSENT_V1.md), with generated on/off and negative device-attribution
 vectors in [`support-log-consent-v1-vectors.json`](support-log-consent-v1-vectors.json).
 Regenerate with `cargo run --locked --example generate_support_log_consent_vectors`
 from `daemon/`; Rust tests consume the corpus. It adds `register.supports_support_log`,

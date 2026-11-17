@@ -88,8 +88,13 @@ The support additions are daemon-only and additive: current server registration
 reads known properties from a JSON object and ignores the capability. There is
 no sender, upload route or app signing switch yet. `support_log.collect` carries
 a UUID `request_id` and integer `since_seconds`, clamped to 60–259200. Responses
-use a bounded HTTPS POST to the configured origin, with signed device consent,
-current admission checks and local rate history; see
+use a bounded HTTPS POST to the configured origin and path prefix, with bearer
+daemon token, locally proven account/device consent and current actor generation.
+The process-wide admission bucket survives reconnects; excess frames have no
+POST/receipt. All trust/consent/reload/teardown inputs cancel running collections;
+already released transport bytes cannot be recalled. Pending failure/overflow
+denies in this process; honest `registered` redelivers current consent after
+restart. Only 2xx succeeds. The full frames, headers, refusal enum and limits are in
 [`SUPPORT_LOG_CONSENT_V1.md`](../proto/SUPPORT_LOG_CONSENT_V1.md).
 
 As implemented:

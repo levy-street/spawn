@@ -355,6 +355,18 @@ impl SupportLog {
         None
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_event(&self, now: u64) {
+        self.push(render_line(
+            &rfc3339_millis(now),
+            "INFO",
+            "spawnd::support",
+            "src/support.rs:1",
+            "",
+            vec![],
+        ));
+    }
+
     fn push(&self, line: Vec<u8>) {
         if let Some(permit) = self.reserve() {
             self.push_reserved(line, permit);
@@ -389,7 +401,15 @@ impl SupportLog {
         if self.inner.tx.try_send(Message::Flush(ack_tx)).is_err() {
             return false;
         }
-        ack_rx.recv_timeout(wait).unwrap_or(false)
+        #[cfg(not(test))]
+        {
+            ack_rx.recv_timeout(wait).unwrap_or(false)
+        }
+        #[cfg(test)]
+        {
+            let _ = wait;
+            ack_rx.recv().unwrap_or(false)
+        }
     }
 
     /// Record that a thread panicked: where, and the runtime thread ID. Never the

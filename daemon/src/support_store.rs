@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 use spawnd::{secret_file::SecretFile, support_consent::Consent};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 const CONSENT: SecretFile =
     SecretFile::new("SPAWN D support sharing", ".support-consent.", 64 * 1024);
+pub(crate) const MAX_REVOCATIONS: usize = 256;
+#[derive(Debug, thiserror::Error)]
+#[error("support revocation capacity exceeded")]
+pub(crate) struct RevocationOverflow;
 const CONSENT_NAME: &str = "support-log-consent.json";
 const CONSENT_LOCK: &str = "support-log-consent.lock";
 const SENT: &str = "sent.jsonl";
@@ -52,13 +56,42 @@ pub(crate) fn load(config: &Path, trust: &Trust, now: u64) -> Result<Stored, Ref
     }
     Ok(stored)
 }
+// A bounded wait handles ordinary overlap with status/another writer. Actor
+// retries keep the input pending after this wait, with a capped async backoff.
+fn consent_lock(config: &Path) -> Result<File> {
+    let mut last = None;
+    for _attempt in 0..5 {
+        match CONSENT.try_lock_file(&config.join(CONSENT_LOCK)) {
+            Ok(lock) => return Ok(lock),
+            Err(error) => last = Some(error),
+        }
+        #[cfg(not(test))]
+        if _attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Err(last.expect("lock attempted"))
+}
+/// Allocation-free fallback when a delivered off cannot be stored. The actor
+/// still retains that input and denies; losing this file loses the replay floor.
+pub(crate) fn erase_statement(config: &Path) -> Result<()> {
+    match std::fs::remove_file(config.join(CONSENT_NAME)) {
+        Ok(()) => spawnd::secret_file::sync_parent_directory(config).map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 pub(crate) fn apply(
     config: &Path,
     incoming: Option<Consent>,
     trust: &Trust,
     now: u64,
 ) -> Result<()> {
-    let _lock = CONSENT.try_lock_file(&config.join(CONSENT_LOCK))?;
+    anyhow::ensure!(
+        trust.account.is_some(),
+        "support sharing needs a locally proven account"
+    );
+    let _lock = consent_lock(config)?;
     let mut stored = read(config)?;
     stored.revoked.absorb(trust.revoked.clone());
     let mut trust = trust.clone();
@@ -72,7 +105,9 @@ pub(crate) fn apply(
             let account = trust.account.context("unknown account")?;
             old.verify(&account, now)?;
             if consent.issued_at_ms < old.issued_at_ms
-                || (consent.issued_at_ms == old.issued_at_ms && !consent.same_statement(old))
+                || (consent.issued_at_ms == old.issued_at_ms
+                    && !consent.same_statement(old)
+                    && (!old.enabled || consent.enabled))
             {
                 return Ok(());
             }
@@ -85,18 +120,27 @@ pub(crate) fn apply(
     write(config, &stored)?;
     Ok(())
 }
-pub(crate) fn remember_revocations(config: &Path, trust: &Trust) -> Result<()> {
-    let _lock = CONSENT.try_lock_file(&config.join(CONSENT_LOCK))?;
+pub(crate) fn remember_revocations(
+    config: &Path,
+    trust: &Trust,
+) -> Result<spawnd::endorsement_chain::RevocationSet> {
+    let _lock = consent_lock(config)?;
     let mut stored = read(config)?;
-    if stored.revoked.absorb(trust.revoked.clone()) {
+    let changed = stored.revoked.absorb(trust.revoked.clone());
+    if stored.revoked.len() > MAX_REVOCATIONS {
+        return Err(RevocationOverflow.into());
+    }
+    if changed {
         write(config, &stored)?;
     }
-    Ok(())
+    Ok(stored.revoked)
 }
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct SharingStatus {
     pub enabled: bool,
+    pub account_unproven: bool,
+    pub runtime: Option<crate::support::RuntimeStatus>,
     pub signer_device_id: Option<Uuid>,
     pub issued_at_ms: Option<u64>,
     pub server_off: bool,
@@ -105,20 +149,11 @@ pub(crate) struct SharingStatus {
 pub(crate) fn status(config: &Path, trust: &Trust, path: &Path) -> SharingStatus {
     let mut status = SharingStatus::default();
     // Even an untrusted or damaged proof cannot hide the server's off flag.
-    let mut trust = trust.clone();
     if let Ok(stored) = read(config) {
         status.server_off = stored.server_off;
-        // Legacy pins can lack the retained pairing proof. For presentation
-        // only, recover the account from the previously accepted statement;
-        // load still verifies its signature and current device admission.
-        if trust.account.is_none() {
-            trust.account = stored
-                .consent
-                .as_ref()
-                .and_then(|c| spawnd::host_pair_approval::account_id_bytes(&c.account_id).ok());
-        }
     }
-    if let Ok(stored) = load(config, &trust, crate::support_log::now_unix_millis()) {
+    status.account_unproven = trust.account.is_none();
+    if let Ok(stored) = load(config, trust, crate::support_log::now_unix_millis()) {
         if let Some(consent) = stored.consent {
             status.enabled = consent.enabled && !stored.server_off;
             status.signer_device_id = Uuid::parse_str(&consent.signer_device_id).ok();
@@ -129,13 +164,28 @@ pub(crate) fn status(config: &Path, trust: &Trust, path: &Path) -> SharingStatus
     status
 }
 
-pub(crate) fn remove(config: &Path) -> Result<()> {
-    let _lock = CONSENT.try_lock_file(&config.join(CONSENT_LOCK))?;
-    match std::fs::remove_file(config.join(CONSENT_NAME)) {
-        Ok(()) => spawnd::secret_file::sync_parent_directory(config).map_err(Into::into),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+/// Complete ordinary cleanup before reporting an optional support failure.
+pub(crate) fn cleanup_after<T>(
+    ordinary: impl FnOnce() -> Result<T>,
+    support: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let primary = ordinary();
+    let secondary = support();
+    match (primary, secondary) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => {
+            Err(primary.context(format!("support cleanup also failed: {secondary:#}")))
+        }
     }
+}
+pub(crate) fn remove(config: &Path) -> Result<()> {
+    // No lock creation when there is nothing to remove (including full disks).
+    if !config.join(CONSENT_NAME).try_exists()? {
+        return Ok(());
+    }
+    let _lock = consent_lock(config)?;
+    erase_statement(config)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +199,7 @@ pub(crate) enum Outcome {
     RateLimited,
     NoLog,
     Failed,
+    Cancelled,
 }
 impl From<Refusal> for Outcome {
     fn from(value: Refusal) -> Self {
@@ -183,6 +234,8 @@ impl Receipt {
         }
     }
     fn charges_rate(&self) -> bool {
+        // Cancellation can precede Started. Charge it conservatively too, so
+        // admitted/cancelled frames cannot rotate away the durable quota floor.
         !matches!(self.outcome, Outcome::Sent | Outcome::UploadFailed)
     }
 }
@@ -262,7 +315,6 @@ pub(crate) fn recent(path: &Path) -> Result<Vec<Receipt>> {
 #[derive(Debug)]
 pub(crate) struct Flight {
     _file: File,
-    pub path: PathBuf,
 }
 pub(crate) fn begin(path: &Path, receipt: &Receipt) -> Result<Flight, Refusal> {
     let (dir, _lock) = locked_dir(path).map_err(|_| Refusal::Failed)?;
@@ -273,10 +325,7 @@ pub(crate) fn begin(path: &Path, receipt: &Receipt) -> Result<Flight, Refusal> {
         return Err(Refusal::RateLimited);
     }
     append_locked(&dir, receipt).map_err(|_| Refusal::Failed)?;
-    Ok(Flight {
-        _file: flight,
-        path: path.to_owned(),
-    })
+    Ok(Flight { _file: flight })
 }
 fn rate_limited(receipts: &[Receipt], now: u64) -> bool {
     // Refusals also consume rate budget: refusal floods cannot rotate away the
