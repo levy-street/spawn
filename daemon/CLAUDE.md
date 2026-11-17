@@ -680,8 +680,9 @@ request. A select drops the future on generation change, including stalled
 connect/TLS. `cancelled` makes no promise that nothing was sent.
 
 `support_store.rs` owns atomic owner-only consent and bounded append-only
-receipts. Status reads existing files only: no folder, lock or file is created,
-and credential inspection does no cleanup or keyring migration. With no support
+receipts. The sharing part of status only reads existing support files and creates
+no support directory, lock, receipt or consent file; ordinary credential and
+service inspection retains master's behavior. With no support
 files, plain output adds only the fixed sharing-off line to master's output.
 The local log remains "kept on this machine"; enabled sharing additionally permits
 bounded copies to be uploaded. Logout (both variants), reset and exorcise retain

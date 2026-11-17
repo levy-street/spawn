@@ -285,7 +285,8 @@ mod tests {
         // complete-file credential paths run; native keyring calls use its mock
         // provider, and the existing service-disable flag prevents OS effects.
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
-        let config = crate::config::config_path().unwrap();
+        let config =
+            PathBuf::from(std::env::var_os("SPAWN_CONFIG_DIR").expect("isolated config path"));
         let root =
             PathBuf::from(std::env::var_os("SPAWN_TEST_TEMP_ROOT").expect("isolated test root"));
         // Resolve exactly the helpers the real commands use, before invoking
@@ -323,11 +324,22 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(
-                std::fs::read_dir(&root).unwrap().count(),
-                0,
-                "status created a path"
-            );
+            let assert_no_support_paths = || {
+                assert!(
+                    !crate::support_log::support_dir(&config).unwrap().exists(),
+                    "status created a support directory, receipt or lock"
+                );
+                assert!(
+                    std::fs::read_dir(&config).unwrap().all(|entry| {
+                        let name = entry.unwrap().file_name();
+                        let name = name.to_string_lossy();
+                        !name.starts_with("support-log-consent.")
+                            && !name.starts_with(".support-consent.")
+                    }),
+                    "status created a support consent file, temporary file or lock"
+                );
+            };
+            assert_no_support_paths();
             crate::platform::create_private_dir_all(&config).unwrap();
             spawnd::secret_file::SecretFile::new("test", ".test.", 4096)
                 .write(&config.join("credentials.json"), b"{}")
@@ -340,12 +352,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
-            assert_eq!(
-                std::fs::read_dir(&config).unwrap().count(),
-                1,
-                "status created a file or lock"
-            );
+            assert_no_support_paths();
             return;
         }
         crate::platform::create_private_dir_all(&config).unwrap();

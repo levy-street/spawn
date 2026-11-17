@@ -53,7 +53,8 @@ struct InstanceStatus {
     launch: String,
     /// Whether the running daemon's spawn-worker matches it.
     pair: String,
-    /// The local support log; sharing requires a verified device statement.
+    /// The daemon's own support log (support_log.rs), which stays on this
+    /// machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     support_log: Option<String>,
     support_sharing: crate::support_store::SharingStatus,
@@ -106,12 +107,12 @@ pub async fn run(
 
 fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     if explicit_config {
-        return Ok(vec![crate::config::config_path()?]);
+        return Ok(vec![crate::config::config_dir()?]);
     }
     let base = crate::possess::default_instance_base()?;
     let instances = crate::possess::account_dirs_with_creds(&base)?;
     if instances.is_empty() {
-        Ok(vec![crate::config::config_path()?])
+        Ok(vec![crate::config::config_dir()?])
     } else {
         Ok(instances)
     }
@@ -187,7 +188,7 @@ pub(crate) fn instance_build(config_dir: &Path) -> InstanceBuild {
 
 async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<InstanceStatus> {
     let _guard = crate::lifecycle::ConfigDirGuard::set(dir);
-    let stored = crate::creds::load_for_status(dir).context("loading stored credentials")?;
+    let stored = crate::creds::load().context("loading stored credentials")?;
     let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let build = instance_build(dir);
     let heartbeat = build.state.as_ref();
@@ -212,13 +213,12 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     });
     let launch = launch_text(build.live());
     let pair = pair_text(build.live());
-    let support_config = dir.to_owned();
-    let support_trust = crate::support::Trust::from_record(&stored);
-    // Path resolution is read-only and remains available even if the optional
-    // storage worker cannot start or its sharing inspection times out.
     let support_log = crate::support_log::current_path(dir)
         .ok()
         .map(|path| path.display().to_string());
+    let support_config = dir.to_owned();
+    let support_trust = crate::support::Trust::from_record(&stored);
+    // Sharing inspection only reads existing support files.
     let support_sharing = if let Some(worker) = crate::support_io::Worker::process() {
         worker
             .run(
