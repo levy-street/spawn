@@ -438,7 +438,35 @@ enum ServeOutcome {
 
 struct SessionEnd {
     result: Result<()>,
-    stable: bool,
+    registered_for: Option<Duration>,
+}
+
+#[derive(Default)]
+struct RevokedLoginBackoff {
+    credential_generation: u64,
+    refusals: usize,
+}
+
+impl RevokedLoginBackoff {
+    fn after_session(
+        &mut self,
+        generation: u64,
+        registered_for: Option<Duration>,
+        refusal: Option<ws::AuthRefusal>,
+    ) -> Option<Duration> {
+        // The credential monitor already interrupts the sleep on a new generation.
+        if generation != self.credential_generation || registered_for.is_some() {
+            self.credential_generation = generation;
+            self.refusals = 0;
+        }
+        if refusal != Some(ws::AuthRefusal::Revoked) {
+            return None;
+        }
+        const MINUTES: [u64; 4] = [1, 5, 30, 60];
+        let delay = Duration::from_secs(MINUTES[self.refusals] * 60);
+        self.refusals = (self.refusals + 1).min(MINUTES.len() - 1);
+        Some(delay)
+    }
 }
 
 enum ActiveSessionEvent {
@@ -460,6 +488,19 @@ async fn credential_change_now(
     support: Option<&crate::support::Collector>,
 ) -> Result<Option<LiveCredentialSnapshot>> {
     credential_change_now_with(active, loader, support).await
+}
+
+// A competing wake can cancel the monitor while its backend read is in flight.
+// Finish that read before a state-file lock or fsync can use up its deadline.
+async fn pending_credential_change(
+    active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
+) -> Option<Result<LiveCredentialSnapshot>> {
+    loader.pending.as_ref()?;
+    credential_change_now(active, loader, support)
+        .await
+        .transpose()
 }
 
 async fn credential_change_now_with(
@@ -635,7 +676,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // wired into clap), then the URL we logged in against.
     let server_url = config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let ws_url = config::ws_url(&server_url)?;
-    let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
+    let live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     // The actor processes inputs lazily as they arrive; startup opens no support storage.
     // Its delivery queue already exists, so early trust/withdrawal is retained.
@@ -656,6 +697,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let rtc_sessions = RtcSessions::new();
     let state_registry = registry.clone();
     let state_rtc_sessions = rtc_sessions.clone();
+    let heartbeat_store = Arc::clone(&state_store);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await;
@@ -665,7 +707,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             // here, on the daemon's own clock and off the offer path: peers
             // keep opening and closing through a server outage, and the
             // state file write is an fsync.
-            state_store.heartbeat(
+            heartbeat_store.heartbeat(
                 state_registry.ids().len(),
                 Some(state_rtc_sessions.admission_gauge().await),
             );
@@ -695,6 +737,30 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             memory,
         ));
     }
+    supervise_connections(
+        server_url,
+        ws_url,
+        live_credentials,
+        credential_loader,
+        registry,
+        rtc_sessions,
+        state_store,
+        support,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_connections(
+    server_url: url::Url,
+    ws_url: url::Url,
+    mut live_credentials: LiveCredentialSnapshot,
+    mut credential_loader: CredentialLoader,
+    registry: SessionRegistry,
+    rtc_sessions: RtcSessions,
+    state_store: Arc<crate::state::StateStore>,
+    support: Option<crate::support::Collector>,
+) -> Result<()> {
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every
@@ -720,8 +786,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut supersession_count = 0_u8;
     let mut supersession_logged = false;
     let mut unauthorized_logged = false;
+    let mut revoked_login = RevokedLoginBackoff::default();
 
-    'supervisor: loop {
+    loop {
         // A session close or backoff timer can become ready in the same
         // scheduler turn as a credential write. Never let that select race
         // carry the stale snapshot into another socket: reread the whole
@@ -773,7 +840,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 }
             }
         }?;
-        let res = match outcome {
+        let ended = match outcome {
             ServeOutcome::CredentialsChanged(next) => {
                 tracing::info!(
                     generation = next.generation,
@@ -784,25 +851,34 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 continue;
             }
             ServeOutcome::SessionEnded(ended) => {
-                if ended.stable {
+                if ended
+                    .registered_for
+                    .is_some_and(|age| age >= Duration::from_secs(60))
+                {
                     attempt = 0;
                     unauthorized_logged = false;
                 } else {
                     attempt = attempt.saturating_add(1);
                 }
-                ended.result
+                ended
             }
         };
-        if let Err(error) = &res {
+        let res = ended.result;
+        let refusal = res.as_ref().err().and_then(ws::auth_refusal);
+        let revoked_delay =
+            revoked_login.after_session(live_credentials.generation, ended.registered_for, refusal);
+        let (kind, detail) = if let Err(error) = &res {
             let class = ws::failure_class(error);
             let (kind, default_detail) = crate::state::connection_error_class(class);
-            let detail = ws::auth_refusal(error)
+            let detail = refusal
                 .map(ws::AuthRefusal::as_str)
                 .unwrap_or(default_detail);
-            crate::state::active_disconnected(kind, detail, registry.ids().len());
+            (kind, detail)
         } else {
-            crate::state::active_disconnected("protocol", "socket_closed", registry.ids().len());
-        }
+            ("protocol", "socket_closed")
+        };
+        let revoked_deadline =
+            state_store.disconnected(kind, detail, registry.ids().len(), revoked_delay);
         let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
         let reconnect_now = res.as_ref().err().and_then(ws::close_disposition)
             == Some(ws::CloseDisposition::ImmediateReconnect);
@@ -855,9 +931,19 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 Some(ws::CloseDisposition::Unauthorized) => {
                     if !unauthorized_logged {
                         unauthorized_logged = true;
-                        tracing::error!(class = "unauthorized", "token expired — run spawnd login");
+                        if refusal == Some(ws::AuthRefusal::Revoked) {
+                            tracing::error!(
+                                class = "unauthorized",
+                                "the server revoked this machine's token — see spawnd status"
+                            );
+                        } else {
+                            tracing::error!(
+                                class = "unauthorized",
+                                "token expired — run spawnd login"
+                            );
+                        }
                     }
-                    Duration::from_secs(60)
+                    revoked_delay.unwrap_or(Duration::from_secs(60))
                 }
                 Some(ws::CloseDisposition::Superseded) => {
                     let now = Instant::now();
@@ -910,47 +996,84 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         if reconnect_now {
             attempt = 0;
         }
-        let reloaded = {
-            let sleep_fut = tokio::time::sleep(delay);
-            let reload_fut = wait_for_credential_change(
-                &live_credentials,
-                &mut credential_loader,
-                support.as_ref(),
-            );
-            tokio::pin!(sleep_fut);
-            tokio::pin!(reload_fut);
-            tokio::select! {
-                _ = &mut sleep_fut => None,
-                reloaded = &mut reload_fut => Some(reloaded),
-                _ = sighup_signal() => {
-                    attempt = 0;
-                    None
-                }
-                r = tokio::signal::ctrl_c() => {
-                    r.context("ctrl-c handler")?;
-                    tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
-                    return Ok(());
-                }
-                _ = shutdown_signal() => {
-                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
-                    return Ok(());
-                }
+        match wait_for_retry(
+            revoked_deadline,
+            delay,
+            &live_credentials,
+            &mut credential_loader,
+            support.as_ref(),
+            &rtc_sessions,
+            sighup_signal(),
+            async { state_store.clear_pending_retry() },
+        )
+        .await?
+        {
+            RetryWake::Timer => {}
+            RetryWake::Reconnect => attempt = 0,
+            RetryWake::Shutdown => return Ok(()),
+            RetryWake::Credentials(reloaded) => {
+                live_credentials = reloaded?;
+                attempt = 0;
             }
-        };
-        if let Some(reloaded) = reloaded {
-            let reloaded = match reloaded {
-                Ok(reloaded) => reloaded,
-                Err(error) => {
-                    rtc_sessions.invalidate_trust_and_close_all().await;
-                    return Err(error);
-                }
-            };
-            rtc_sessions.invalidate_trust_and_close_all().await;
-            live_credentials = reloaded;
-            attempt = 0;
-            continue 'supervisor;
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWake<T> {
+    Timer,
+    Reconnect,
+    Credentials(T),
+    Shutdown,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_retry(
+    revoked_deadline: Option<tokio::time::Instant>,
+    delay: Duration,
+    active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
+    rtc_sessions: &RtcSessions,
+    reconnect: impl Future<Output = ()>,
+    clear_pending_retry: impl Future<Output = ()>,
+) -> Result<RetryWake<Result<LiveCredentialSnapshot>>> {
+    let sleep = match revoked_deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline),
+        None => tokio::time::sleep(delay),
+    };
+    let mut wake = tokio::select! {
+        _ = sleep => RetryWake::Timer,
+        reloaded = wait_for_credential_change(active, loader, support) => RetryWake::Credentials(reloaded),
+        _ = reconnect => RetryWake::Reconnect,
+        r = tokio::signal::ctrl_c() => {
+            r.context("ctrl-c handler")?;
+            tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+            RetryWake::Shutdown
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
+            RetryWake::Shutdown
+        }
+    };
+    if revoked_deadline.is_some() {
+        match wake {
+            RetryWake::Timer | RetryWake::Reconnect => {
+                if let Some(reload) = pending_credential_change(active, loader, support).await {
+                    wake = RetryWake::Credentials(reload);
+                }
+            }
+            RetryWake::Shutdown => drop(loader.pending.take()),
+            RetryWake::Credentials(_) => {}
+        }
+    }
+    if matches!(wake, RetryWake::Credentials(_)) {
+        rtc_sessions.invalidate_trust_and_close_all().await;
+    }
+    if revoked_deadline.is_some() {
+        clear_pending_retry.await;
+    }
+    Ok(wake)
 }
 
 fn reconnect_notify() -> &'static tokio::sync::Notify {
@@ -996,7 +1119,7 @@ async fn serve_one_connection(
     daemon_revoked: &mut RevocationSet,
     support: Option<&crate::support::Collector>,
 ) -> Result<ServeOutcome> {
-    serve_one_connection_with_loader(
+    let outcome = serve_one_connection_with_loader(
         live_credentials,
         ws_url,
         registry,
@@ -1006,7 +1129,18 @@ async fn serve_one_connection(
         daemon_revoked,
         support,
     )
-    .await
+    .await?;
+    // Only a revoked login adds a retry deadline write. Other closes keep
+    // their disposition and leave the monitor read for the supervisor.
+    let revoked = matches!(&outcome, ServeOutcome::SessionEnded(ended)
+        if ended.result.as_ref().err().and_then(ws::auth_refusal) == Some(ws::AuthRefusal::Revoked));
+    if revoked {
+        if let Some(reload) = pending_credential_change(live_credentials, loader, support).await {
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Ok(ServeOutcome::CredentialsChanged(Box::new(reload?)));
+        }
+    }
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1054,7 +1188,7 @@ async fn serve_one_connection_with_loader(
                 Ok(stream) => ConnectOutcome::Connected(stream),
                 Err(error) => return Ok(ServeOutcome::SessionEnded(SessionEnd {
                     result: Err(error),
-                    stable: false,
+                    registered_for: None,
                 })),
             },
             reloaded = &mut reload_fut => ConnectOutcome::Reloaded(reloaded.map(Box::new)),
@@ -1322,11 +1456,14 @@ async fn serve_one_connection_with_loader(
     drop(heartbeat_task);
     match dispatch_result {
         ActiveSessionEvent::SessionEnded(result) => {
-            let stable = registered_at
+            let registered_for = registered_at
                 .lock()
                 .expect("registered timestamp lock")
-                .is_some_and(|registered| registered.elapsed() >= Duration::from_secs(60));
-            Ok(ServeOutcome::SessionEnded(SessionEnd { result, stable }))
+                .map(|registered| registered.elapsed());
+            Ok(ServeOutcome::SessionEnded(SessionEnd {
+                result,
+                registered_for,
+            }))
         }
         ActiveSessionEvent::CredentialReload(result) => {
             Ok(ServeOutcome::CredentialsChanged(result?))
@@ -4598,6 +4735,422 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    #[test]
+    fn revoked_login_backoff_tracks_registration_and_credential_generation() {
+        use ws::AuthRefusal::{Expired, Revoked};
+        let mut backoff = RevokedLoginBackoff::default();
+        for (generation, registered_for, refusal, expected_seconds) in [
+            (1, None, Some(Revoked), Some(60)),
+            (1, None, Some(Revoked), Some(300)),
+            (1, None, Some(Revoked), Some(1800)),
+            (1, None, Some(Revoked), Some(3600)),
+            (1, None, Some(Expired), None),
+            (1, None, Some(Revoked), Some(3600)),
+            (1, Some(Duration::ZERO), None, None),
+            (1, None, Some(Revoked), Some(60)),
+            (1, None, Some(Revoked), Some(300)),
+            (2, None, Some(Revoked), Some(60)),
+            (2, Some(Duration::from_secs(1)), Some(Revoked), Some(60)),
+        ] {
+            assert_eq!(
+                backoff.after_session(generation, registered_for, refusal),
+                expected_seconds.map(Duration::from_secs),
+            );
+        }
+    }
+
+    fn controlled_credential_loader(
+    ) -> (CredentialLoader, std_mpsc::Receiver<CredentialLoadRequest>) {
+        let (requests, reads) = std_mpsc::sync_channel(1);
+        let loader = CredentialLoader {
+            requests: Some(requests),
+            pending: None,
+            load_deadline: CREDENTIAL_LOAD_DEADLINE,
+            failed: false,
+        };
+        (loader, reads)
+    }
+
+    async fn check_revoked_retry(expected: RetryWake<u64>) {
+        use crate::state::{parse_rfc3339_seconds, read_path, StateStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = StateStore::at_path(path.clone(), "", None);
+        let last_error = || read_path(&path).unwrap().unwrap().last_error.unwrap();
+        let hour = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let deadline = store.disconnected("auth", "token_revoked", 0, Some(hour));
+        let error = last_error();
+        let refused_at = parse_rfc3339_seconds(&error.at).unwrap();
+        let advertised = parse_rfc3339_seconds(error.next_attempt_at.as_ref().unwrap()).unwrap();
+        assert_eq!(advertised, refused_at + 3600);
+
+        // Charge time between recording the deadline and entering the select,
+        // as would happen with a slow heartbeat write.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin =
+            url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let host = Uuid::new_v4();
+        let record = |generation| {
+            credential_record(
+                generation,
+                generation.into(),
+                "token",
+                host,
+                origin.as_str(),
+                1,
+                &[],
+            )
+        };
+        let active = LiveCredentialSnapshot::initial(record(1), &origin).unwrap();
+        // Answer the real monitor's read in memory, at a chosen clock tick.
+        let (mut loader, reads) = controlled_credential_loader();
+        let reply = |request: CredentialLoadRequest, generation| {
+            assert!(request
+                .reply
+                .send(CredentialLoadReply::Loaded(record(generation)))
+                .is_ok());
+        };
+        let elapsed = match expected {
+            RetryWake::Timer => hour,
+            _ => Duration::from_secs(15),
+        };
+        let slow_write = CREDENTIAL_LOAD_DEADLINE + Duration::from_secs(1);
+        let reconnect = tokio::sync::Notify::new();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
+        let mut wait = Box::pin(wait_for_retry(
+            deadline,
+            hour,
+            &active,
+            &mut loader,
+            None,
+            &rtc,
+            reconnect.notified(),
+            async {
+                assert_eq!(start.elapsed(), elapsed);
+                assert_eq!(
+                    rtc.trust_epoch_for_test(),
+                    epoch + u64::from(matches!(expected, RetryWake::Credentials(_)))
+                );
+                tokio::time::advance(slow_write).await;
+                store.clear_pending_retry();
+            },
+        ));
+
+        // Start the monitor close enough to the wake for its read to be timely.
+        tokio::time::advance(
+            elapsed - start.elapsed() - CREDENTIAL_RELOAD_INTERVAL - Duration::from_secs(1),
+        )
+        .await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        let pending = reads.try_recv().unwrap();
+        assert_eq!(last_error().next_attempt_at, error.next_attempt_at);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        if expected == RetryWake::Timer {
+            assert_eq!(refused_at + start.elapsed().as_secs() as i64, advertised);
+        }
+        match expected {
+            RetryWake::Credentials(next) => reply(pending, next),
+            RetryWake::Timer | RetryWake::Reconnect => {
+                if expected == RetryWake::Reconnect {
+                    reconnect.notify_one();
+                }
+                // Let the timer/signal win, then queue the unchanged reply.
+                assert!(futures_util::poll!(&mut wait).is_pending());
+                reply(pending, active.generation);
+            }
+            RetryWake::Shutdown => unreachable!(),
+        }
+        let active = match (wait.await.unwrap(), expected) {
+            (RetryWake::Timer, RetryWake::Timer) | (RetryWake::Reconnect, RetryWake::Reconnect) => {
+                active
+            }
+            (RetryWake::Credentials(Ok(next)), RetryWake::Credentials(generation)) => {
+                assert_eq!(next.generation, generation);
+                next
+            }
+            _ => panic!("unexpected retry wake"),
+        };
+        assert_eq!(start.elapsed(), elapsed + slow_write);
+        assert!(last_error().next_attempt_at.is_none());
+
+        let ws_url = config::ws_url(&origin).unwrap();
+        let registry = SessionRegistry::new();
+        let mut revoked = RevocationSet::new();
+        let connect = async {
+            assert!(credential_change_now(&active, &mut loader, None)
+                .await
+                .unwrap()
+                .is_none());
+            serve_one_connection(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc,
+                &mut loader,
+                &mut revoked,
+                None,
+            )
+            .await
+        };
+        tokio::pin!(connect);
+        // Both the supervisor and the socket admission check read afresh after the write.
+        assert!(futures_util::poll!(&mut connect).is_pending());
+        reply(reads.try_recv().unwrap(), active.generation);
+        assert!(futures_util::poll!(&mut connect).is_pending());
+        reply(reads.try_recv().unwrap(), active.generation);
+        tokio::select! {
+            _ = &mut connect => panic!("supervisor exited before connecting"),
+            accepted = listener.accept() => { accepted.unwrap(); }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revoked_retry_starts_at_its_advertised_time() {
+        check_revoked_retry(RetryWake::Timer).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_credentials_interrupt_the_hourly_retry() {
+        check_revoked_retry(RetryWake::Credentials(2)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_signal_interrupts_the_hourly_retry() {
+        check_revoked_retry(RetryWake::Reconnect).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum PendingRead {
+        Changed,
+        Invalid,
+        Failed,
+    }
+
+    async fn check_trust_before_retry_write(read: PendingRead, reconnect: bool) {
+        let origin = config::server_url(None).unwrap();
+        let host = Uuid::new_v4();
+        let record = |generation: u64| {
+            credential_record(
+                generation,
+                generation.into(),
+                "token",
+                host,
+                origin.as_str(),
+                1,
+                &[],
+            )
+        };
+        let active = LiveCredentialSnapshot::initial(record(1), &origin).unwrap();
+        let (mut loader, reads) = controlled_credential_loader();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
+        let delay = CREDENTIAL_RELOAD_INTERVAL * 2;
+        let signal = tokio::sync::Notify::new();
+        let (release, blocked_write) = oneshot::channel();
+        let mut wait = Box::pin(wait_for_retry(
+            Some(tokio::time::Instant::now() + delay),
+            delay,
+            &active,
+            &mut loader,
+            None,
+            &rtc,
+            signal.notified(),
+            async {
+                assert_eq!(rtc.trust_epoch_for_test(), epoch + 1);
+                blocked_write.await.unwrap();
+            },
+        ));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        let pending = reads.try_recv().unwrap();
+        if reconnect {
+            signal.notify_one();
+        } else {
+            tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        }
+        // Commit to the timer or signal before the monitor can see the reply.
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch);
+        let reply = match read {
+            PendingRead::Changed => CredentialLoadReply::Loaded(record(2)),
+            PendingRead::Invalid => {
+                let mut invalid = record(2);
+                invalid.access_token = None;
+                CredentialLoadReply::Loaded(invalid)
+            }
+            PendingRead::Failed => CredentialLoadReply::Failed,
+        };
+        assert!(pending.reply.send(reply).is_ok());
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch + 1);
+        release.send(()).unwrap();
+        match (wait.await.unwrap(), read) {
+            (RetryWake::Credentials(Ok(next)), PendingRead::Changed) => {
+                assert_eq!(next.generation, 2)
+            }
+            (RetryWake::Credentials(Err(_)), PendingRead::Invalid | PendingRead::Failed) => {}
+            _ => panic!("unexpected credential result"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_credentials_invalidate_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Changed, false).await;
+        check_trust_before_retry_write(PendingRead::Changed, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_credentials_invalidate_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Invalid, false).await;
+        check_trust_before_retry_write(PendingRead::Invalid, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_credential_read_invalidates_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Failed, false).await;
+        check_trust_before_retry_write(PendingRead::Failed, true).await;
+    }
+
+    async fn check_close_with_changed_credentials(code: u16) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::handshake::server::{Callback, Request};
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Arc::new(crate::state::StateStore::at_path(path.clone(), "", None));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin =
+            url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let ws_url = config::ws_url(&origin).unwrap();
+        let host = Uuid::new_v4();
+        let record = credential_record(1, 1, "first", host, origin.as_str(), 1, &[]);
+        let next = credential_record(2, 2, "second", host, origin.as_str(), 1, &[]);
+        let active = LiveCredentialSnapshot::initial(record.clone(), &origin).unwrap();
+        let registered = Arc::new(AtomicBool::new(false));
+        let monitor_registered = Arc::clone(&registered);
+        let (pending, read_started) = oneshot::channel();
+        let mut pending = Some(pending);
+        let (release, closed) = std_mpsc::channel();
+        let loader = CredentialLoader::start(HANDSHAKE_LIVENESS, move || {
+            if !monitor_registered.load(Ordering::Acquire) {
+                return Ok(record.clone());
+            }
+            if let Some(pending) = pending.take() {
+                pending.send(()).unwrap();
+                closed.recv()?;
+            }
+            Ok(next.clone())
+        })
+        .unwrap();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
+        let registry = SessionRegistry::new();
+        assert!(registry.claim_discovery());
+        const BLOCKED: &str = "test_no_installation";
+        let supervisor = Box::pin(crate::update::FIXED_CAPABILITY.scope(
+            || crate::update::Capability {
+                self_update: false,
+                blocked: Some(BLOCKED),
+            },
+            supervise_connections(
+                origin,
+                ws_url,
+                active,
+                loader,
+                registry,
+                rtc.clone(),
+                store,
+                None,
+            ),
+        ));
+        let (retried, retry_seen) = oneshot::channel();
+        let peer = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tcp, SelectDaemonSubprotocol)
+                .await
+                .unwrap();
+            let frame = socket.next().await.unwrap().unwrap();
+            let register: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(register["type"], "register");
+            assert_eq!(register["self_update"], false);
+            assert_eq!(register["self_update_blocked"], BLOCKED);
+            registered.store(true, Ordering::Release);
+            read_started.await.unwrap();
+            socket
+                .close(Some(CloseFrame {
+                    code: code.into(),
+                    reason: "".into(),
+                }))
+                .await
+                .unwrap();
+            // The read stays pending until socket teardown, so the close wins
+            // even if both sides run on a single executor thread.
+            let _ = socket.get_mut().read_to_end(&mut Vec::new()).await;
+            release.send(()).unwrap();
+            if code != 4002 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let check_token = |request: &Request, response| {
+                    assert_eq!(request.headers()["Authorization"], "Bearer second");
+                    SelectDaemonSubprotocol.on_request(request, response)
+                };
+                let socket = tokio_tungstenite::accept_hdr_async(tcp, check_token)
+                    .await
+                    .unwrap();
+                assert!(retried.send(socket).is_ok());
+            }
+        };
+        let check = async {
+            if code == 4002 {
+                assert_eq!(
+                    supervisor.await.unwrap_err().to_string(),
+                    "server rejected this daemon as a client bug (close 4002)"
+                );
+            } else {
+                tokio::select! {
+                    result = supervisor => panic!("ordinary close ended the supervisor: {result:?}"),
+                    retry = retry_seen => drop(retry.unwrap()),
+                }
+            }
+        };
+        tokio::time::timeout(HANDSHAKE_LIVENESS, async { tokio::join!(peer, check) })
+            .await
+            .unwrap();
+        let mut files = std::fs::read_dir(dir.path()).unwrap();
+        assert_eq!(files.next().unwrap().unwrap().path(), path);
+        assert!(files.next().is_none());
+        let state = crate::state::read_path(&path).unwrap().unwrap();
+        assert!(!state.connected);
+        let error = state.last_error.unwrap();
+        assert_eq!(error.kind, "http");
+        assert_eq!(error.detail, "websocket_handshake");
+        assert!(error.next_attempt_at.is_none());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch + u64::from(code != 4002));
+    }
+
+    #[tokio::test]
+    async fn close_4002_records_disconnect_and_exits_with_a_changed_read_pending() {
+        check_close_with_changed_credentials(4002).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_close_records_disconnect_and_reconnects_with_a_changed_read_pending() {
+        check_close_with_changed_credentials(1000).await;
+    }
 
     /// A program that hangs past a capture's timeout is stopped with
     /// everything it started: its process group goes whole.

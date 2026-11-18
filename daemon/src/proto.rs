@@ -49,6 +49,45 @@ pub(crate) struct SupportUpdate {
     pub consent: ConsentInput,
 }
 
+// The ordinary parser has already validated this JSON. Usually two substring
+// checks rule the key out. If it could occur, inspect only string boundaries
+// and nesting: a value or a nested key with the same spelling doesn't count.
+fn has_top_level_field(text: &str, field: &str) -> bool {
+    if !text.contains(field) && !text.contains(r"\u") {
+        return false;
+    }
+    let mut depth = 0;
+    let mut quote = None;
+    let mut bytes = text.bytes().enumerate();
+    while let Some((pos, byte)) = bytes.next() {
+        match (quote, byte) {
+            (None, b'{' | b'[') => depth += 1,
+            (None, b'}' | b']') => depth -= 1,
+            (None, b'"') => quote = Some(pos),
+            (Some(_), b'\\') => {
+                bytes.next();
+            }
+            (Some(start), b'"') => {
+                quote = None;
+                // An ASCII key uses at most six bytes per letter (\uXXXX).
+                if depth != 1 || pos - start - 1 > 6 * field.len() {
+                    continue;
+                }
+                let raw = &text[start + 1..pos];
+                let matches = raw == field
+                    || (raw.contains('\\')
+                        && serde_json::from_str::<String>(&text[start..=pos])
+                            .is_ok_and(|key| key == field));
+                if matches && text[pos + 1..].trim_ascii_start().starts_with(':') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Only support-bearing frames get a second parse. The ordinary parse runs
 /// first, with exactly the ordinary field types and serde_json features.
 pub(crate) fn parse_inbound(text: &str) -> Result<Inbound, serde_json::Error> {
@@ -132,6 +171,9 @@ pub(crate) fn parse_inbound(text: &str) -> Result<Inbound, serde_json::Error> {
         }
     }
     let consent = if text.len() > MAX_SUPPORT_FRAME_BYTES {
+        if field == "support_log_consent" && !has_top_level_field(text, field) {
+            return Ok(frame);
+        }
         ConsentInput::Invalid
     } else {
         use serde::de::DeserializeSeed;
@@ -1743,15 +1785,45 @@ mod ordinary_parity {
         }
     }
     #[test]
-    fn oversized_support_frame_denies_only_support() {
-        let wire = format!(
-            r#"{{"type":"registered","host_id":"{}","padding":"{}"}}"#,
-            uuid::Uuid::nil(),
-            "x".repeat(64 * 1024)
+    fn oversized_registration_bounds_only_a_top_level_consent_field() {
+        let padding = "x".repeat(64 * 1024);
+        for (extra, present) in [
+            ("", false),
+            (r#","nested":[{"support_log_consent":null}]"#, false),
+            (r#","value":"support_log_consent""#, false),
+            (r#","value":"\"support_log_consent\":{""#, false),
+            (r#","support_log_consent":null"#, true),
+            (r#","support_log_\u0063onsent" : null"#, true),
+        ] {
+            let wire = format!(
+                r#"{{"type":"registered","host_id":"{}","padding":"{padding}"{extra}}}"#,
+                Uuid::nil()
+            );
+            let Inbound::Registered { support, .. } = parse_inbound(&wire).unwrap() else {
+                panic!("registration discarded")
+            };
+            if present {
+                assert!(matches!(support.consent, ConsentInput::Invalid));
+            } else {
+                assert!(matches!(support.consent, ConsentInput::Absent));
+            }
+        }
+    }
+
+    #[test]
+    fn positional_registration_preserves_the_ordinary_frame_across_the_cap() {
+        // The absence guarantee covers the objects the server sends. At or
+        // below the cap, arrays keep master's map-only extension result. Above
+        // it an array has no named consent field, so it can safely keep local
+        // consent without parsing an unsupported wire form a second time.
+        let mut wire = serde_json::json!(["registered", Uuid::nil()]).to_string();
+        wire.push_str(&" ".repeat(64 * 1024 - wire.len()));
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Invalid))
         );
-        let Inbound::Registered { support, .. } = parse_inbound(&wire).unwrap() else {
-            unreachable!()
-        };
-        assert!(matches!(support.consent, ConsentInput::Invalid));
+        wire.push(' ');
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Absent))
+        );
     }
 }

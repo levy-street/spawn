@@ -7,6 +7,7 @@
 //! shared `spawnd status` reported its own version and "up to date" for an
 //! instance whose daemon was a different build, refusing every new session.
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -358,6 +359,15 @@ fn live_connection_text(state: &crate::state::StateFile) -> String {
         return format!("connected · {age} · last error: none");
     }
     match state.last_error.as_ref() {
+        Some(error) if error.kind == "auth" && error.detail == "token_revoked" => {
+            let mut message = String::from(
+                "The server no longer accepts this machine's login. To renew it, run spawnd login --no-run with the same --config-dir and --server options this SPAWN D instance runs with. If this machine was removed from your account, pair it again.",
+            );
+            if let Some(next) = &error.next_attempt_at {
+                let _ = write!(message, " Next attempt at {next}.");
+            }
+            message
+        }
         Some(error) if error.kind == "auth" => {
             "rejected by server (signed out) — fix with: spawnd login".into()
         }
@@ -422,8 +432,6 @@ async fn release_state(server: &url::Url, instance_tree: Option<&str>) -> String
 }
 
 fn format_plain(output: &StatusOutput, verbose: u8) -> String {
-    use std::fmt::Write;
-
     let mut text = String::new();
     for (index, instance) in output.instances.iter().enumerate() {
         if index > 0 {
@@ -573,6 +581,7 @@ mod tests {
                 kind: "auth".into(),
                 detail: "token_revoked".into(),
                 at: "2026-08-25T00:00:00Z".into(),
+                next_attempt_at: None,
             }),
             sessions: 1,
             tree: None,
@@ -591,8 +600,18 @@ mod tests {
 
     #[test]
     fn auth_heartbeat_has_the_exact_status_remedy() {
+        let remedy = "The server no longer accepts this machine's login. To renew it, run spawnd login --no-run with the same --config-dir and --server options this SPAWN D instance runs with. If this machine was removed from your account, pair it again.";
+        let mut heartbeat = state("0.1.0", None, false);
+        assert_eq!(live_connection_text(&heartbeat), remedy);
+        heartbeat.last_error.as_mut().unwrap().next_attempt_at =
+            Some("2026-08-25T00:05:00Z".into());
         assert_eq!(
-            live_connection_text(&state("0.1.0", None, false)),
+            live_connection_text(&heartbeat),
+            format!("{remedy} Next attempt at 2026-08-25T00:05:00Z.")
+        );
+        heartbeat.last_error.as_mut().unwrap().detail = "token_expired".into();
+        assert_eq!(
+            live_connection_text(&heartbeat),
             "rejected by server (signed out) — fix with: spawnd login"
         );
     }

@@ -189,6 +189,63 @@ pub(crate) async fn receive_request(stream: &mut tokio::net::TcpStream) -> (Stri
 }
 
 #[tokio::test]
+async fn oversized_registration_allows_later_consent_and_collection() {
+    use crate::proto::{parse_inbound, Inbound};
+    use serde_json::json;
+
+    bounded(async {
+        let tmp = support_log::capture::private_tempdir();
+        let (listener, origin) = listener().await;
+        let (trust, consent) = fixture();
+        let c = test_collector(tmp.path().to_owned(), trust.clone(), origin).await;
+        let registration = json!({
+            "type":"registered", "host_id":Uuid::nil(), "padding":"x".repeat(65536)
+        });
+        let Inbound::Registered { support, .. } = parse_inbound(&registration.to_string()).unwrap()
+        else {
+            panic!("expected registration");
+        };
+        c.update(&support);
+        for value in [json!(consent), serde_json::Value::Null] {
+            let wire = json!({"type":"host.support_log_consent", "consent":value});
+            let Inbound::HostSupportLogConsent { support } =
+                parse_inbound(&wire.to_string()).unwrap()
+            else {
+                panic!("expected consent update");
+            };
+            c.update(&support);
+            settled(&c).await;
+            let stored = support_store::load(tmp.path(), &trust, 1000).unwrap();
+            assert_eq!(stored.consent, Some(consent.clone()));
+            assert_eq!(stored.server_off, value.is_null());
+        }
+        let wire =
+            json!({"type":"support_log.collect", "request_id":Uuid::new_v4(), "since_seconds":60});
+        let Inbound::SupportLogCollect {
+            request_id,
+            since_seconds,
+        } = parse_inbound(&wire.to_string()).unwrap()
+        else {
+            panic!("expected collection request");
+        };
+        c.collect(request_id, since_seconds);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (_, body) = receive_request(&mut socket).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"declined":"not_consented"})
+        );
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        settled(&c).await;
+        assert_eq!(c.delivery.status().denied, None);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn actual_upload_and_refusal_complete_before_receipts_are_read() {
     bounded(async {
         let _clock = freeze_time();
