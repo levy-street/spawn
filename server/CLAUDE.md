@@ -15,7 +15,7 @@ spawn_server/
                 auth_providers, account_recovery, admin, agents,
                 browser_devices, capabilities, device, device_pairing,
                 host_introductions, hosts, install, profile, push, release,
-                root_introductions, sessions, support_log, trust_bundle, waitlist,
+                root_introductions, sessions, support_log, support_log_account, trust_bundle, waitlist,
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
                 broker.py, alerts.py, activity.py, host_signal.py,
@@ -83,7 +83,34 @@ authorization and durable-state requirements for their replacement.
 ## Support log delivery and storage
 
 Only an operator on the server can request a collection. The command inserts a
-database record. The app signing switch and owner history are still to come.
+database record. The app controls are still to come.
+
+When storage is ready, `GET /api/support-log` returns the signed-in owner's
+stored choice, signing device, server-side sharing state, hosts' declared
+capability and last seen time, and up to 100 collections from the last 365 days,
+newest first. The next signing time is an unsigned millisecond count or an
+object with a refusal code if the clock or the timestamp floor prevents signing.
+The owner's app discovers the feature through this route. Both account routes
+are absent when storage is off.
+
+`PUT /api/support-log/consent` takes the signed wire envelope (64 KiB maximum).
+The server serializes concurrent choices for one account in its single worker.
+Before checking a signature it decides pacing from the stored row's `updated_at`
+and the server clock. The first statement can be stored immediately. Each on
+after that must wait 60 seconds from the last stored change. A 429 gives the
+remaining whole seconds rounded up in `detail.retry_after_seconds`. A withdrawal
+has no cooldown. A valid off when already off returns the current state and
+leaves the row's time alone. This allows at most ten ons and ten offs per ten
+minutes. The released daemon stops sharing for the life of its process after
+30 state-changing writes in ten minutes.
+
+Once a change commits, the server wakes the pump and publishes one
+`support-log` data event to the owner's alert channel. The response has the
+same fields as GET. Statements are stored and sent, never confirmed by a host.
+Authentication failures return 401 with a string in `detail`. Consent refusals
+carry `detail.code`. A stale statement returns 409 with the
+stored `detail.issued_at_ms`. Malformed or future-dated statements return
+422, bad signatures return 400, and account or signer refusals return 403.
 
 When storage is ready, registration records the literal JSON boolean
 `supports_support_log: true` in the existing host activation write. Every host
@@ -194,7 +221,7 @@ private marked directory and checks readiness by opening the write end of
 the pipe without blocking or sending data. Before inserting
 a request, `collect` locks and verifies the directory and runs the startup write probe.
 Each lifespan starts dispatch, installs the
-upload route and starts retention only after that check succeeds. With storage
+upload and account routes and starts retention only after that check succeeds. With storage
 off, registration sends its ordinary frame and performs its ordinary SQL. A failure logs one error and
 keeps storage off for that lifespan.
 Keeping bundles outside the checkout prevents a deploy or source backup from
@@ -221,10 +248,10 @@ roster reference, so pruning a removed device preserves the signed artifact.
 Unsigned millisecond timestamps use 20-digit decimal text: SQLite integers
 cannot represent all of u64. This preserves ordering without rounding.
 Removing a signer makes every sharing check false without rewriting the statement.
-The app route should pass the ready store to `store_statement`. A signed off
-cancels open requests and marks collected records deleted in the same commit.
-File cleanup then uses only those record IDs. Account deletion reads its file
-IDs and commits both ordinary deletes. After the response, a background task
+A signed off cancels open requests and marks collected records deleted in the
+same commit. The account route leaves their files for the orphan sweep.
+Account deletion reads its file IDs and commits both ordinary deletes.
+After the response, a background task
 tries the verified directory lock once and has two seconds to remove the
 files. Each store admits one filesystem cleanup job at a time. Deletions
 during that job leave their files to the orphan sweep after its grace period.

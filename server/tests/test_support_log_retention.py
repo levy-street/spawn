@@ -48,6 +48,8 @@ from tests.test_support_log_uploads import (
 # Re-export this shared fixture without introducing a global test dependency.
 __all__ = ["app", "storage"]
 
+pytestmark = pytest.mark.usefixtures("inprocess_pubsub")
+
 
 async def age_record(record_id, **changes):
     async with get_sessionmaker()() as session:

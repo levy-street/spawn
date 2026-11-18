@@ -51,6 +51,8 @@ from tests.test_support_log_uploads import BODY, raw_request
 
 __all__ = ["lifespan_db", "pump", "temporary_prebuilts"]
 
+pytestmark = pytest.mark.usefixtures("inprocess_pubsub")
+
 
 async def request(owner, host, **kwargs):
     return await create_request(

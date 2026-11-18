@@ -203,12 +203,20 @@ on a host it no longer owns.
 
 ### Optional support log sharing
 
-**Only the operator on the server can request a diagnostic log. Sharing is
-off for everyone until the apps can sign a statement.** The local command
-requires a reason and an operator label. Both are recorded with the request
-and will be shown to the owner in collection history. The host decides whether
-it can send a bundle. Storage requires a usable private directory outside the
-checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
+**Only the operator on the server can request a diagnostic log. Sharing starts
+off.** The local command records a reason and an operator label. The host
+decides whether it can send a bundle. Storage requires a usable private
+directory outside the checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
+
+On a ready server, an owner's app can read the stored choice, the signing
+device and time, and each host's last declared capability and last seen time.
+The server reports when sharing is off because the signer was removed.
+Collection history shows up to 100 requests from the past 365 days, newest
+first. Each entry gives the request ID, host, reason, state, any decline
+code, size and request, completion, expiry and deletion times. The server
+keeps the operator label in its own record. It stores a statement signed by
+a current device on that account and relays the choice to capable hosts.
+A successful save reports what the server stored.
 
 The server's background pump alone sends statements and collection requests.
 Registration sends the ordinary trust data. The pump then sends the current
@@ -246,7 +254,8 @@ bytes unchanged and refuses a terminal. Metadata commands omit tokens, keys and
 signatures. An account-scoped lookup exposes no other account's data.
 Bundles expire after seven days and a bounded sweep runs at startup and every
 15 minutes, so deletion can follow the expiry time. A signed withdrawal cancels open requests and marks the existing collected
-bundles for deletion in the same commit. Their files are removed afterwards.
+bundles for deletion in the same commit. The orphan sweep removes their files
+once the files are more than ten minutes old.
 After the account is deleted and the response is sent, a background task tries
 to remove its bundles.
 A busy or unusable store leaves files for the orphan sweep.

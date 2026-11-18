@@ -24,6 +24,8 @@ from spawn_server.support_log_files import READY_PIPE, file_status, get_store
 from spawn_server.support_log_retention import sweep_once
 from tests.test_support_consent import seed_statement, sign
 
+pytestmark = pytest.mark.usefixtures("inprocess_pubsub")
+
 BODY = b'{"format":3}\n{"event":1}\n'
 
 

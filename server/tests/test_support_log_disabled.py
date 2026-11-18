@@ -29,6 +29,8 @@ from spawn_server.ws import daemon
 from tests.test_support_consent import seed_statement
 from tests.test_ws_daemon import FakeDaemonWebSocket, _create_host, _create_session_row
 
+pytestmark = pytest.mark.usefixtures("inprocess_pubsub")
+
 
 @pytest.mark.parametrize("unusable", [False, True])
 async def test_disabled_lifecycle(app, file_sqlite_client, tmp_path, monkeypatch, unusable, sansio_launch):

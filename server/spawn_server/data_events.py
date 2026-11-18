@@ -41,6 +41,7 @@ from .redis import get_backend, user_alert_channel
 log = logging.getLogger("spawn.data.events")
 
 DATA_FRAME_TYPE = "data"
+SUPPORT_LOG_RESOURCE = "support-log"  # Published explicitly only when consent is stored.
 
 #: First `/api/` path segments whose successful mutations fan out, and the
 #: resource name a frame carries for each. Everything absent is deliberate:
@@ -115,7 +116,7 @@ def forwardable_data_frame(event: object) -> dict[str, object] | None:
     if event.get("type") != DATA_FRAME_TYPE:
         return None
     resource = event.get("resource")
-    if resource not in RESOURCES.values():
+    if resource != SUPPORT_LOG_RESOURCE and resource not in RESOURCES.values():
         return None
     resource_id = event.get("id")
     if resource_id is not None and _bounded(resource_id) is None:
