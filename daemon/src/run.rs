@@ -8210,12 +8210,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         registry.finish_discovery(temp.path().to_owned());
         rtc.bind_registered_host_id(Uuid::new_v4()).await;
-        let pc = crate::rtc::connect_pair(&rtc, &registry, [0; 32]).await;
+        let pc = crate::rtc::connect_terminal_pair(&rtc, &registry, temp.path()).await;
         let (tx, mut rx) = mpsc::channel(8);
-        let create = skilled_create(".");
+        let create = skilled_create(temp.path().to_str().unwrap());
         let id = create.session_id;
         let gate = registry.worker_gate(id);
-        let _hold = gate.read().await;
+        let hold = gate.read().await;
         // These operations are parked at their first await, before any
         // endpoint or registry entry exists. A queued writer excludes probes.
         {
@@ -8237,6 +8237,29 @@ mod tests {
             assert!(crate::rtc::refusal_frames(&pc, id, "pty").await.is_empty());
         }
         assert_eq!(crate::rtc::refusal_frames(&pc, id, "pty").await.len(), 1);
+        drop(hold);
+        let stalled = rtc.stall_refusal_send(id).await;
+        let refusal = crate::rtc::refusal_frames(&pc, id, "pty");
+        tokio::pin!(refusal);
+        tokio::select! {
+            _ = stalled.wait_entered() => {}
+            _ = &mut refusal => panic!("refusal closed before send"),
+        }
+        // Dispatch can acquire the lifecycle writer for both windows while the
+        // send is stalled. Park each handler at its next lock, before any action.
+        for window in [id, Uuid::new_v4()] {
+            let mut command = skilled_create(temp.path().to_str().unwrap());
+            command.session_id = window;
+            let _before_replacement = registry.lock_generation_transition(window).await;
+            let dispatch = handle_session_restart(command, &registry, &rtc, &tx);
+            tokio::pin!(dispatch);
+            assert!(futures_util::poll!(&mut dispatch).is_pending());
+            assert_eq!(registry.generation_transition_holders(window), 2);
+        }
+        assert!(
+            refusal.await.is_empty(),
+            "stalled send ends in an ordinary close"
+        );
         rtc.close_all().await;
         pc.close().await.unwrap();
         assert!(rx.try_recv().is_err());

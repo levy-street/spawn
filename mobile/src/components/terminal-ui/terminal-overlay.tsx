@@ -83,6 +83,7 @@ export interface TerminalOverlayProps {
   host: HostOut;
   focused: boolean;
   detailLoaded?: boolean;
+  refreshDetail?: () => Promise<boolean>;
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
   /** Restart the window as what it was opened as: a fresh shell, with the
@@ -136,13 +137,14 @@ export function TerminalOverlay({
   agents = [],
   onKill,
   detailLoaded = false,
+  refreshDetail,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
   const appActive = useAppActive();
   const visible = focused && appActive;
   const row = detailLoaded ? session : null;
-  const windowRef = useRef({ row, visible });
-  windowRef.current = { row, visible };
+  const windowRef = useRef({ row, visible, refreshDetail });
+  windowRef.current = { row, visible, refreshDetail };
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
@@ -310,7 +312,8 @@ export function TerminalOverlay({
       scrollUnsubscribeRef.current?.();
       pendingLaunchUnsubscribeRef.current?.();
       transportRef.current = transport;
-      transport.observeWindow?.(windowRef.current.row, windowRef.current.visible);
+      const window = windowRef.current;
+      transport.observeWindow?.(window.row, window.visible, window.refreshDetail);
       scrollUnsubscribeRef.current = transport.on("scroll", (scroll) => {
         updateFollow({ type: "scroll", scroll });
         if (scroll.newOutputWhileAway) updateFollow({ type: "output-while-away" });
@@ -333,16 +336,17 @@ export function TerminalOverlay({
   );
 
   useLayoutEffect(() => {
-    transportRef.current?.observeWindow?.(row, visible);
-  }, [row, visible]);
+    transportRef.current?.observeWindow?.(row, visible, refreshDetail);
+  }, [row, visible, refreshDetail]);
 
   const handleConnectionState = (next: TransportState): void => {
     const previous = previousConnectionState.current;
     previousConnectionState.current = next;
     setConnectionState(next);
-    if (next === "ready") {
-      // The surface took the display on this ready if the claim was owed.
+    if (next === "ready" || next === "not-running") {
       setIncarnation((current) => (current.claimOwed ? { ...current, claimOwed: false } : current));
+    }
+    if (next === "ready") {
       setHasEverBeenReady(true);
       setConnectionError(null);
       if (previous !== "ready") haptics.success();

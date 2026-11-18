@@ -23,6 +23,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -61,6 +62,7 @@ import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
+import { sameSessionRun } from "@/lib/sessions";
 import { paneSizing } from "@/lib/terminal-grid";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
@@ -321,6 +323,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // a terminal mounted for a window that moved here is a reconnect, unless
   // this device moved it (`claimDisplayOnOpen`).
   const displayClaimOwedRef = useRef(active && claimDisplayOnOpen);
+  const reattachingAfterRefusal = useRef(false);
   const payDisplayClaimRef = useRef<() => void>(() => {});
   // GPU renderer for FOREGROUND terminals, within the page's budget. The DOM
   // renderer rebuilds row elements and forces style/layout/paint after every
@@ -438,7 +441,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // take control and fit to the now-visible container. Two rAFs let the
       // host's appendChild move and the container's layout settle before we
       // measure + resize.
-      displayClaimOwedRef.current = true;
+      displayClaimOwedRef.current = !reattachingAfterRefusal.current;
       requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));
       // Catch up on the refreshes the parked quiescence skipped.
       if (scrollbackCacheDirtyRef.current) {
@@ -1217,10 +1220,27 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   };
 
   const queryClient = useQueryClient();
+  const [detailRun, setDetailRun] = useState<Session | null>(null);
+  useLayoutEffect(() => {
+    const cache = queryClient.getQueryCache();
+    const detail = cache.find<Session>({ queryKey: ["session", sessionId], exact: true });
+    // A manual foreground edit can make a list-seeded query successful.
+    // Only a completed detail GET vouches for the run that supplied it.
+    return cache.subscribe((event) => {
+      if (
+        event.type === "updated" &&
+        event.query === detail &&
+        event.action.type === "success" &&
+        !event.action.manual
+      ) {
+        setDetailRun(detail.state.data ?? null);
+      }
+    });
+  }, [queryClient, sessionId]);
   const sessionIdentityQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
-    refetchOnMount: (query) => (query.state.dataUpdateCount === 0 ? "always" : true),
+    refetchOnMount: "always",
     staleTime: 30_000,
     ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
   });
@@ -1415,12 +1435,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       sessionIdentityQuery.data?.started_at,
     ]),
     canShowNotRunning:
-      sessionIdentityQuery.isFetched &&
+      detailRun?.id === sessionId &&
       sessionIdentityQuery.isSuccess &&
       displayedRow?.status === "running" &&
       displayedRow.host_id === signalingHostId &&
       sessionIdentityQuery.data?.status === "running" &&
+      sameSessionRun(detailRun, sessionIdentityQuery.data) &&
       sessionIdentityQuery.data.host_id === signalingHostId,
+    onNotRunning: () => {
+      reattachingAfterRefusal.current = true;
+      displayClaimOwedRef.current = false;
+    },
     active,
     enabled:
       socketWanted &&
@@ -1681,7 +1706,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
   });
   useEffect(() => {
-    if (!socket.dcOpen || !active) return;
+    if (!socket.dcOpen) return;
+    reattachingAfterRefusal.current = false;
+    if (!active) return;
     if (displayClaimOwedRef.current) {
       // Measure after layout settles, as the foreground path does.
       requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));

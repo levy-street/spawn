@@ -166,6 +166,7 @@ export default function TerminalScreen(): React.JSX.Element {
         agents={data.agents}
         detailLoaded={data.detailLoaded}
         focused={focused}
+        refreshDetail={data.refreshDetail}
         host={host}
         onDismiss={() => router.back()}
         onKill={() => killSession(sessionName)}

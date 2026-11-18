@@ -46,6 +46,7 @@ export interface UseSessionSocketOptions {
   active?: boolean;
   observedRun?: string;
   canShowNotRunning?: boolean;
+  onNotRunning?: () => void;
   sessionStatus?: { status: string; exit_code: number | null } | null;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
@@ -170,6 +171,7 @@ export function useSessionSocket({
   active = true,
   observedRun,
   canShowNotRunning = false,
+  onNotRunning,
   initialSize = null,
   onData,
   onHistory,
@@ -242,6 +244,7 @@ export function useSessionSocket({
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     sessionId,
+    onNotRunning,
     onData,
     onHistory,
     onDisplayControl,
@@ -253,6 +256,7 @@ export function useSessionSocket({
   initialSizeRef.current = initialSize;
   handlersRef.current = {
     sessionId,
+    onNotRunning,
     onData,
     onHistory,
     onDisplayControl,
@@ -842,6 +846,7 @@ export function useSessionSocket({
           cleanupRtc(true, true, rtcGeneration);
           return true;
         }
+        currentHandlers()?.onNotRunning?.();
         notRunning = true;
         cleanupRtc(true, false, rtcGeneration);
         setState("not-running");

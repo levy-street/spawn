@@ -311,6 +311,9 @@ test("Try again only asks the current transport to attach", async () => {
   expect(screen.getByText("Choose Restart from the window menu to start it again.")).toBeTruthy();
   await fireEvent.press(screen.getByText("Try again"));
   expect(recheck).toHaveBeenCalledTimes(1);
+  expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+  await act(() => mockConnectionProps.onRetry?.());
+  expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
   expect(restart).not.toHaveBeenCalled();
 });
 

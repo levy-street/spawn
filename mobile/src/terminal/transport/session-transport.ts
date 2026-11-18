@@ -81,6 +81,8 @@ class WebViewSessionTransport implements SessionTransport {
   #workerStarted = false;
   #row: WindowRun | null = null;
   #visible = false;
+  #refreshDetail: (() => Promise<boolean>) | undefined;
+  #detailRequest: Promise<boolean> | undefined;
   #noticeTimer: ReturnType<typeof setTimeout> | undefined;
   #pendingViewEvents: PairEvent[] = [];
   #pendingViewBytes = 0;
@@ -181,11 +183,16 @@ class WebViewSessionTransport implements SessionTransport {
         this.#emitError(error);
       }),
     );
-    const unsubscribe = shared.transport.onRebound?.(() => this.recheckNotRunning());
+    const unsubscribe = shared.transport.onRebound?.(() => this.#reattachNotRunning());
     if (unsubscribe) this.#subscriptions.push(unsubscribe);
     this.#syncConnection();
   }
-  observeWindow(row: WindowRun | null, visible: boolean): void {
+  observeWindow(
+    row: WindowRun | null,
+    visible: boolean,
+    refreshDetail?: () => Promise<boolean>,
+  ): void {
+    this.#refreshDetail = refreshDetail;
     const changed =
       row?.host_id !== this.#row?.host_id ||
       row?.status !== this.#row?.status ||
@@ -193,15 +200,33 @@ class WebViewSessionTransport implements SessionTransport {
     const shown = visible && !this.#visible;
     this.#row = row;
     this.#visible = visible;
-    if (!visible) clearTimeout(this.#noticeTimer);
+    if (!visible) {
+      clearTimeout(this.#noticeTimer);
+      this.#detailRequest = undefined;
+    }
     if (changed || shown) {
       if (this.#state === "connecting" && this.#attachmentId) {
         this.#detach();
         this.#syncConnection();
-      } else this.recheckNotRunning();
+      } else this.#reattachNotRunning();
     }
   }
-  recheckNotRunning(): void {
+  async recheckNotRunning(): Promise<void> {
+    if (this.#state !== "not-running" || this.#detailRequest) return;
+    clearTimeout(this.#noticeTimer);
+    if (this.#refreshDetail) {
+      const request = this.#refreshDetail();
+      this.#detailRequest = request;
+      const sameRun = await request;
+      if (this.#detailRequest !== request) return;
+      this.#detailRequest = undefined;
+      // A changed run attaches through observeWindow or the new host's surface.
+      if (!sameRun) return;
+    }
+    this.#reattachNotRunning();
+  }
+  #reattachNotRunning(): void {
+    if (this.#row && this.#row.host_id !== this.hostId) return;
     if (this.#state !== "not-running" || this.daemonState !== "ready") return;
     clearTimeout(this.#noticeTimer);
     this.#setState("connecting");
@@ -433,6 +458,7 @@ class WebViewSessionTransport implements SessionTransport {
     }
   }
   #detach(): void {
+    this.#detailRequest = undefined;
     clearTimeout(this.#noticeTimer);
     clearTimeout(this.#retry ?? undefined);
     this.#retry = null;

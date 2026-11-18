@@ -138,7 +138,11 @@ export interface SessionTransportOptions {
 export type WindowRun = Pick<SessionOut, "host_id" | "started_at" | "status">;
 
 export interface SessionTransport {
-  observeWindow?(row: WindowRun | null, visible: boolean): void;
+  observeWindow?(
+    row: WindowRun | null,
+    visible: boolean,
+    refreshDetail?: () => Promise<boolean>,
+  ): void;
   recheckNotRunning?(): void;
   readonly sessionId: string;
   /** The host this view attaches to the window on, fixed for its life. */

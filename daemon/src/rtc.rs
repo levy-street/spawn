@@ -402,6 +402,7 @@ impl PeerCloseCoordinator {
 enum TestEffectPoint {
     CloseAllSnapshot,
     ControlRequest,
+    RefusalSend,
     /// Under the admission lock, before the device's own pair is taken;
     /// keyed by the device key in hex.
     HostAdmissionTake,
@@ -1160,6 +1161,12 @@ impl RtcSessions {
             .await
             .insert((signal_id.to_string(), point), Arc::clone(&gate));
         gate
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stall_refusal_send(&self, id: Uuid) -> Arc<TestEffectGate> {
+        self.stall_effect(&id.to_string(), TestEffectPoint::RefusalSend)
+            .await
     }
 
     #[cfg(test)]
@@ -5555,7 +5562,7 @@ async fn send_json_dynamic(signaling: &RtcWsSender, frame: Outbound) {
 }
 
 #[cfg(test)]
-pub(crate) use pair::tests::{connect_pair, refusal_frames};
+pub(crate) use pair::tests::{connect_terminal_pair, refusal_frames};
 
 #[cfg(test)]
 mod tests {

@@ -3,6 +3,7 @@ import { useEffect } from "react";
 
 import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
+import { ApiError } from "@/data/api/client";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { getHost } from "@/data/api/endpoints/hosts";
 import {
@@ -31,6 +32,8 @@ export interface TerminalData {
   agents: readonly AgentDef[];
   isLoading: boolean;
   error: Error | null;
+  /** True when a fresh detail GET confirms the run this terminal shows. */
+  refreshDetail: () => Promise<boolean>;
   refetch: () => Promise<void>;
 }
 
@@ -81,6 +84,12 @@ export function useTerminalData(sessionId: string): TerminalData {
     staleTime: AGENTS_STALE_MS,
   });
 
+  const detailError = sessionQuery.error;
+  const unavailable =
+    !sessionQuery.data ||
+    hostQuery.data?.id !== hostId ||
+    (detailError instanceof ApiError && [401, 403, 404, 410].includes(detailError.status));
+
   return {
     session: sessionQuery.data,
     detailLoaded: sessionQuery.isFetched && sessionQuery.isSuccess,
@@ -88,11 +97,17 @@ export function useTerminalData(sessionId: string): TerminalData {
     agents: agentsQuery.data ?? [],
     isLoading: sessionQuery.isLoading || (hostId.length > 0 && hostQuery.isLoading),
     error:
-      sessionQuery.error instanceof Error
-        ? sessionQuery.error
+      unavailable && detailError instanceof Error
+        ? detailError
         : hostQuery.error instanceof Error
           ? hostQuery.error
           : null,
+    refreshDetail: async () => {
+      const result = await sessionQuery.refetch({ cancelRefetch: false });
+      return (
+        !!sessionQuery.data && result.isSuccess && sameSessionRun(sessionQuery.data, result.data)
+      );
+    },
     refetch: async () => {
       const sessionResult = await sessionQuery.refetch();
       if (sessionResult.data?.host_id) await hostQuery.refetch();

@@ -47,6 +47,7 @@ import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
+import { usePaneScope } from "./pane-scope";
 import { WhereChip } from "./where-chip";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
@@ -140,11 +141,12 @@ export function SessionPane({
     session,
   );
   const daemonConnection = useDaemonConnection(session?.host_id ?? null);
-  const wasFocused = useRef(focused);
+  const noticeFocused = usePaneScope().active && focused;
+  const wasFocused = useRef(noticeFocused);
   useEffect(() => {
-    if (focused && !wasFocused.current) getHandle()?.recheckNotRunning();
-    wasFocused.current = focused;
-  }, [focused, getHandle]);
+    if (noticeFocused && !wasFocused.current) getHandle()?.recheckNotRunning();
+    wasFocused.current = noticeFocused;
+  }, [noticeFocused, getHandle]);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);

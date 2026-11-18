@@ -1660,7 +1660,12 @@ const setRefusal = (page: Page, reason?: string) =>
   );
 
 async function refusedWindow(page: Page, workspacePane = false, reason = "session_not_running") {
-  await installSessionRtcMock(page, [], { attachRefusal: reason, autoSnapshot: true });
+  const messages: Array<string | Buffer> = [];
+  await installSessionRtcMock(page, messages, {
+    attachRefusal: reason,
+    autoSnapshot: true,
+    control: { owner: false, cols: 100, rows: 30, viewers: 2 },
+  });
   const store = await mockApp(page, {
     sessions: [session({ agent_id: null })],
     workspaces: [
@@ -1678,6 +1683,7 @@ async function refusedWindow(page: Page, workspacePane = false, reason = "sessio
   return {
     store,
     mutations: () => mutations,
+    messages,
     open: () => page.goto(workspacePane ? `/w/${WORKSPACE_ID}` : `/sessions/${SESSION_ID}`),
     button: page.getByRole("button", { name: "Try again", exact: true }),
     notice: page.getByText(/This session is no longer running on/),
@@ -1734,6 +1740,13 @@ test("not-running notice retries once on click, visibility, timer and host recov
   await view.button.click();
   await expect(view.notice).toHaveCount(0);
   await expect(terminal).toHaveAttribute("aria-busy", "false");
+  const take = page.getByRole("button", { name: "Take control" });
+  await expect(take).toBeVisible();
+  expect(jsonMessages(view.messages).filter((m) => m.type === "take_control")).toHaveLength(0);
+  await take.click();
+  await expect
+    .poll(() => jsonMessages(view.messages).filter((m) => m.type === "take_control").length)
+    .toBe(1);
   const healthy = await attachmentCount(page);
   await rebound(page);
   await page.clock.fastForward(30_000);
@@ -1781,6 +1794,23 @@ test("workspace not-running notice requires loaded detail and the displayed host
   });
   await view.open();
   await expect.poll(() => attachmentCount(page)).toBeGreaterThan(1);
+  await expect(view.notice).toHaveCount(0);
+  // Exercise the switcher's optimistic cache write without launching an agent.
+  await page.getByLabel("Session terminal").evaluate((node, id) => {
+    type Client = import("@tanstack/react-query").QueryClient;
+    type Fiber = { return: Fiber | null; memoizedProps?: { client?: Client } };
+    const key = Object.keys(node).find((name) => name.startsWith("__reactFiber$"));
+    let fiber: Fiber | null = key ? Reflect.get(node, key) : null;
+    while (fiber && !fiber.memoizedProps?.client?.setQueryData) fiber = fiber.return;
+    const client = fiber?.memoizedProps?.client;
+    if (!client) throw new Error("Missing query provider");
+    client.setQueryData<Record<string, unknown>>(["session", id], (row) => {
+      if (!row) throw new Error("Expected list-seeded detail");
+      return { ...row, foreground_command: "codex" };
+    });
+  }, SESSION_ID);
+  const optimistic = await attachmentCount(page);
+  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(optimistic);
   await expect(view.notice).toHaveCount(0);
   release();
   await expect(view.notice).toBeVisible();
@@ -1834,5 +1864,54 @@ test("a delayed not-running refusal cannot park a replacement or a reopened work
     );
     await expect(view.notice).toHaveCount(0);
   }
+  expect(view.mutations()).toBe(0);
+});
+
+test("a visible workspace notice rechecks once after 30 seconds", async ({ page }) => {
+  const view = await refusedWindow(page, true);
+  await view.open();
+  await expect(view.notice).toBeVisible();
+  const count = await attachmentCount(page);
+  await page.clock.fastForward(30_000);
+  await expect.poll(() => attachmentCount(page)).toBe(count + 1);
+  await expect(view.notice).toBeVisible();
+  expect(view.mutations()).toBe(0);
+});
+
+test("a starting workspace pane keeps retrying without a notice", async ({ page }) => {
+  const view = await refusedWindow(page, true);
+  view.store.sessions[0].status = "starting";
+  await view.open();
+  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(1);
+  await expect(view.notice).toHaveCount(0);
+  expect(view.mutations()).toBe(0);
+});
+
+test("activating a split column rechecks its focused terminal before expiry", async ({ page }) => {
+  const view = await refusedWindow(page, true);
+  const second = crypto.randomUUID();
+  view.store.sessions.push(session({ id: SESSION_B_ID }));
+  view.store.workspaces.push(
+    workspace({
+      id: second,
+      layout: {
+        version: 3,
+        tiles: [{ session_id: SESSION_B_ID, x: 0, y: 0, w: 24, h: 24 }],
+      },
+    }),
+  );
+  await page.addInitScript(
+    (members) => {
+      localStorage.setItem("spawn.workspaces.split", JSON.stringify({ members }));
+    },
+    [WORKSPACE_ID, second],
+  );
+  await view.open();
+  await expect(view.notice).toHaveCount(2);
+  const column = page.locator(`[data-workspace-pane="${second}"]`);
+  const count = await attachmentCount(page);
+  await column.dispatchEvent("pointerdown");
+  await expect.poll(() => attachmentCount(page)).toBe(count + 1);
+  await expect(column.getByText(/This session is no longer running on/)).toBeVisible();
   expect(view.mutations()).toBe(0);
 });

@@ -71,11 +71,14 @@ its tiles before deleting the workspace.
 | Host control | DataChannel `spawn.host.ctl` | protocol version 1 | host filesystem and host-scoped protected operations |
 
 On a shared host connection, either half of a refused terminal attachment can
-close first. When the host finds no worker for that window, each channel sends
-one text event before closing, with `version: 1`, `kind: "event"`,
-`event: "attach_refused"` and `reason: "session_not_running"`. Older devices
-ignore PTY text and unknown control events and retry on close. Other reasons
-and closes without a reason keep that retry behavior. The notice applies to a
+close first. After discovery and admission, a host that finds no worker or
+worker files for a window outside a lifecycle change can send one text event
+on each channel before closing, with `version: 1`, `kind: "event"`,
+`event: "attach_refused"` and `reason: "session_not_running"`. An ordinary
+close also occurs before discovery finishes, when admission refuses, when the
+filesystem check is uncertain, on timeout, or when the channel closes first.
+Older devices ignore PTY text and unknown control events and retry on close.
+Other reasons and closes without a reason keep that retry behavior. The notice applies to a
 running row on the answering host. Try again opens fresh channels, as does a
 visible notice after 30 seconds. Restart belongs to the window menu. This
 exchange neither contacts a worker nor records a session change on the server.

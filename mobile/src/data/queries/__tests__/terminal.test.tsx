@@ -78,3 +78,16 @@ test.each([{ status: "starting" as const }, { started_at: new Date(0).toISOStrin
     expect(result.current.detailLoaded).toBe(true);
   },
 );
+
+test("a failed detail refresh suppresses the notice until a successful detail GET", async () => {
+  jest.mocked(getSession).mockResolvedValue(session);
+  jest.mocked(getHost).mockResolvedValue(host);
+  const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
+  await waitFor(() => expect(result.current.host).toEqual(host));
+  jest.mocked(getSession).mockRejectedValueOnce(new Error("temporarily unavailable"));
+  await act(() => result.current.refreshDetail());
+  await waitFor(() => expect(result.current.detailLoaded).toBe(false));
+  expect(result.current).toMatchObject({ session, host, error: null });
+  await act(() => result.current.refreshDetail());
+  await waitFor(() => expect(result.current.detailLoaded).toBe(true));
+});

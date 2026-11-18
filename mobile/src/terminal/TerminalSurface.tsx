@@ -228,6 +228,10 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       let displayClaimOwed = claimsOnOpen.current;
       const unsubscribers = [
         transport.on("state", (state) => {
+          if (state === "not-running") {
+            claimsOnOpen.current = false;
+            displayClaimOwed = false;
+          }
           if (state === "ready" && displayClaimOwed) {
             displayClaimOwed = false;
             transport.takeControl();
