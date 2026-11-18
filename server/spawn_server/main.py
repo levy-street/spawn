@@ -38,6 +38,7 @@ from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
 from .routes import support_log as support_log_routes
+from .routes import support_log_account as support_log_account_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import waitlist as waitlist_routes
 from .routes import workspace_templates as workspace_templates_routes
@@ -110,6 +111,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         else:
             before = len(app.routes)
             app.include_router(support_log_routes.router)
+            app.include_router(support_log_account_routes.router)
             app.state.support_log_routes = app.routes[before:]
         app.openapi_schema = None
         app.state.support_log_store = store

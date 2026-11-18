@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     EmailStr,
@@ -27,7 +28,89 @@ from .host_identity import (
 )
 from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
 from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
+from .support_consent import U64_MAX, canonical_uuid
 from .web_push import valid_subscription_key
+from .ws.signed_signal_relay import MAX_RELAYED_ENDORSEMENTS, sanitize_carried_endorsements
+
+# ---------- account support log ----------
+
+
+class SupportLogConsentIn(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    version: int = Field(ge=1, le=1)
+    account_id: str
+    signer_public_key: str = Field(min_length=43, max_length=43)
+    signer_device_id: str
+    enabled: bool
+    issued_at_ms: int = Field(ge=0, le=U64_MAX)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH, max_length=ED25519_SIGNATURE_B64URL_LENGTH
+    )
+    carried_endorsements: list[dict[str, str]] = Field(
+        default_factory=list, max_length=MAX_RELAYED_ENDORSEMENTS
+    )
+
+    @field_validator("account_id", "signer_device_id")
+    @classmethod
+    def wire_uuid(cls, value: str) -> str:
+        canonical_uuid(value)
+        return value
+
+    @field_validator("carried_endorsements")
+    @classmethod
+    def bounded_approvals(cls, value: list[dict[str, str]]) -> list[dict[str, str]]:
+        if value and sanitize_carried_endorsements(value) != value:
+            raise ValueError("invalid carried endorsements")
+        return value
+
+
+class StoredSupportStatement(BaseModel):
+    enabled: bool
+    issued_at_ms: int
+    signer_device_id: str
+    signer_device_name: str | None
+
+
+# SQLite returns naive UTC. Send an explicit offset on both databases.
+SupportLogTime = Annotated[
+    datetime, AfterValidator(lambda dt: dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC))
+]
+
+
+class SupportLogHostOut(BaseModel):
+    id: str
+    name: str
+    capable: bool
+    last_seen_at: SupportLogTime | None
+
+
+class SupportLogCollectionOut(BaseModel):
+    id: str
+    host_id: str | None
+    host_name: str
+    state: str
+    decline_code: str | None = None
+    reason: str
+    requested_at: SupportLogTime
+    completed_at: SupportLogTime | None
+    size_bytes: int | None
+    expires_at: SupportLogTime | None
+    deleted_at: SupportLogTime | None
+
+
+class SupportLogTimestampRefusal(BaseModel):
+    code: Literal["timestamp_overflow", "future_timestamp"]
+
+
+class SupportLogAccountOut(BaseModel):
+    statement: StoredSupportStatement | None
+    sharing: Literal["on", "off", "off_signer_removed"]
+    next_issued_at_ms: int | SupportLogTimestampRefusal
+    hosts: list[SupportLogHostOut]
+    collections: list[SupportLogCollectionOut]
+    retention_days: int
+
 
 # ---------- auth ----------
 
