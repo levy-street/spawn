@@ -15,15 +15,14 @@ from enum import StrEnum
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import HTTPException
-from sqlalchemy import and_, exists, literal, or_, select
+from sqlalchemy import and_, exists, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .browser_registration import decode_ed25519_signature
 from .db import get_sessionmaker
 from .host_identity import _decode_strict_ed25519_point, decode_ed25519_public_key
-from .models import BrowserDevice, SupportLogCollection, SupportLogConsent, User
-from .support_delivery import deliver_statement, delivery_order
+from .models import BrowserDevice, SupportLogCollection, SupportLogConsent, _utcnow
 from .ws.signed_signal_relay import sanitize_carried_endorsements
 
 MAGIC = b"SPAWN-SUPPORT-LOG-CONSENT-V1"
@@ -208,43 +207,26 @@ def _envelope(row: SupportLogConsent | None) -> dict | None:
     }
 
 
-async def delivery_snapshot(session, user_id: str):
-    # The outer join returns the wake decision even without a deliverable
-    # statement. A signed off remains deliverable after removal of its signer.
+async def effective_statement(user_id: str) -> dict | None:
     consent = SupportLogConsent
-    query = (
-        select(consent)
-        .select_from(User)
-        .outerjoin(
-            consent,
-            and_(
-                consent.owner_user_id == User.id,
+    async with get_sessionmaker()() as session:
+        row = await session.scalar(
+            select(consent).where(
+                consent.owner_user_id == user_id,
                 or_(
                     consent.enabled.is_(False),
-                    live_signer(
-                        consent.owner_user_id,
-                        consent.signer_device_id,
-                        consent.signer_public_key,
-                    ),
+                    live_signer(user_id, consent.signer_device_id, consent.signer_public_key),
                 ),
-            ),
+            )
         )
-        .where(User.id == user_id)
-    )
-    query = query.add_columns(
-        exists().where(
-            SupportLogCollection.owner_user_id == user_id,
-            SupportLogCollection.state.in_(("requested", "dispatched")),
-        )
-    )
-    row = (await session.execute(query)).one_or_none()
-    if row is None:
-        return None, False
-    return _envelope(row[0]), row[1]
+        return _envelope(row)
 
 
-async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | None = None):
-    from .support_log_files import finish_job
+async def store_statement(
+    user_id: str, value: dict | bytes, *, clock_ms: int | None = None, store=None
+):
+    from .support_log import cancel_open
+    from .support_log_retention import remove_files
 
     statement = await asyncio.to_thread(verify_statement, value)
     if statement["account_id"] != user_id:
@@ -252,18 +234,6 @@ async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | 
     clock = now_ms() if clock_ms is None else clock_ms
     if statement["issued_at_ms"] > clock + FUTURE_MS:
         raise ConsentError(ConsentReason.FUTURE_TIMESTAMP)
-    async with delivery_order(user_id).enter(reducing=not statement["enabled"]) as turn:
-        if turn is None:
-            raise TimeoutError("Support log delivery is busy")
-        # A cancelled caller cannot release the order halfway through a commit
-        # or leave its signed withdrawal undelivered on healthy sockets.
-        await finish_job(_commit_and_deliver(turn, user_id, statement))
-    return statement
-
-
-async def _commit_and_deliver(turn, user_id, statement):
-    from .models import _utcnow
-
     values = dict(
         owner_user_id=user_id,
         enabled=statement["enabled"],
@@ -309,5 +279,21 @@ async def _commit_and_deliver(turn, user_id, statement):
             else:
                 reason = ConsentReason.STALE_STATEMENT
             raise ConsentError(reason)
+        files = []
+        if not statement["enabled"]:
+            now = _utcnow()
+            await cancel_open(session, user_id, now)
+            deleted = await session.scalars(
+                update(SupportLogCollection)
+                .where(
+                    SupportLogCollection.owner_user_id == user_id,
+                    SupportLogCollection.state == "collected",
+                )
+                .values(state="deleted", deleted_at=now)
+                .returning(SupportLogCollection.id)
+            )
+            files = deleted.all()
         await session.commit()
-    await deliver_statement(turn, user_id, statement)
+    if store is not None and files:
+        await remove_files(store, files)
+    return statement

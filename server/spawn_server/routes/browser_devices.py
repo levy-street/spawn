@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from contextlib import nullcontext
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,9 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
-from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, SupportLogConsent, User
-from ..support_delivery import deliver_statement, delivery_order
-from ..support_log_files import get_store
+from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, User
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/browser-devices", tags=["browser-devices"])
@@ -316,41 +313,9 @@ async def request_browser_device_approval(
 async def revoke_browser_device(
     device_id: str,
     body: schemas.BrowserDeviceRevokeRequest,
-    request: Request,
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> schemas.BrowserDeviceOut:
-    ready = get_store(request.app) is not None
-    if ready:
-        await session.commit()  # End the authentication read before waiting for delivery.
-    order = delivery_order(user.id).enter(reducing=True) if ready else nullcontext()
-    async with order as turn:
-        device, changed = await _revoke_device(session, user, device_id, body)
-        # Every host needs the ordinary account-wide key tombstone, including
-        # hosts with no direct pin. Also identify the signer in this same read.
-        hosts = select(Host.id).where(Host.owner_user_id == user.id)
-        if ready and changed:
-            hosts = hosts.add_columns(
-                select(SupportLogConsent.signed_device_id)
-                .where(SupportLogConsent.owner_user_id == user.id, SupportLogConsent.enabled)
-                .scalar_subquery()
-            )
-        affected_hosts = (await session.execute(hosts)).all()
-        if ready:
-            await session.commit()  # Finish the host read before any sends.
-            if changed and affected_hosts and affected_hosts[0][1] == device_id:
-                await deliver_statement(turn, user.id, None)
-
-    for (host_id, *_) in affected_hosts:
-        try:
-            await push_browser_pins(host_id)
-        except Exception:
-            pass
-
-    return _to_out(device)
-
-
-async def _revoke_device(session, user, device_id, body):
     now = datetime.now(UTC)
     # Attribution only (the removed screen names its remover, R4). Accept the
     # claimed device only if it is a live device of this same account; anything
@@ -436,7 +401,33 @@ async def _revoke_device(session, user, device_id, body):
             raise HTTPException(
                 status_code=409, detail="browser device revocation did not commit"
             ) from None
-    return device, result.rowcount != 0
+
+    # Revocation only stamps a DB tombstone; a live daemon keeps trusting this
+    # device -- directly, and via every pin it endorsed -- until it next
+    # reconnects and reconciles. That wait can be days for a long-lived spawnd
+    # WS, so mirror the endorsement route and push the recomputed live pin set
+    # now to every host whose set this revocation changed (the device as
+    # endorsed OR as endorser). Best effort by design: registration
+    # reconciliation is the hard guarantee, so an absent or failed push must
+    # never fail the revoke.
+    #
+    # Push to EVERY host of the account, not just those with a per-host pin
+    # relationship to this device: the account deny-list (revoked_browser_keys)
+    # is account-wide, and a revoked device could otherwise connect to a host it
+    # was never directly pinned on via a carried endorsement chain to that host's
+    # anchor (device mesh §3). The per-host pin-pruning targets are a subset.
+    affected_host_ids = (
+        (await session.execute(select(Host.id).where(Host.owner_user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    for host_id in affected_host_ids:
+        try:
+            await push_browser_pins(host_id)
+        except Exception:
+            pass
+
+    return _to_out(device)
 
 
 @router.patch("/{device_id}", response_model=schemas.BrowserDeviceOut)

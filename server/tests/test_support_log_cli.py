@@ -315,7 +315,7 @@ async def test_show_escapes_controls_and_raw_requires_redirection(
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     assert await cli.run(["show", record, "--raw"]) == 2
     captured = capsys.readouterr()
-    assert not captured.out and "pipe or a file" in captured.err
+    assert not captured.out and "terminal" in captured.err
 
 
 async def test_unrelated_directory_is_untouched_by_commands_startup_and_sweep(
@@ -356,3 +356,17 @@ async def test_unrelated_directory_is_untouched_by_commands_startup_and_sweep(
     assert list(root.iterdir()) == [old] and old.read_bytes() == BODY
     after = root.stat()
     assert (before.st_mode, before.st_ctime_ns) == (after.st_mode, after.st_ctime_ns)
+
+async def test_collect_and_startup_agree_when_verified_store_fails_write_probe(
+    app, configured, monkeypatch, capsys
+):
+    from unittest.mock import Mock
+
+    from spawn_server import support_log_files as files
+
+    probe = Mock(side_effect=PermissionError)
+    monkeypatch.setattr(files, "_write_probe", probe)
+    with no_statements():
+        assert "storage" in (await output(collect("", "") + ["--by", "operator"], capsys, 8))["error"]
+    assert await prepare_store() is None
+    assert probe.call_count == 2

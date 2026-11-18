@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -79,8 +80,11 @@ class SupportLogFiles:
         return self.root / f"{record_id}.ndjson"
 
     def _try_lock(self):
+        parent = self.fd
+        if parent is None:
+            raise OSError("Support store is closed")
         try:
-            fd = _lock_directory(".", fcntl.LOCK_EX | fcntl.LOCK_NB, parent=self.fd)
+            fd = _lock_directory(".", fcntl.LOCK_EX | fcntl.LOCK_NB, parent=parent)
             try:
                 _verify_identity(fd)
                 return fd
@@ -124,14 +128,31 @@ class SupportLogFiles:
         finally:
             self.unlink(temporary)
 
-    def remove(self, record_id: str):
-        self.unlink(self.path(record_id).name)
+    def remove(self, record_id: str, *, dir_fd=None):
+        self.unlink(self.path(record_id).name, dir_fd=dir_fd)
 
-    def unlink(self, name):
+    def remove_committed(self, ids, deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        fd = self._try_lock()
+        if fd is None:
+            raise BlockingIOError("Support store is busy")
+        try:
+            for record_id in ids:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                try:
+                    self.remove(record_id, dir_fd=fd)
+                except Exception:
+                    log.error("SPAWN D support log file cleanup failed; sweep will retry")
+        finally:
+            os.close(fd)
+
+    def unlink(self, name, *, dir_fd=None):
         if not STORE_FILE.fullmatch(name):
             raise ValueError("Unrecognized support file name")
         try:
-            os.unlink(name, dir_fd=self.fd)
+            os.unlink(name, dir_fd=self.fd if dir_fd is None else dir_fd)
         except FileNotFoundError:
             pass
 
@@ -175,6 +196,14 @@ class SupportLogFiles:
             self._entries = None
 
 
+def _write_probe(fd):
+    # Probe writes only after verifying or establishing the identity.
+    name = f".upload-{uuid.uuid4()}.tmp"
+    probe = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=fd)
+    os.close(probe)
+    os.unlink(name, dir_fd=fd)
+
+
 def _probe(root: Path):
     fd = _lock_directory(root, fcntl.LOCK_EX)
     try:
@@ -186,11 +215,7 @@ def _probe(root: Path):
                     raise
             os.fchmod(fd, 0o700)
             os.setxattr(fd, STORE_ATTRIBUTE, STORE_VERSION, os.XATTR_CREATE)
-        # Probe writes only after verifying or establishing the identity.
-        name = f".upload-{uuid.uuid4()}.tmp"
-        probe = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=fd)
-        os.close(probe)
-        os.unlink(name, dir_fd=fd)
+        _write_probe(fd)
     finally:
         os.close(fd)
 
@@ -236,13 +261,21 @@ async def prepare_store() -> SupportLogFiles | None:
         return None
 
 
-def open_existing_store():
+def open_existing_store(*, probe_write=False):
     directory = get_settings().support_log_dir
     if not directory:
         raise OSError("Support log storage is not configured or usable.")
     store = SupportLogFiles(_store_root(directory))
     try:
-        _verify_identity(store.fd)
+        if probe_write:
+            fcntl.flock(store.fd, fcntl.LOCK_EX)
+            try:
+                _verify_identity(store.fd)
+                _write_probe(store.fd)
+            finally:
+                fcntl.flock(store.fd, fcntl.LOCK_UN)
+        else:
+            _verify_identity(store.fd)
         return store
     except BaseException:
         store.close()

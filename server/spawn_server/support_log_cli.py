@@ -87,7 +87,7 @@ def arguments(argv):
     if args.command == "show" and args.raw and getattr(args, "json", False):
         raise CommandError(2, "Choose one output format.")
     if args.command == "show" and args.raw and sys.stdout.isatty():
-        raise CommandError(2, "Raw output requires a pipe or a file.")
+        raise CommandError(2, "Raw output refuses a terminal.")
     return args
 
 
@@ -256,7 +256,7 @@ async def run(argv):
     try:
         args = arguments(argv)
         as_json = getattr(args, "json", False)
-        store = await asyncio.to_thread(open_existing_store)
+        store = await asyncio.to_thread(open_existing_store, probe_write=args.command == "collect")
         try:
             result = await command(args, store)
         finally:

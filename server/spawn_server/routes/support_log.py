@@ -13,7 +13,7 @@ from starlette.requests import ClientDisconnect
 
 from .. import auth
 from ..db import get_sessionmaker
-from ..models import SupportLogCollection, _utcnow
+from ..models import _utcnow
 from ..support_consent import ConsentError, canonical_uuid, is_sharing_on, strict_json
 from ..support_log import DECLINE_CODES, body_readers, get_collection, transition
 from ..support_log_files import finish_job, get_store
@@ -154,27 +154,20 @@ async def upload(request_id: str, request: Request):
     pump = getattr(request.app.state, "support_log_pump", None)
     if store is None or pump is None:
         raise HTTPException(404, NOT_FOUND)
-    # Explicit dependency scope ends before a body read, including auth's SELECT.
+    async with get_sessionmaker()() as session:
+        host = await auth.daemon_principal(request.headers.get("authorization"), session)
+        host_id, owner = host.id, host.owner_user_id
+    try:
+        canonical_uuid(request_id)
+    except ConsentError:
+        raise HTTPException(404, NOT_FOUND) from None
     with ExitStack() as slots:
-        async with get_sessionmaker()() as session:
-            host = await auth.daemon_principal(request.headers.get("authorization"), session)
-            try:
-                canonical_uuid(request_id)
-            except ConsentError:
-                raise HTTPException(404, NOT_FOUND) from None
-            # Register a reader before a pump claim can spend a slot freed by
-            # cancellation. Neither the session nor admission spans the body read.
-            async with pump.upload_admission:
-                record = await session.get(SupportLogCollection, request_id)
-                if (
-                    record is None
-                    or record.host_id != host.id
-                    or record.owner_user_id != host.owner_user_id
-                ):
-                    raise HTTPException(404, NOT_FOUND)
-                if record.state != "dispatched":
-                    raise HTTPException(409, "support request closed")
-                slots.enter_context(upload_slots(record.id))
+        record = await pump.collection_for_upload(request_id)
+        if record is None or record.host_id != host_id or record.owner_user_id != owner:
+            raise HTTPException(404, NOT_FOUND)
+        if record.state != "dispatched":
+            raise HTTPException(409, "support request closed")
+        slots.enter_context(upload_slots(record.id))
         if not await is_sharing_on(record.owner_user_id):
             await transition(record.id, "dispatched", "cancelled")
             raise HTTPException(409, "support sharing is off")

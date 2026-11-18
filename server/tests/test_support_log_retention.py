@@ -25,9 +25,7 @@ from spawn_server.support_consent import get_statement, store_statement
 from spawn_server.support_log import create_request, get_collection, mark_dispatched, transition
 from spawn_server.support_log_files import get_store
 from spawn_server.support_log_retention import (
-    account_deletion_files,
-    account_file_ids,
-    sharing_turned_off,
+    remove_files,
     start_sweeps,
     sweep_once,
 )
@@ -159,8 +157,7 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     other, other_token, *_ = await setup_request()
     assert (await post(client, other, other_token)).status_code == 204
     off = sign({**statement, "enabled": False}, key)
-    await store_statement(statement["account_id"], off)
-    await sharing_turned_off(statement["account_id"], storage)
+    await store_statement(statement["account_id"], off, store=storage)
     assert await get_statement(statement["account_id"]) == off
     assert (await get_collection(record_id)).state == "deleted"
     assert (await get_collection(requested)).state == "cancelled"
@@ -170,9 +167,9 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     assert not await mark_dispatched(requested)
 
 
-@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup"])
 async def test_account_deletion_removes_files_and_cascades(
-    client, storage, monkeypatch, caplog, cleanup_fails
+    client, storage, monkeypatch, caplog, failure
 ):
     record_id, token, statement, _key, host = await setup_request()
     assert (await post(client, record_id, token)).status_code == 204
@@ -192,18 +189,32 @@ async def test_account_deletion_removes_files_and_cascades(
     socket = Mock(close=AsyncMock())
     broker = Mock(get_daemon_for_host=Mock(return_value=socket))
     monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
-    remove = storage.remove
-    if cleanup_fails:
+    with monkeypatch.context() as m:
+        if failure == "unlink":
+            m.setattr(storage, "remove", Mock(side_effect=OSError))
+        elif failure == "marker":
+            os.removexattr(storage.fd, support_log_files.STORE_ATTRIBUTE)
+        elif failure == "mode":
+            os.fchmod(storage.fd, 0o750)
+        elif failure == "lock":
+            support_log_files.fcntl.flock(storage.fd, support_log_files.fcntl.LOCK_EX)
+        elif failure == "lookup":
+            from sqlalchemy.ext.asyncio import AsyncSession
 
-        def fail_remove(_record_id):
-            raise OSError("injected")
-
-        monkeypatch.setattr(storage, "remove", fail_remove)
-    response = await client.post(
-        "/api/account/delete",
-        json={"confirm_email": user.email},
-        headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
-    )
+            m.setattr(AsyncSession, "scalars", AsyncMock(side_effect=RuntimeError))
+        try:
+            response = await client.post(
+                "/api/account/delete",
+                json={"confirm_email": user.email},
+                headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
+            )
+        finally:
+            if failure == "marker":
+                os.setxattr(storage.fd, support_log_files.STORE_ATTRIBUTE, support_log_files.STORE_VERSION)
+            elif failure == "mode":
+                os.fchmod(storage.fd, 0o700)
+            elif failure == "lock":
+                support_log_files.fcntl.flock(storage.fd, support_log_files.fcntl.LOCK_UN)
     assert response.status_code == 204 and response.content == b""
     assert 'spawn_session=""' in response.headers["set-cookie"]
     assert "Max-Age=0" in response.headers["set-cookie"]
@@ -211,14 +222,13 @@ async def test_account_deletion_removes_files_and_cascades(
     socket.close.assert_awaited_once()
     assert await get_collection(record_id) is None
     assert await get_statement(user.id) is None
-    assert storage.path(record_id).exists() == cleanup_fails
+    assert storage.path(record_id).exists() == bool(failure)
     assert storage.path(other).exists()
     async with get_sessionmaker()() as session:
         assert await session.get(Host, host.id) is None
         assert await session.get(User, user.id) is None
-    if cleanup_fails:
-        assert caplog.text.count("account file cleanup failed") == 1
-        monkeypatch.setattr(storage, "remove", remove)
+    if failure:
+        assert caplog.text.count("sweep will retry") == 1
         await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
         assert not storage.path(record_id).exists()
         assert storage.path(other).exists()
@@ -320,11 +330,6 @@ async def test_feature_off_no_io_body_or_sweep(app, tmp_path, monkeypatch):
     for record_id, token in (("malformed", None), (str(uuid.uuid4()), "invalid")):
         status, _, reads = await raw_request(app, record_id, token=token)
         assert status == 404 and reads == 0
-    await sharing_turned_off(str(uuid.uuid4()), store)
-    async with get_sessionmaker()() as session:
-        assert await account_file_ids(session, str(uuid.uuid4()), store) == []
-        async with account_deletion_files(session, str(uuid.uuid4()), store):
-            assert not session.in_transaction()
     assert not directory.exists()
 
 
@@ -489,7 +494,8 @@ async def test_collection_functions_validate_and_compare_state(app):
     assert (await get_collection(record_id)).host_id is None
 
 
-async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkeypatch):
+@pytest.mark.parametrize("before_commit", [False, True])
+async def test_upload_during_account_deletion(file_sqlite_client, storage, monkeypatch, before_commit):
     from spawn_server import support_log_retention as retention
     from spawn_server.db import configure_sqlite_connections, get_engine
 
@@ -511,15 +517,23 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
         )
         await session.commit()
     captured, proceed = asyncio.Event(), asyncio.Event()
-    original = retention.account_file_ids
+    if before_commit:
+        get_ids = retention.account_file_ids
 
-    async def held_ids(session, user_id, store):
-        ids = await original(session, user_id, store)
-        captured.set()
-        await asyncio.wait_for(proceed.wait(), 30)
-        return ids
+        async def hold_snapshot(session, owner):
+            ids = await get_ids(session, owner)
+            captured.set()
+            await proceed.wait()
+            return ids
 
-    monkeypatch.setattr(retention, "account_file_ids", held_ids)
+        monkeypatch.setattr(retention, "account_file_ids", hold_snapshot)
+    else:
+        async def hold_cleanup(store, ids):
+            captured.set()
+            await proceed.wait()
+            await remove_files(store, ids)
+
+        monkeypatch.setattr(retention, "remove_files", hold_cleanup)
     deletion = asyncio.create_task(
         file_sqlite_client.post(
             "/api/account/delete",
@@ -528,11 +542,16 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
         )
     )
     await asyncio.wait_for(captured.wait(), 30)
-    late = asyncio.create_task(post(file_sqlite_client, record_id, token))
-    proceed.set()
-    result, upload = await asyncio.wait_for(asyncio.gather(deletion, late), 30)
+    try:
+        upload = await post(file_sqlite_client, record_id, token)
+        if before_commit:
+            assert upload.status_code == 204 and storage.path(record_id).read_bytes() == BODY
+        else:
+            assert upload.status_code == 401
+    finally:
+        proceed.set()
+    result = await asyncio.wait_for(deletion, 30)
     assert result.status_code == 204
-    assert upload.status_code in {401, 404, 409}
     assert not list(storage.root.iterdir())
     assert await get_collection(record_id) is None
 
@@ -553,3 +572,65 @@ async def test_sweep_only_unlinks_store_names_and_rechecks_identity(client, stor
     with pytest.raises(OSError):
         await sweep_once(storage)
     assert set(storage.root.iterdir()) == {unrelated, unrelated_temp, old}
+
+
+async def test_delayed_off_cleanup_only_removes_its_committed_files(client, storage, monkeypatch):
+    collected, token, value, key, host = await setup_request()
+    assert (await post(client, collected, token)).status_code == 204
+    queued = await seed_request(host)
+    owner = value["account_id"]
+    off = sign({**value, "enabled": False}, key)
+    entered, release = asyncio.Event(), asyncio.Event()
+    removed = []
+
+    async def hold_cleanup(store, ids):
+        removed.extend(ids)
+        entered.set()
+        await release.wait()
+        await remove_files(store, ids)
+
+    monkeypatch.setattr(support_log_retention, "remove_files", hold_cleanup)
+    task = asyncio.create_task(store_statement(owner, off, store=storage))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        assert await get_statement(owner) == off
+        assert (await get_collection(queued)).state == "cancelled"
+        assert (await get_collection(collected)).state == "deleted"
+        assert storage.path(collected).exists()
+        await store_statement(owner, sign({**value, "issued_at_ms": 1001}, key))
+        new = await seed_request(host)
+        assert await mark_dispatched(new)
+        assert (await post(client, new, token)).status_code == 204
+        pending = await seed_request(host)
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 30)
+    assert removed == [collected] and not storage.path(collected).exists()
+    assert storage.path(new).read_bytes() == BODY and (await get_collection(new)).state == "collected"
+    assert (await get_collection(pending)).state == "requested"
+
+
+async def test_off_and_record_changes_roll_back_together(client, storage):
+    from sqlalchemy import event
+
+    from spawn_server.db import get_engine
+
+    collected, token, value, key, host = await setup_request()
+    assert (await post(client, collected, token)).status_code == 204
+    pending = await seed_request(host)
+    off = sign({**value, "enabled": False}, key)
+
+    def reject_delete(_conn, _cursor, sql, *_):
+        if sql.startswith("UPDATE support_log_collections") and "deleted_at=" in sql:
+            raise RuntimeError("injected")
+
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", reject_delete)
+    try:
+        with pytest.raises(RuntimeError, match="injected"):
+            await store_statement(value["account_id"], off, store=storage)
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_delete)
+    assert await get_statement(value["account_id"]) == value
+    assert (await get_collection(pending)).state == "requested"
+    assert (await get_collection(collected)).state == "collected" and storage.path(collected).exists()

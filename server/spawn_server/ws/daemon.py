@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,15 +29,6 @@ from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Ses
 from ..pin_liveness import live_browser_device_id_set
 from ..push import send_alert_push
 from ..redis import get_backend, session_event_channel, user_alert_channel
-from ..support_consent import delivery_snapshot
-from ..support_delivery import (
-    DAEMON_LIMIT,
-    SUPPORT_LIMIT,
-    delivery_order,
-    enabled_timestamp,
-    send_statement,
-    wire_size,
-)
 from ..trust_events import pin_undelivered_payload, publish_trust_event
 from .alerts import (
     ALERT_QUIET_SECONDS,
@@ -97,7 +88,6 @@ router = APIRouter()
 log = logging.getLogger("spawn.ws.daemon")
 HOST_ACTIVATION_DEADLINE_SECONDS = 30
 HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS = 2.0
-SUPPORT_READ_SECONDS = 4
 HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS = 10.0
 DAEMON_WS_PROTOCOL = "spawn.control.v3"
 DURABLE_OWNERSHIP_CACHE_SECONDS = 10.0
@@ -331,7 +321,7 @@ async def _prepare_host_activation(
         "worker_mismatch": registration.get("worker_mismatch") is True,
     }
     if "supports_support_log" in registration:
-        values["support_log_capable"] = registration["supports_support_log"] is True
+        values["support_log_capable"] = registration["supports_support_log"]
     if current.daemon_connection_id is not None and current.daemon_connection_id != connection_id:
         values["last_disconnect_at"] = _utcnow()
         values["last_disconnect_reason"] = "superseded"
@@ -1338,41 +1328,6 @@ async def _revoked_browser_keys(account_id: str) -> list[str]:
 
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
     await asyncio.wait_for(target.send_text(payload), timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS)
-
-
-async def _support_registration_snapshot(turn, conn):
-    if turn is not None:
-        try:
-            async with asyncio.timeout(SUPPORT_READ_SECONDS), get_sessionmaker()() as session:
-                return await delivery_snapshot(session, conn.user_id)
-        except Exception:
-            pass
-    log.warning("SPAWN D could not read support log consent during registration")
-    return None
-
-
-async def _send_registration(conn, payload, turn, snapshot):
-    if snapshot is None or not turn.valid:
-        await _bounded_send_text(conn, payload)
-        return
-    statement, _ = snapshot
-    combined = {**payload, "support_log_consent": statement}
-    if wire_size(combined) <= SUPPORT_LIMIT:
-        if await turn.send(conn, combined):
-            if turn.valid:
-                conn.support_enabled_sent_ms = enabled_timestamp(statement)
-                conn.support_delivery_ready = True
-            return
-        # A timed-out withdrawal interrupted this extension before delivery.
-        await _bounded_send_text(conn, payload)
-        return
-    ordinary_size = wire_size(payload)
-    await _bounded_send_text(conn, payload)
-    if ordinary_size > DAEMON_LIMIT:
-        # The released parser denies even an absent extension on this frame.
-        log.warning("SPAWN D ordinary registration exceeds the daemon support log limit")
-        return
-    await send_statement(turn, conn, statement)
 
 
 async def _route_rtc_payload_if_owner(
@@ -2484,10 +2439,8 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "account_id": host.owner_user_id,
                             "browser_device_ids": await _live_browser_device_ids(host.id),
                             "browser_pins": await _live_browser_pins(host.id),
+                            "revoked_browser_keys": await _revoked_browser_keys(host.owner_user_id),
                         }
-                        registered_payload["revoked_browser_keys"] = await _revoked_browser_keys(
-                            host.owner_user_id
-                        )
                         if _daemon_token_needs_rotation(daemon_token_payload):
                             registered_payload["access_token"] = auth_mod.issue_daemon_token(
                                 host.id, host.owner_user_id
@@ -2496,27 +2449,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # host was away: decided afresh now that it is
                         # routable, and before `registered` ends the
                         # registration; sent after it (see the function).
-                        order = (
-                            delivery_order(conn.user_id).enter()
-                            if conn.supports_support_log
-                            else nullcontext()
-                        )
-                        async with AsyncExitStack() as workers:
-                            async with order as turn:
-                                snapshot = (
-                                    await _support_registration_snapshot(turn, conn)
-                                    if conn.supports_support_log
-                                    else None
-                                )
-                                left_running = await workers.enter_async_context(
-                                    _decide_workers_to_stop(
-                                        conn, host, reported_existing, known_existing
-                                    )
-                                )
-                                await _send_registration(conn, registered_payload, turn, snapshot)
-                                registered = True
-                                if snapshot and snapshot[1] and conn.support_delivery_ready:
-                                    pump.wake.set()
+                        async with _decide_workers_to_stop(
+                            conn, host, reported_existing, known_existing
+                        ) as left_running:
+                            await _bounded_send_text(conn, registered_payload)
+                            registered = True
                             await _stop_workers_left_running(conn, host, left_running)
                         await publish_data_changed(host.owner_user_id, "hosts", host.id)
                         conn.durable_owner_valid_until = (
@@ -2525,6 +2462,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if conn.keeps_peers_across_reconnect:
                             await _reconcile_live_bindings(conn, live_bindings)
                         await _auto_update_after_registration(conn)
+                        if conn.supports_support_log:
+                            conn.support_registration_complete = True
+                            pump.wake.set()
                     if not registration_accepted:
                         async with _bounded_host_ownership_session() as session:
                             await _mark_host_offline_if_owner(session, host.id, conn.id, generation)

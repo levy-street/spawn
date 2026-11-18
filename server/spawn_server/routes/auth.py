@@ -236,12 +236,16 @@ async def delete_account(
         .all()
     )
     from ..support_log_files import get_store
-    from ..support_log_retention import account_deletion_files
+    from ..support_log_retention import account_file_ids, remove_files
 
-    async with account_deletion_files(session, user.id, get_store(request.app)):
-        await session.execute(delete(HostKeyClaim).where(HostKeyClaim.owner_user_id == user.id))
-        await session.execute(delete(User).where(User.id == user.id))
-        await session.commit()
+    owner = user.id
+    store = get_store(request.app)
+    file_ids = await account_file_ids(session, owner) if store is not None else ()
+    await session.execute(delete(HostKeyClaim).where(HostKeyClaim.owner_user_id == owner))
+    await session.execute(delete(User).where(User.id == owner))
+    await session.commit()
+    if file_ids:
+        await remove_files(store, file_ids)
 
     for host_id in host_ids:
         try:

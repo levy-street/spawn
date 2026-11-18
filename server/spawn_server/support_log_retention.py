@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
@@ -12,13 +12,13 @@ from sqlalchemy import delete, select, update
 from .db import get_sessionmaker
 from .models import SupportLogCollection as Collection
 from .models import _utcnow
-from .support_delivery import delivery_order
 from .support_log import transition
 from .support_log_files import finish_job
 
 log = logging.getLogger("spawn.support_log")
 BATCH = 100
 INTERVAL_SECONDS = 15 * 60
+CLEANUP_SECONDS = 2
 
 
 async def delete_collected(store, record_id: str, *, now: datetime | None = None):
@@ -112,77 +112,32 @@ async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
             await asyncio.to_thread(store.unlink, name)
 
 
-async def sharing_turned_off(user_id: str, store):
-    """Called after storing the signed off statement; never substitutes a null row."""
-    if store is None:
-        return
-    async with get_sessionmaker()() as session:
-        await session.execute(
-            update(Collection)
-            .where(
+async def remove_files(store, ids):
+    # Try the lock once. A slow filesystem cannot delay the caller past
+    # the deadline. The worker owns its locked descriptor until it finishes.
+    try:
+        deadline = time.monotonic() + CLEANUP_SECONDS
+        async with asyncio.timeout(CLEANUP_SECONDS):
+            await asyncio.to_thread(store.remove_committed, ids, deadline)
+    except Exception:
+        log.error("SPAWN D support log file cleanup failed; sweep will retry")
+
+
+async def account_file_ids(session, user_id: str):
+    try:
+        ids = await session.scalars(
+            select(Collection.id).where(
                 Collection.owner_user_id == user_id,
-                Collection.state.in_(["requested", "dispatched"]),
+                Collection.state.in_(("collected", "deleted", "dispatched")),
             )
-            .values(state="cancelled", completed_at=_utcnow())
         )
-        await session.commit()
-    async with store.locked():
-        while True:
-            async with get_sessionmaker()() as session:
-                ids = (
-                    await session.scalars(
-                        select(Collection.id)
-                        .where(
-                            Collection.owner_user_id == user_id,
-                            Collection.state == "collected",
-                        )
-                        .order_by(Collection.id)
-                        .limit(BATCH)
-                    )
-                ).all()
-            if not ids:
-                break
-            for record_id in ids:
-                await delete_collected(store, record_id)
-
-
-async def account_file_ids(session, user_id: str, store) -> list[str]:
-    # No extra query, path access or transaction when the feature is off.
-    if store is None:
+        return ids.all()
+    except Exception:
+        # A failed SELECT can abort the transaction on PostgreSQL. The route
+        # has only read authorization and host IDs so far.
+        await session.rollback()
+        log.error("SPAWN D support log file lookup failed; sweep will retry")
         return []
-    return list(
-        (
-            await session.scalars(
-                select(Collection.id).where(
-                    Collection.owner_user_id == user_id,
-                )
-            )
-        ).all()
-    )
-
-
-@asynccontextmanager
-async def account_deletion_files(session, user_id: str, store):
-    """Fence publication from the file-id snapshot through the account commit.
-
-    With storage off this is a no-op, including the caller's transaction. With
-    storage on, finish its read-only authorization transaction before file I/O.
-    The caller deletes the account and commits inside this context.
-    """
-    if store is None:
-        yield
-        return
-    await session.commit()
-    async with delivery_order(user_id).enter(reducing=True), store.locked():
-        ids = await account_file_ids(session, user_id, store)
-        yield
-        for record_id in ids:
-            try:
-                await asyncio.to_thread(store.remove, record_id)
-            except OSError:
-                # The account commit has succeeded. Preserve socket/cookie cleanup;
-                # the orphan sweep will retry the remaining file after its grace.
-                log.error("SPAWN D support log account file cleanup failed; sweep will retry")
 
 
 async def run_sweeps(store, stop: asyncio.Event):

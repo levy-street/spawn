@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import delete, event, update
@@ -12,9 +13,8 @@ from spawn_server.config import get_settings
 from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogConsent
 from spawn_server.support_consent import store_statement
-from spawn_server.support_delivery import deliver_statement
-from spawn_server.support_log_dispatch import SupportLogPump
-from spawn_server.ws.broker import get_broker
+from spawn_server.support_log_dispatch import SUPPORT_LIMIT, SupportLogPump
+from spawn_server.ws.broker import SUPPORT_UNSENT, daemon_wire, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from tests.test_support_consent import VECTORS, seed_statement, sign
 from tests.test_ws_daemon import FakeDaemonWebSocket, _create_host
@@ -96,18 +96,15 @@ async def test_capability_is_literal_and_replaces_last_registration(app, pump, f
     async with connected(app, owner, host, **registration) as (_, frames, conn):
         frame = frames.get_nowait()
         assert conn.supports_support_log is (flag is True)
-        if flag is True:
-            assert frame["support_log_consent"] == value
-        else:
-            assert "support_log_consent" not in frame
+        assert "support_log_consent" not in frame
         async with get_sessionmaker()() as db:
             assert (await db.get(Host, host)).support_log_capable is (flag is True)
-        assert not pump.wake.is_set()
+        assert pump.wake.is_set() == (flag is True)
         assert frames.empty()
 
 
 @pytest.mark.parametrize("case", ["absent", "carried", "off", "removed_on", "removed_off"])
-async def test_registered_contains_effective_stored_statement(app, pump, case):
+async def test_pump_sends_effective_stored_statement(app, pump, case):
     value, key = await seed_statement(enabled=case not in {"off", "removed_off"})
     owner = value["account_id"]
     host = await _create_host(owner, name="")
@@ -123,66 +120,51 @@ async def test_registered_contains_effective_stored_statement(app, pump, case):
         if case != "removed_off":
             expected = None
     async with connected(app, owner, host, supports_support_log=True) as (_, frames, conn):
-        assert frames.get_nowait()["support_log_consent"] == expected
-        assert conn.support_delivery_ready and frames.empty()
+        assert frames.get_nowait()["type"] == "registered" and frames.empty()
+        await pump.run_once()
+        assert frames.get_nowait() == {"type": "host.support_log_consent", "consent": expected}
+        assert conn.support_statement_sent == expected
+        await pump.run_once()
+        assert frames.empty()
 
 
-async def test_enabled_sql_adds_one_read_only_for_capable(app, pump):
-    _, _, _, capable = await registration_trace(app)
-    assert len(capable) == 12
-    consent = [sql for sql in capable if "support_log_consents" in sql]
-    assert len(consent) == 1 and "support_log_collections" in consent[0]
-    assert sum("support_log_capable=" in sql for sql in capable) == 1
-    _, _, _, incapable = await registration_trace(app, flag=False)
-    assert len(incapable) == 11
-    assert not any("support_log_consents" in sql for sql in incapable)
+@pytest.mark.parametrize("flag", [True, False])
+async def test_registration_only_extends_existing_write(app, pump, flag):
+    _, _, _, sql = await registration_trace(app, flag=flag)
+    assert len(sql) == 11
+    assert sum("support_log_capable=" in stmt for stmt in sql) == 1
+    assert not any(
+        "support_log_consents" in stmt or "support_log_collections" in stmt for stmt in sql
+    )
 
 
-async def test_change_push_is_account_scoped_and_includes_removed_and_off(app, pump):
-    owner_statement, key = await seed_statement()
-    other_statement, _ = await seed_statement()
-    owner = owner_statement["account_id"]
-    other = other_statement["account_id"]
-    # A changed account without sockets performs no DB read.
-    with no_statements():
-        await deliver_statement(None, owner, None)
-    async with AsyncExitStack() as stack:
-        queues = []
-        for account, capable in [(owner, True), (owner, True), (owner, False), (other, True)]:
-            host = await _create_host(account, name="")
-            _, frames, _ = await stack.enter_async_context(
-                connected(app, account, host, supports_support_log=capable)
-            )
-            assert frames.get_nowait()["type"] == "registered"
-            queues.append(frames)
-        newer = sign({**owner_statement, "issued_at_ms": 1001}, key)
-        off = sign({**newer, "enabled": False}, key)
-        for artifact in [newer, off]:
-            await store_statement(owner, artifact)
-            for frames in queues[:2]:
-                assert frames.get_nowait() == {
-                    "type": "host.support_log_consent",
-                    "consent": artifact,
-                }
-            assert all(frames.empty() for frames in queues)
+@pytest.mark.parametrize("flag", [True, False, None])
+async def test_enabled_registration_matches_disabled_bytes(app, monkeypatch, flag):
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await _create_host(owner, name="")
+    register = {} if flag is None else {"supports_support_log": flag}
+    async with connected(app, owner, host, **register) as (ws, _, _):
+        disabled = ws.sent_text.copy()
+    monkeypatch.setattr(app.state, "support_log_pump", SupportLogPump(), raising=False)
+    async with connected(app, owner, host, **register) as (ws, _, _):
+        assert ws.sent_text == disabled
 
 
 @contextmanager
 def no_statements():
-    def unexpected(*args):
-        pytest.fail("Unexpected database statement")
+    sql = []
+
+    def capture(_conn, _cursor, statement, *_):
+        sql.append(statement)
 
     engine = get_engine().sync_engine
-    event.listen(engine, "before_cursor_execute", unexpected)
+    event.listen(engine, "before_cursor_execute", capture)
     try:
         yield
     finally:
-        event.remove(engine, "before_cursor_execute", unexpected)
-
-
-async def test_storage_off_change_is_inert(app):
-    with no_statements():
-        await deliver_statement(None, "", None)
+        event.remove(engine, "before_cursor_execute", capture)
+    assert not sql
 
 
 async def test_storage_off_ignores_last_capability_and_literal_null_clears_it(app, monkeypatch):
@@ -205,115 +187,82 @@ async def test_storage_off_ignores_last_capability_and_literal_null_clears_it(ap
         assert not (await db.get(Host, host)).support_log_capable
 
 
-@pytest.mark.parametrize("failure", ["sql", "decode", "read_timeout", "order_timeout"])
-async def test_support_failure_keeps_ordinary_socket(app, pump, monkeypatch, caplog, failure):
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from spawn_server import support_delivery
-    from spawn_server.ws import daemon
-
-    value, _ = await seed_statement()
-    owner = value["account_id"]
-    host = await _create_host(owner, name="")
-    stalled = asyncio.Event()
-
-    async def read(*args, **kwargs):
-        assert not get_broker().get_daemon_for_host(host).lifecycle_lock.locked()
-        if failure == "read_timeout":
-            await stalled.wait()
-        raise SQLAlchemyError() if failure == "sql" else ValueError()
-
-    monkeypatch.setattr(daemon, "delivery_snapshot", read)
-    if failure == "read_timeout":
-        monkeypatch.setattr(daemon, "SUPPORT_READ_SECONDS", 0)
-    held = AsyncExitStack()
-    if failure == "order_timeout":
-        await held.enter_async_context(support_delivery.delivery_order(owner).enter())
-        monkeypatch.setattr(support_delivery, "ORDER_SECONDS", 0)
-    try:
-        async with connected(
-            app, owner, host, supports_support_log=True, existing_sessions=[host]
-        ) as (ws, frames, conn):
-            registration = frames.get_nowait()
-            assert (
-                registration["type"] == "registered" and "support_log_consent" not in registration
-            )
-            assert not conn.support_delivery_ready
-            ws.queue_text({"type": "host.heartbeat"})
-            assert await asyncio.wait_for(frames.get(), 30) == {"type": "host.heartbeat"}
-            assert caplog.text.count("could not read support log consent") == 1
-    finally:
-        await held.aclose()
-
-
-@pytest.mark.parametrize("delta", [0, 1])
-async def test_combined_registration_size_in_wire_bytes(app, pump, monkeypatch, delta):
-    from unittest.mock import AsyncMock
-
-    from spawn_server.support_delivery import SUPPORT_LIMIT
-    from spawn_server.ws.broker import daemon_wire
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+async def test_registered_wire_size_gates_only_support(app, pump, monkeypatch, caplog, delta):
     from tests.test_support_log_dispatch import request
 
     value, _ = await seed_statement()
     owner = value["account_id"]
     host = await _create_host(owner, name="")
     roster = ["\u00e9"]
-    combined = dict(
+    ordinary = dict(
         type="registered",
         host_id=host,
         account_id=owner,
         browser_device_ids=roster,
         browser_pins=[],
         revoked_browser_keys=[],
-        support_log_consent=value,
     )
-    roster[0] += "a" * (SUPPORT_LIMIT + delta - len(daemon_wire(combined).encode()))
+    roster[0] += "a" * (SUPPORT_LIMIT + delta - len(daemon_wire(ordinary).encode()))
     monkeypatch.setattr(
         "spawn_server.ws.daemon._live_browser_device_ids", AsyncMock(return_value=roster)
     )
     async with connected(app, owner, host, supports_support_log=True) as (ws, frames, conn):
-        ordinary = frames.get_nowait()
-        assert ordinary["browser_device_ids"] == roster
-        if delta:
-            assert "support_log_consent" not in ordinary
-            assert frames.get_nowait() == {"type": "host.support_log_consent", "consent": value}
-        else:
-            assert len(ws.sent_text[0].encode()) == SUPPORT_LIMIT
-            assert ordinary["support_log_consent"] == value
-        assert conn.support_delivery_ready
+        assert frames.get_nowait() == ordinary
+        assert (
+            conn.support_registered_bytes == len(ws.sent_text[0].encode()) == SUPPORT_LIMIT + delta
+        )
         queued = await request(owner, host)
         await pump.run_once()
-        assert frames.get_nowait()["request_id"] == queued and frames.empty()
+        await pump.run_once()
+        if delta > 0:
+            assert frames.empty()
+            assert caplog.text.count("size prevents support sharing") == 1
+        else:
+            assert frames.get_nowait() == {"type": "host.support_log_consent", "consent": value}
+            assert frames.get_nowait()["request_id"] == queued
+            assert frames.empty()
 
 
-@pytest.mark.parametrize("ordinary_too_big", [False, True])
-async def test_registration_with_unusable_wire_size_keeps_trust(
-    app, pump, monkeypatch, caplog, ordinary_too_big
-):
-    from unittest.mock import AsyncMock
-
-    from spawn_server.support_delivery import DAEMON_LIMIT, SUPPORT_LIMIT
-    from spawn_server.ws.broker import daemon_wire
+async def test_oversized_statement_withheld_until_it_fits(app, pump, monkeypatch):
+    from tests.test_support_log_dispatch import request
 
     value, _ = await seed_statement()
     owner = value["account_id"]
     host = await _create_host(owner, name="")
-    roster = ["a" * DAEMON_LIMIT] if ordinary_too_big else ["a"]
-    monkeypatch.setattr(
-        "spawn_server.ws.daemon._live_browser_device_ids", AsyncMock(return_value=roster)
-    )
-    if not ordinary_too_big:
-        separate = {"type": "host.support_log_consent", "consent": value}
-        value["carried_endorsements"] = [""]
-        value["carried_endorsements"][0] = "a" * (
-            SUPPORT_LIMIT + 1 - len(daemon_wire(separate).encode())
-        )
-        monkeypatch.setattr(
-            "spawn_server.ws.daemon.delivery_snapshot", AsyncMock(return_value=(value, True))
-        )
     async with connected(app, owner, host, supports_support_log=True) as (_, frames, conn):
-        ordinary = frames.get_nowait()
-        assert ordinary["browser_device_ids"] == roster and "support_log_consent" not in ordinary
-        assert not conn.support_delivery_ready and frames.empty()
-        assert not pump.wake.is_set()
-        assert sum("support log" in r.getMessage() for r in caplog.records) == 1
+        frames.get_nowait()
+        queued = await request(owner, host)
+        with monkeypatch.context() as m:
+            oversized = {**value, "carried_endorsements": ["a" * SUPPORT_LIMIT]}
+            m.setattr(
+                "spawn_server.support_log_dispatch.effective_statement",
+                AsyncMock(return_value=oversized),
+            )
+            await pump.run_once()
+            assert conn.support_statement_sent is SUPPORT_UNSENT and frames.empty()
+        await pump.run_once()
+        assert frames.get_nowait()["consent"] == value
+        assert frames.get_nowait()["request_id"] == queued
+
+
+async def test_size_bookkeeping_failure_does_not_interrupt_registration(app, pump, monkeypatch):
+    from spawn_server.ws.broker import DaemonConn
+
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await _create_host(owner, name="")
+    assign = DaemonConn.__setattr__
+
+    def fail_size(self, name, value):
+        if name == "support_registered_bytes" and value is not None:
+            raise RuntimeError
+        assign(self, name, value)
+
+    monkeypatch.setattr(DaemonConn, "__setattr__", fail_size)
+    async with connected(app, owner, host, supports_support_log=True) as (ws, frames, conn):
+        assert frames.get_nowait()["type"] == "registered" and conn.support_registered_bytes is None
+        await pump.run_once()
+        ws.queue_text({"type": "host.heartbeat"})
+        assert await asyncio.wait_for(frames.get(), 30) == {"type": "host.heartbeat"}
+        assert frames.empty()

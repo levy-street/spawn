@@ -210,10 +210,24 @@ and will be shown to the owner in collection history. The host decides whether
 it can send a bundle. Storage requires a usable private directory outside the
 checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
 
-The server sends the account's current statement to each capable host at
-registration and sends changes on its control connection. For a statement or
-a turn-off, the server can report only that it was sent. The host sends no
-receipt for applying it. A host can have one open request, with at least five
+The server's background pump alone sends statements and collection requests.
+Registration sends the ordinary trust data. The pump then sends the current
+signed statement or null in a separate `host.support_log_consent` frame before
+any collect. A capable host normally learns the current choice within about ten
+seconds of a change and can skip intermediate choices. The daemon accepts this
+separate frame. The wire document describes delivery inside `registered` and
+should be aligned when the daemon next changes. There is no receipt confirming
+that the host applied the change.
+
+If ordinary registration exceeds 65,536 UTF-8 bytes, the released daemon
+denies sharing until its process restarts and tries once to erase its saved
+statement. The server keeps all trust data and allows a 1,024-byte margin.
+Above 64,512 bytes it logs once and sends neither a statement nor a collect for
+that connection. Lifting the daemon limit requires a daemon change. The
+operator command cannot see that connection's size, so a request can wait and
+expire. An oversized statement also waits until the current one fits.
+
+A host can have one open request, with at least five
 minutes between dispatches. An account has a limit of ten requests in any 24
 hours, and at most ten can be dispatched in that period. Across the server at
 most two collections occupy dispatch slots. An upload body still being read
@@ -227,11 +241,13 @@ whole bundle as the machine reported it. The server checks its form and
 cannot guarantee what the events contain. Before display, the command
 verifies its size, SHA-256 and JSON object framing. Default `show` prints one
 object per line with terminal controls escaped. `show --raw` writes the stored
-bytes unchanged to a pipe or file. Metadata commands omit tokens, keys and
+bytes unchanged and refuses a terminal. Metadata commands omit tokens, keys and
 signatures. An account-scoped lookup exposes no other account's data.
 Bundles expire after seven days and a bounded sweep runs at startup and every
-15 minutes, so deletion can follow the expiry time. Turning sharing off deletes
-collected files and cancels open requests; deleting an account deletes its files.
+15 minutes, so deletion can follow the expiry time. A signed withdrawal cancels open requests and marks the existing collected
+bundles for deletion in the same commit. Their files are removed afterwards.
+Account deletion commits first, then immediately tries to remove its bundles.
+A busy or unusable store leaves files for the orphan sweep.
 The database retains the current signed statement and collection metadata
 (reason, requester, host snapshot, outcome, times, sizes and digest). Collection
 records are swept after 365 days; statements have no expiry. A missing file is
@@ -247,6 +263,12 @@ The server cannot turn sharing on. It checks statements to keep malformed data
 out of storage, but the daemon independently decides whether the owner's
 statement and signer are valid. Removing the signing device makes server-side
 sharing checks false immediately, without erasing or rewriting the signed row.
+A collect already claimed can still be sent just after the removal commits.
+The daemon learns of the removal through its ordinary trust update. At the
+start of a request it checks its own stored on statement and that it still
+admits the signer. One bundle of up to 900 KiB can already be in flight when
+sharing is turned off. The upload route refuses it if sharing is off at arrival
+and checks sharing again before retaining it.
 Durable withdrawal remains a signed off statement, not a missing row or null.
 
 The support log is a separate, bounded local record. It holds event times,
@@ -336,7 +358,7 @@ comparison of the carried approvals: a refreshed approval path is persisted.
 Successful persistence survives restart; terminal process denial and the admission
 bucket do not. Removing the statement also removes its timestamp/revocation floor;
 failed removal can leave an old on. An honest server must redeliver current consent
-in `registered` before collection. A dishonest server can withhold withdrawal or
+after registration and before collection. A dishonest server can withhold withdrawal or
 replay an old valid on after state loss. There is no host acknowledgement that it
 applied a turn-off; apps must not claim one. Capability, silence and collection
 receipts do not provide that confirmation.

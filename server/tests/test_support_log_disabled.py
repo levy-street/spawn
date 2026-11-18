@@ -1,8 +1,10 @@
 """Wire and SQLite driver transcript recorded with origin/master at 238184b5."""
 
+import json
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from email.utils import formatdate
 from itertools import count, groupby
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -14,7 +16,15 @@ from sqlalchemy import event
 from spawn_server import auth, main
 from spawn_server.config import get_settings
 from spawn_server.db import configure_sqlite_connections, get_engine, get_sessionmaker
-from spawn_server.models import AuthIdentity, HostBrowserPin, RevokedBrowserKey, User, _utcnow
+from spawn_server.models import (
+    AuthIdentity,
+    BrowserDevice,
+    HostBrowserPin,
+    RevokedBrowserKey,
+    User,
+    _utcnow,
+)
+from spawn_server.routes import browser_devices
 from spawn_server.ws import daemon
 from tests.test_support_consent import seed_statement
 from tests.test_ws_daemon import FakeDaemonWebSocket, _create_host, _create_session_row
@@ -48,6 +58,7 @@ async def lifecycle_trace(app, client, monkeypatch):
     revoked = uuid.uuid4().hex + uuid.uuid4().hex[:11]
     async with get_sessionmaker()() as db:
         user = await db.get(User, owner)
+        (await db.get(BrowserDevice, device)).created_at = datetime(2000, 1, 1, tzinfo=UTC)
         db.add_all(
             [
                 AuthIdentity(
@@ -159,6 +170,26 @@ async def lifecycle_trace(app, client, monkeypatch):
         assert rotated in ws.sent_text[0] and key in ws.sent_text[0] and revoked in ws.sent_text[0]
         assert ws.sent_text[-1] == '{"type": "host.heartbeat"}'
         headers = {"authorization": f"Bearer {auth.issue_access_token(owner)}"}
+        # Pin only the removal and cookie clocks to compare the actual HTTP
+        # payloads and every Set-Cookie attribute with the master capture.
+        revoked_at = _utcnow()
+
+        class RemovalClock(datetime):
+            @classmethod
+            def now(cls, tz):
+                return revoked_at
+
+        monkeypatch.setattr(browser_devices, "datetime", RemovalClock)
+        replacements[revoked_at.replace(tzinfo=None).isoformat(timespec="microseconds")] = (
+            "<revoked-at>"
+        )
+        monkeypatch.setattr("http.cookies._getdate", lambda offset: formatdate(offset, usegmt=True))
+
+        def http_result(response):
+            return json.dumps(
+                [response.status_code, response.text, response.headers.get_list("set-cookie")]
+            )
+
         events.append("[remove device]")
         response = await client.post(
             f"/api/browser-devices/{device}/revoke",
@@ -166,11 +197,13 @@ async def lifecycle_trace(app, client, monkeypatch):
             json={"expected_public_key": key},
         )
         assert response.status_code == 200
+        events.append(http_result(response))
         events.append("[delete account]")
         response = await client.post(
             "/api/account/delete", headers=headers, json={"confirm_email": user.email}
         )
         assert response.status_code == 204
+        events.append(http_result(response))
     finally:
         event.remove(engine.sync_engine, "connect", observe)
 

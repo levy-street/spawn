@@ -211,6 +211,15 @@ async def transition(
     return changed is not None
 
 
+async def cancel_open(session, owner, now):
+    row = SupportLogCollection
+    await session.execute(
+        update(row)
+        .where(row.owner_user_id == owner, row.state.in_(OPEN_STATES), ~sharing_on(owner))
+        .values(state="cancelled", completed_at=now)
+    )
+
+
 async def mark_dispatched(
     record_id: str,
     *,

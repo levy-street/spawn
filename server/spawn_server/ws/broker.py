@@ -49,6 +49,9 @@ async def _send_or_disconnect(websocket: WebSocket, text: str) -> None:
 log = logging.getLogger(__name__)
 
 
+SUPPORT_UNSENT = object()
+
+
 def daemon_wire(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
 
@@ -77,14 +80,23 @@ class DaemonConn:
     session_ice_policy: bool = False
     supports_device_connections: bool = False
     supports_support_log: bool = False
-    support_delivery_ready: bool = False
-    # Only an enabled statement can authorize dispatch. Off wins timestamp ties.
-    support_enabled_sent_ms: int | None = None
+    support_registration_complete: bool = False
+    support_registered_bytes: int | None = None
+    support_size_warned: bool = False
+    support_statement_sent: object = SUPPORT_UNSENT
     durable_owner_valid_until: float = 0.0
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await _send_or_disconnect(self.websocket, daemon_wire(payload))
+            wire = daemon_wire(payload)
+            await _send_or_disconnect(self.websocket, wire)
+            if self.supports_support_log and payload.get("type") == "registered":
+                try:
+                    # Ordinary registration always uses ensure_ascii, so each
+                    # character is one wire byte. Reuse the exact text sent.
+                    self.support_registered_bytes = len(wire)
+                except Exception:
+                    pass
 
 
 @dataclass(eq=False)
@@ -548,10 +560,10 @@ class Broker:
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
 
-    def support_daemons_for_account(self, user_id: str) -> list[DaemonConn]:
+    def support_daemons(self) -> list[DaemonConn]:
         return [
             conn for conn in self._daemons_by_host.values()
-            if conn.user_id == user_id and conn.supports_support_log
+            if conn.support_registration_complete
         ]
 
     def get_daemon_for_session(self, session_id: str) -> DaemonConn | None:

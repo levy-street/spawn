@@ -393,13 +393,14 @@ async def test_sharing_off_at_arrival_does_not_read(app, storage, off):
 @pytest.mark.parametrize("boundary", ["rename", "commit", "lost_race", "withdrawn"])
 async def test_atomic_publication_failure(client, storage, monkeypatch, boundary):
     record_id, token, statement, key, _host = await setup_request()
+    observations = []
     if boundary == "rename":
 
         def fail_rename(source, destination, *, src_dir_fd, dst_dir_fd):
-            assert src_dir_fd == dst_dir_fd == storage.fd
-            assert source != destination and destination == storage.path(record_id).name
-            assert not storage.path(record_id).exists()
-            assert stat.S_IMODE((storage.root / source).stat().st_mode) == 0o600
+            observations.append((
+                src_dir_fd, dst_dir_fd, source != destination, destination,
+                storage.path(record_id).exists(), stat.S_IMODE((storage.root / source).stat().st_mode),
+            ))
             raise OSError("injected")
 
         monkeypatch.setattr("spawn_server.support_log_files.os.replace", fail_rename)
@@ -408,7 +409,7 @@ async def test_atomic_publication_failure(client, storage, monkeypatch, boundary
 
         async def fail_transition(record_id, current, target, **kwargs):
             if target == "collected":
-                assert storage.path(record_id).read_bytes() == BODY
+                observations.append(storage.path(record_id).read_bytes())
                 if boundary == "commit":
                     raise RuntimeError("injected")
                 if boundary == "withdrawn":
@@ -421,6 +422,10 @@ async def test_atomic_publication_failure(client, storage, monkeypatch, boundary
 
         monkeypatch.setattr(route, "transition", fail_transition)
     response = await post(client, record_id, token)
+    if boundary == "rename":
+        assert observations == [(storage.fd, storage.fd, True, storage.path(record_id).name, False, 0o600)]
+    else:
+        assert observations == [BODY]
     assert response.status_code == (409 if boundary in {"lost_race", "withdrawn"} else 500)
     assert (await get_collection(record_id)).state == (
         "cancelled" if boundary == "withdrawn" else "failed"
@@ -508,7 +513,6 @@ async def test_cancel_after_rename_finishes_commit(client, storage, monkeypatch)
 
     async def held_transition(record_id, current, target, **metadata):
         if target == "collected":
-            assert storage.path(record_id).exists()
             entered.set()
             await asyncio.wait_for(proceed.wait(), 30)
         return await real_transition(record_id, current, target, **metadata)
@@ -516,6 +520,7 @@ async def test_cancel_after_rename_finishes_commit(client, storage, monkeypatch)
     monkeypatch.setattr(route, "transition", held_transition)
     task = asyncio.create_task(post(client, record_id, token))
     await asyncio.wait_for(entered.wait(), 30)
+    assert storage.path(record_id).exists()
     task.cancel()
     proceed.set()
     with pytest.raises(asyncio.CancelledError):
@@ -648,8 +653,10 @@ async def test_total_receive_deadline_fails_and_releases(app, storage, monkeypat
     deadlines = []
     timeout = asyncio.timeout
 
+    delays = []
+
     def capture_timeout(delay):
-        assert delay == 60
+        delays.append(delay)
         deadline = timeout(None)
         deadlines.append(deadline)
         return deadline
@@ -676,6 +683,7 @@ async def test_total_receive_deadline_fails_and_releases(app, storage, monkeypat
         )
     )
     await asyncio.wait_for(entered.wait(), 30)
+    assert delays == [60]
     assert len(deadlines) == 1  # One total deadline, not a fresh budget per chunk.
     deadlines[0].reschedule(asyncio.get_running_loop().time())
     status, _, reads = await asyncio.wait_for(task, 30)
@@ -714,7 +722,6 @@ async def test_sweep_waits_for_publication_between_rename_and_commit(
 
     async def held_transition(record_id, current, target, **metadata):
         if target == "collected":
-            assert storage.path(record_id).read_bytes() == BODY
             renamed.set()
             await asyncio.wait_for(proceed.wait(), 30)
         return await original_transition(record_id, current, target, **metadata)
@@ -761,7 +768,6 @@ async def test_signer_removed_during_upload_cannot_publish(
 
     async def held_transition(record_id, current, target, **metadata):
         if target == "collected":
-            assert storage.path(record_id).exists()
             entered.set()
             await asyncio.wait_for(proceed.wait(), 30)
         return await original_transition(record_id, current, target, **metadata)
@@ -772,6 +778,8 @@ async def test_signer_removed_during_upload_cannot_publish(
     try:
         await asyncio.wait_for(entered.wait(), 30)
         assert (await get_collection(record_id)).state == "dispatched"
+        if boundary == "commit":
+            assert storage.path(record_id).exists()
         async with get_sessionmaker()() as session:
             await session.execute(
                 delete(BrowserDevice).where(BrowserDevice.id == statement["signer_device_id"])
@@ -799,7 +807,6 @@ async def test_refusal_wins_against_publication_in_another_worker(
 
     async def held_transition(record_id, current, target, **metadata):
         if target == "collected":
-            assert storage.path(record_id).read_bytes() == BODY
             renamed.set()
             await asyncio.wait_for(proceed.wait(), 30)
         return await original_transition(record_id, current, target, **metadata)
@@ -817,6 +824,7 @@ async def test_refusal_wins_against_publication_in_another_worker(
     )
     try:
         await asyncio.wait_for(renamed.wait(), 30)
+        assert storage.path(record_id).read_bytes() == BODY
         response = await file_sqlite_client.post(
             url(record_id),
             json={"declined": "no_log"},
@@ -832,3 +840,78 @@ async def test_refusal_wins_against_publication_in_another_worker(
     record = await get_collection(record_id)
     assert record.state == "declined" and record.decline_code == "no_log"
     assert not list(storage.root.iterdir())
+
+async def test_waiting_authenticated_uploads_release_pool(app, file_sqlite_client, monkeypatch):
+    from spawn_server.db import get_engine
+
+    _, token, *_ = await setup_request()
+    missing = str(uuid.uuid4())
+    pool = get_engine().sync_engine.pool
+    pump = app.state.support_log_pump
+    claim = pump._last_claim = asyncio.get_running_loop().create_future()
+    arrivals = 0
+    all_waiting = asyncio.Event()
+    count = 16  # More than the file SQLite pool plus its default overflow.
+    lookup = pump.collection_for_upload
+
+    async def observe(record_id):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == count:
+            all_waiting.set()
+        return await lookup(record_id)
+
+    monkeypatch.setattr(pump, "collection_for_upload", observe)
+    tasks = [asyncio.create_task(raw_request(app, missing, token=token)) for _ in range(count)]
+    try:
+        await asyncio.wait_for(all_waiting.wait(), 30)
+        assert pool.checkedout() == 0
+    finally:
+        claim.set_result(None)
+        results = await asyncio.wait_for(asyncio.gather(*tasks), 30)
+    assert all(status == 404 and reads == 0 for status, _, reads in results)
+
+
+async def test_admission_rechecks_an_upload_lookup_that_crossed_a_claim(
+    app, file_sqlite_client, storage, monkeypatch
+):
+    from spawn_server import support_log_dispatch
+    from tests.test_support_log_dispatch import capable, request
+    from tests.test_support_log_registration import connected
+
+    record, token, value, *_ = await setup_request()
+    owner = value["account_id"]
+    host = await capable(owner)
+    pump = app.state.support_log_pump
+    captured, release = asyncio.Event(), asyncio.Event()
+    lookup = support_log_dispatch.get_collection
+    reads = []
+
+    async def held_lookup(record_id):
+        row = await lookup(record_id)
+        reads.append(row.state)
+        if len(reads) == 1:
+            captured.set()
+            await release.wait()
+        return row
+
+    monkeypatch.setattr(support_log_dispatch, "get_collection", held_lookup)
+    async with connected(app, owner, host, supports_support_log=True) as (_, frames, _):
+        frames.get_nowait()
+        queued = await request(owner, host)
+        upload = asyncio.create_task(raw_request(app, record, token=token))
+        try:
+            await asyncio.wait_for(captured.wait(), 30)
+            await transition(record, "dispatched", "cancelled")
+            # The lifespan fixture parks its automatic pump. Drive one real
+            # pass while the upload still has the old, detached record.
+            await pump.sync_statements()
+            (row,) = await support_log_dispatch.requested_page(datetime.now(UTC), None)
+            assert await pump.dispatch(row, None)
+            assert frames.get_nowait()["consent"] == value
+            assert frames.get_nowait()["request_id"] == queued
+        finally:
+            release.set()
+            status, _, body_reads = await asyncio.wait_for(upload, 30)
+        assert status == 409 and body_reads == 0
+        assert reads == ["dispatched", "cancelled"]

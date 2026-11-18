@@ -25,7 +25,6 @@ spawn_server/
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   support_consent.py       signed statement encoding, validation and current storage
-  support_delivery.py      per-account order for support writes and wire delivery
   support_log.py           request admission, pacing and conditional state transitions
   support_log_dispatch.py  the server process's collection pump and statement delivery
   support_log_cli.py       the operator command, run locally with the server settings
@@ -84,41 +83,38 @@ authorization and durable-state requirements for their replacement.
 ## Support log delivery and storage
 
 Only an operator on the server can request a collection. The command inserts a
-database record. One task in the server process scans requested records at
-startup, every ten seconds and when a capable daemon finishes registering for
-an account with open requests. An offline or incapable host waits. Turning
-sharing off cancels the request. The daemon makes its own decision about each
-collection. The app signing switch and owner history are still to come.
+database record. The app signing switch and owner history are still to come.
 
-With storage ready, registration records the literal JSON boolean
-`supports_support_log: true` as capable, in the existing host activation write.
-After activation, a capable connection waits up to four seconds for its
-account's delivery order. A separate bounded read gets the statement and
-whether to wake the pump. If either fails, ordinary registration and worker
-reconciliation finish and the connection receives no collections.
-A signed off is delivered intact. Missing consent or an enabled statement whose
-signer has left the roster is sent as null.
+When storage is ready, registration records the literal JSON boolean
+`supports_support_log: true` in the existing host activation write. Every host
+receives the ordinary `registered` frame with its full trust data. Registration
+wakes the pump after a capable host finishes connecting.
 
-The app route will call `store_statement` once. It commits, closes the
-transaction, and sends that statement to eligible sockets under the same
-account order. Sends to different hosts run concurrently with a two-second
-deadline. A missed send leaves that connection ineligible until registration.
-Device removal and account deletion take the order before writing. Removing
-the enabled signer sends null after commit. A timed-out reduction interrupts
-outstanding support sends and proceeds. The pump holds the order from its final
-signer and ownership check through its send. A successful send records only
-what went onto that connection.
+The pump is the only sender of support statements and collection requests. It
+runs at startup, on wake and about every ten seconds. First it sends the current
+statement in a separate `host.support_log_consent` frame to each capable host
+that needs it. A signed off is sent intact. Missing consent or an on whose signer
+has left the account is sent as null. A host can skip intermediate changes.
+The daemon accepts this frame after `registered`. The wire document describes
+delivery inside `registered` and should be aligned when the daemon next changes.
+Each send has a two-second deadline. The pump retries a missed statement on a later pass. Next
+the pump cancels open requests for accounts whose sharing is off. It then
+checks pending requests against the enabled statement sent on this connection.
 
-The released daemon checks the UTF-8 bytes of the whole WebSocket text
-message. Above 65,536 bytes it denies support for the rest of its process and
-tries to erase its saved statement. The server reserves 1,024 bytes of margin
-on every frame carrying consent. If the combined frame would exceed the
-server limit, ordinary trust data stays together in `registered` and the
-statement follows in `host.support_log_consent` before any collect. If the
-separate frame is too large, support waits for another registration. If
-ordinary trust data alone already exceeds 65,536 bytes, even an absent field
-triggers the daemon's denial. The server preserves ordinary registration,
-logs the condition and withholds support on that connection.
+The released daemon denies sharing until its process restarts if an ordinary
+`registered` frame exceeds 65,536 UTF-8 bytes, even with consent omitted, and
+tries once to erase its stored statement. The server leaves a 1,024-byte margin.
+Above 64,512 bytes it logs once and withholds both support frames for the whole
+connection. Lifting the daemon limit requires a daemon change. A consent frame
+over 64,512 bytes is also withheld until the current statement fits. The local
+operator command sees the last declared capability in the database. It cannot
+see a connection's frame size, so a request can wait until it expires.
+
+Removing the signer still sends the ordinary trust update. A collect claimed
+just before removal can be sent just after the removal commits. At request start
+the daemon checks its stored on statement and whether it still admits the
+signer. One bundle can already be in flight. The server rejects uploads if
+sharing is off at arrival and checks sharing again before storing a bundle.
 
 A host can have one open request and must wait five minutes between dispatches.
 An account can request up to ten collections in a rolling 24 hours. The same
@@ -142,15 +138,14 @@ the server's settings. All commands accept `--json` for one output object.
 | `collect --account <id-or-email> --host <id-or-name> --reason <text> [--by <label>] [--hours N] [--wait SECONDS]` | Creates one request. The reason is 1 to 200 characters. Supply a label through `--by` or `SPAWN_SUPPORT_LOG_BY`. Hours must be positive and at most 72, with a default of 24. The wait is 0 to 86400 seconds. Waiting polls the database and returns the last state when the deadline passes. |
 | `status <id>` | Current state and any typed refusal |
 | `list [--account <id-or-email>] [--days N]` | Requests in the chosen period, seven days by default |
-| `show <id> [--raw]` | Read the unexpired collected bundle locally. Raw output requires a pipe or file. |
+| `show <id> [--raw]` | Read the unexpired collected bundle locally. Raw output refuses a terminal. |
 | `purge` | Run one bounded retention pass |
 
 The operator can read the whole bundle as the machine reported it. The server
 checks its form and cannot guarantee what the events contain. Under the store
 lock, `show` verifies a regular file, size, SHA-256 and JSON object framing
 before printing. Default output prints one object per line with terminal
-controls escaped. `show --raw` writes the stored bytes unchanged to a pipe
-or file. Metadata commands omit tokens, keys and signatures. An account-scoped
+controls escaped. `show --raw` refuses a terminal and otherwise writes the stored bytes unchanged. Metadata commands omit tokens, keys and signatures. An account-scoped
 lookup exposes no other account's data.
 
 Exit codes are 0 for success, 2 for usage, 3 for sharing off, 4 for a host
@@ -170,7 +165,8 @@ new or empty directory with the extended attribute `user.spawnd.support-log-stor
 version `v1`. A populated unmarked directory, including a legacy store, is
 left alone. Keep it for manual recovery and configure a fresh empty directory.
 The filesystem must support user extended attributes. The CLI opens an existing
-private marked directory and never creates, marks or chmods it.
+private marked directory and never creates, marks or chmods it. Before inserting
+a request, `collect` locks and verifies the directory and runs the startup write probe.
 Each lifespan starts dispatch, installs the
 upload route and starts retention only after that check succeeds. With storage
 off, registration sends its ordinary frame and performs its ordinary SQL. A failure logs one error and
@@ -199,9 +195,12 @@ roster reference, so pruning a removed device preserves the signed artifact.
 Unsigned millisecond timestamps use 20-digit decimal text: SQLite integers
 cannot represent all of u64. This preserves ordering without rounding.
 Removing a signer makes every sharing check false without rewriting the statement.
-After storing a signed off statement, a future app route must call
-`sharing_turned_off` to cancel open requests and delete collected files.
-Account deletion already removes those files after its database commit.
+The app route should pass the ready store to `store_statement`. A signed off
+cancels open requests and marks collected records deleted in the same commit.
+File cleanup then uses only those record IDs. Account deletion reads its file
+IDs, commits both ordinary deletes and immediately tries file cleanup. Cleanup
+tries the verified directory lock once and has a two-second deadline. The
+orphan sweep removes leftovers after its grace period.
 
 HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
 first NDJSON object is the header and is excluded from the event count. The
