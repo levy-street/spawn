@@ -873,12 +873,13 @@ async def test_waiting_authenticated_uploads_release_pool(app, file_sqlite_clien
 
 
 async def test_admission_rechecks_an_upload_lookup_that_crossed_a_claim(
-    app, file_sqlite_client, storage, monkeypatch
+    app, file_sqlite_client, storage, monkeypatch, tmp_path
 ):
     from spawn_server import support_log_dispatch
     from tests.test_support_log_dispatch import capable, request
     from tests.test_support_log_registration import connected
 
+    monkeypatch.setattr(get_settings(), "prebuilt_dir", tmp_path / "prebuilt")
     record, token, value, *_ = await setup_request()
     owner = value["account_id"]
     host = await capable(owner)

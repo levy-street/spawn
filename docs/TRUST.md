@@ -213,11 +213,12 @@ checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
 The server's background pump alone sends statements and collection requests.
 Registration sends the ordinary trust data. The pump then sends the current
 signed statement or null in a separate `host.support_log_consent` frame before
-any collect. A capable host normally learns the current choice within about ten
-seconds of a change and can skip intermediate choices. The daemon accepts this
-separate frame. The wire document describes delivery inside `registered` and
-should be aligned when the daemon next changes. There is no receipt confirming
-that the host applied the change.
+any collect. A host can skip intermediate choices. About ten seconds is the
+idle delay between passes. A pass over many hosts with stalled sockets takes
+longer, and shutdown waits for the send or database operation in progress.
+The daemon accepts this separate frame. The wire document describes delivery
+inside `registered` and should be aligned when the daemon next changes. There
+is no receipt confirming that the host applied the change.
 
 If ordinary registration exceeds 65,536 UTF-8 bytes, the released daemon
 denies sharing until its process restarts and tries once to erase its saved
@@ -246,7 +247,8 @@ signatures. An account-scoped lookup exposes no other account's data.
 Bundles expire after seven days and a bounded sweep runs at startup and every
 15 minutes, so deletion can follow the expiry time. A signed withdrawal cancels open requests and marks the existing collected
 bundles for deletion in the same commit. Their files are removed afterwards.
-Account deletion commits first, then immediately tries to remove its bundles.
+After the account is deleted and the response is sent, a background task tries
+to remove its bundles.
 A busy or unusable store leaves files for the orphan sweep.
 The database retains the current signed statement and collection metadata
 (reason, requester, host snapshot, outcome, times, sizes and digest). Collection
@@ -263,13 +265,24 @@ The server cannot turn sharing on. It checks statements to keep malformed data
 out of storage, but the daemon independently decides whether the owner's
 statement and signer are valid. Removing the signing device makes server-side
 sharing checks false immediately, without erasing or rewriting the signed row.
-A collect already claimed can still be sent just after the removal commits.
+The server process is the only writer of sharing statements. The app route
+runs in that process. If a statement changes after a request is claimed and
+before it is sent, the pump cancels the request. The operator can request again
+under the usual pacing limits.
+A collect already handed to the socket cannot be recalled.
+A collect already claimed can still be sent just after a device removal commits.
 The daemon learns of the removal through its ordinary trust update. At the
 start of a request it checks its own stored on statement and that it still
 admits the signer. One bundle of up to 900 KiB can already be in flight when
 sharing is turned off. The upload route refuses it if sharing is off at arrival
 and checks sharing again before retaining it.
 Durable withdrawal remains a signed off statement, not a missing row or null.
+
+If the trust change reaches the released daemon before a statement signed by
+the removed device, it refuses that statement and stops sharing. Turning
+sharing on again takes effect only after SPAWN D restarts on that machine.
+This can also happen on a fresh connection if the stored turn-off was signed
+by a device that has since been removed.
 
 The support log is a separate, bounded local record. It holds event times,
 producer builds, levels, source locations, reviewed counters/identifiers/fixed

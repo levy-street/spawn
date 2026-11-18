@@ -19,6 +19,7 @@ log = logging.getLogger("spawn.support_log")
 BATCH = 100
 INTERVAL_SECONDS = 15 * 60
 CLEANUP_SECONDS = 2
+_cleanup_tasks: set[asyncio.Task] = set()
 
 
 async def delete_collected(store, record_id: str, *, now: datetime | None = None):
@@ -121,6 +122,13 @@ async def remove_files(store, ids):
             await asyncio.to_thread(store.remove_committed, ids, deadline)
     except Exception:
         log.error("SPAWN D support log file cleanup failed; sweep will retry")
+
+
+async def start_file_cleanup(store, ids):
+    """Called after the delete response has been sent. The sweep covers interruptions."""
+    task = asyncio.create_task(remove_files(store, ids))
+    _cleanup_tasks.add(task)
+    task.add_done_callback(_cleanup_tasks.discard)
 
 
 async def account_file_ids(session, user_id: str):

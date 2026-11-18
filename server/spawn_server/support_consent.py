@@ -15,7 +15,7 @@ from enum import StrEnum
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import HTTPException
-from sqlalchemy import and_, exists, literal, or_, select, update
+from sqlalchemy import and_, event, exists, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -28,6 +28,11 @@ from .ws.signed_signal_relay import sanitize_carried_endorsements
 MAGIC = b"SPAWN-SUPPORT-LOG-CONSENT-V1"
 U64_MAX = (1 << 64) - 1
 FUTURE_MS = 86_400_000
+_statement_generations: dict[str, int] = {}
+
+
+def statement_generation(user_id: str) -> int:
+    return _statement_generations.get(user_id, 0)
 
 
 class ConsentReason(StrEnum):
@@ -293,6 +298,11 @@ async def store_statement(
                 .returning(SupportLogCollection.id)
             )
             files = deleted.all()
+        # Publish the change before commit() yields to return the connection to its pool.
+        @event.listens_for(session.sync_session, "after_commit")
+        def advance_generation(_session):
+            _statement_generations[user_id] = statement_generation(user_id) + 1
+
         await session.commit()
     if store is not None and files:
         await remove_files(store, files)

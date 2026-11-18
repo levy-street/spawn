@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -167,7 +168,7 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     assert not await mark_dispatched(requested)
 
 
-@pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup"])
+@pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup", "timeout"])
 async def test_account_deletion_removes_files_and_cascades(
     client, storage, monkeypatch, caplog, failure
 ):
@@ -202,22 +203,47 @@ async def test_account_deletion_removes_files_and_cascades(
             from sqlalchemy.ext.asyncio import AsyncSession
 
             m.setattr(AsyncSession, "scalars", AsyncMock(side_effect=RuntimeError))
+        elif failure == "timeout":
+            loop = asyncio.get_running_loop()
+            entered, finished = asyncio.Event(), asyncio.Event()
+            release = threading.Event()
+            deadline = asyncio.timeout(None)
+            timeout = asyncio.timeout
+
+            def held_worker(ids, cutoff):
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(30)
+                loop.call_soon_threadsafe(finished.set)
+
+            m.setattr(storage, "remove_committed", held_worker)
+            m.setattr(asyncio, "timeout", lambda delay: deadline if delay == 2 else timeout(delay))
         try:
-            response = await client.post(
-                "/api/account/delete",
-                json={"confirm_email": user.email},
-                headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
+            response = await asyncio.wait_for(
+                client.post(
+                    "/api/account/delete",
+                    json={"confirm_email": user.email},
+                    headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
+                ),
+                30,
             )
+            assert response.status_code == 204 and response.content == b""
+            assert 'spawn_session=""' in response.headers["set-cookie"]
+            assert "Max-Age=0" in response.headers["set-cookie"]
+            if failure == "timeout":
+                await asyncio.wait_for(entered.wait(), 30)
+                assert not finished.is_set() and storage.path(record_id).exists()
+                deadline.reschedule(loop.time())
+            await asyncio.wait_for(asyncio.gather(*support_log_retention._cleanup_tasks), 30)
         finally:
-            if failure == "marker":
+            if failure == "timeout":
+                release.set()
+                await asyncio.wait_for(finished.wait(), 30)
+            elif failure == "marker":
                 os.setxattr(storage.fd, support_log_files.STORE_ATTRIBUTE, support_log_files.STORE_VERSION)
             elif failure == "mode":
                 os.fchmod(storage.fd, 0o700)
             elif failure == "lock":
                 support_log_files.fcntl.flock(storage.fd, support_log_files.fcntl.LOCK_UN)
-    assert response.status_code == 204 and response.content == b""
-    assert 'spawn_session=""' in response.headers["set-cookie"]
-    assert "Max-Age=0" in response.headers["set-cookie"]
     broker.get_daemon_for_host.assert_called_once_with(host.id)
     socket.close.assert_awaited_once()
     assert await get_collection(record_id) is None
@@ -552,6 +578,7 @@ async def test_upload_during_account_deletion(file_sqlite_client, storage, monke
         proceed.set()
     result = await asyncio.wait_for(deletion, 30)
     assert result.status_code == 204
+    await asyncio.wait_for(asyncio.gather(*retention._cleanup_tasks), 30)
     assert not list(storage.root.iterdir())
     assert await get_collection(record_id) is None
 

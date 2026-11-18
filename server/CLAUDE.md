@@ -91,13 +91,16 @@ receives the ordinary `registered` frame with its full trust data. Registration
 wakes the pump after a capable host finishes connecting.
 
 The pump is the only sender of support statements and collection requests. It
-runs at startup, on wake and about every ten seconds. First it sends the current
+runs at startup and waits about ten seconds between passes unless woken sooner.
+A pass over many hosts with stalled sockets takes longer. Shutdown waits for
+the send or database operation in progress. First the pump sends the current
 statement in a separate `host.support_log_consent` frame to each capable host
 that needs it. A signed off is sent intact. Missing consent or an on whose signer
 has left the account is sent as null. A host can skip intermediate changes.
 The daemon accepts this frame after `registered`. The wire document describes
 delivery inside `registered` and should be aligned when the daemon next changes.
-Each send has a two-second deadline. The pump retries a missed statement on a later pass. Next
+The pump skips busy connections. Each send uses the ordinary connection lock
+and has a two-second deadline. The pump retries a missed statement on a later pass. Next
 the pump cancels open requests for accounts whose sharing is off. It then
 checks pending requests against the enabled statement sent on this connection.
 
@@ -116,6 +119,12 @@ the daemon checks its stored on statement and whether it still admits the
 signer. One bundle can already be in flight. The server rejects uploads if
 sharing is off at arrival and checks sharing again before storing a bundle.
 
+If the trust update reaches the released daemon before a statement signed by
+the removed device, the daemon refuses that statement. Sharing stays off until
+SPAWN D restarts on that machine, even if the owner turns sharing on again.
+The same can happen on a fresh connection if the stored turn-off was signed
+by a device that has since been removed.
+
 A host can have one open request and must wait five minutes between dispatches.
 An account can request up to ten collections in a rolling 24 hours. The same
 limit on dispatch times covers requests delayed while a host was offline.
@@ -128,6 +137,11 @@ declined. Dispatch verifies the socket owner and the enabled statement last
 sent there, commits the conditional transition, then sends `support_log.collect`
 with the request ID and a window of 60 to 259200 seconds. A failed send stays
 dispatched until retention closes it. The server sends each request at most once.
+The server process is the only writer of statements. The app route runs in
+that process. If a new statement commits between the claim and the send,
+the pump cancels the request. The operator can request again under the usual
+pacing limits. A collect already handed to the socket cannot be recalled.
+The daemon and upload route still apply the checks above.
 
 Run `python -m spawn_server.support_log_cli` from the server directory with
 the server's settings. All commands accept `--json` for one output object.
@@ -198,9 +212,9 @@ Removing a signer makes every sharing check false without rewriting the statemen
 The app route should pass the ready store to `store_statement`. A signed off
 cancels open requests and marks collected records deleted in the same commit.
 File cleanup then uses only those record IDs. Account deletion reads its file
-IDs, commits both ordinary deletes and immediately tries file cleanup. Cleanup
-tries the verified directory lock once and has a two-second deadline. The
-orphan sweep removes leftovers after its grace period.
+IDs and commits both ordinary deletes. After the response, a background task
+tries the verified directory lock once and has two seconds to remove the
+files. The orphan sweep removes leftovers after its grace period.
 
 HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
 first NDJSON object is the header and is excluded from the event count. The

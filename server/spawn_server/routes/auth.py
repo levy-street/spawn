@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -186,6 +186,7 @@ async def delete_account(
     body: schemas.AccountDeleteRequest,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> None:
@@ -236,7 +237,7 @@ async def delete_account(
         .all()
     )
     from ..support_log_files import get_store
-    from ..support_log_retention import account_file_ids, remove_files
+    from ..support_log_retention import account_file_ids, start_file_cleanup
 
     owner = user.id
     store = get_store(request.app)
@@ -244,8 +245,6 @@ async def delete_account(
     await session.execute(delete(HostKeyClaim).where(HostKeyClaim.owner_user_id == owner))
     await session.execute(delete(User).where(User.id == owner))
     await session.commit()
-    if file_ids:
-        await remove_files(store, file_ids)
 
     for host_id in host_ids:
         try:
@@ -260,3 +259,5 @@ async def delete_account(
         samesite="lax",
         secure=get_settings().public_url.startswith("https://"),
     )
+    if file_ids:
+        background_tasks.add_task(start_file_cleanup, store, file_ids)
