@@ -345,10 +345,10 @@ fn connection_text(config_dir: &Path, state: Option<&crate::state::StateFile>) -
     else {
         return "not running — start with: spawnd reconnect".into();
     };
-    live_connection_text(config_dir, state)
+    live_connection_text(state)
 }
 
-fn live_connection_text(config_dir: &Path, state: &crate::state::StateFile) -> String {
+fn live_connection_text(state: &crate::state::StateFile) -> String {
     if state.connected {
         let age = state
             .connected_at
@@ -360,24 +360,8 @@ fn live_connection_text(config_dir: &Path, state: &crate::state::StateFile) -> S
     }
     match state.last_error.as_ref() {
         Some(error) if error.kind == "auth" && error.detail == "token_revoked" => {
-            let dir = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_owned());
-            let dir = dir.to_string_lossy();
-            // Keep shell expansions in an instance path literal (PowerShell on Windows).
-            #[cfg(windows)]
-            let literal = dir.contains(['$', '`']);
-            #[cfg(not(windows))]
-            let literal = dir.contains(['$', '`', '"', '\\', '!']);
-            let argument = if literal {
-                #[cfg(windows)]
-                let escaped = dir.replace('\'', "''");
-                #[cfg(not(windows))]
-                let escaped = dir.replace('\'', "'\\''");
-                format!("'{escaped}'")
-            } else {
-                format!("\"{dir}\"")
-            };
-            let mut message = format!(
-                "The server no longer accepts this machine's login. Run spawnd login --no-run --config-dir {argument} to renew it. If this machine was removed from your account, pair it again."
+            let mut message = String::from(
+                "The server no longer accepts this machine's login. To renew it, run spawnd login --no-run with the same --config-dir and --server options this SPAWN D instance runs with. If this machine was removed from your account, pair it again.",
             );
             if let Some(next) = &error.next_attempt_at {
                 let _ = write!(message, " Next attempt at {next}.");
@@ -616,18 +600,18 @@ mod tests {
 
     #[test]
     fn auth_heartbeat_has_the_exact_status_remedy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("instance with spaces");
+        let remedy = "The server no longer accepts this machine's login. To renew it, run spawnd login --no-run with the same --config-dir and --server options this SPAWN D instance runs with. If this machine was removed from your account, pair it again.";
         let mut heartbeat = state("0.1.0", None, false);
+        assert_eq!(live_connection_text(&heartbeat), remedy);
         heartbeat.last_error.as_mut().unwrap().next_attempt_at =
             Some("2026-08-25T00:05:00Z".into());
         assert_eq!(
-            live_connection_text(&dir, &heartbeat),
-            format!("The server no longer accepts this machine's login. Run spawnd login --no-run --config-dir \"{}\" to renew it. If this machine was removed from your account, pair it again. Next attempt at 2026-08-25T00:05:00Z.", dir.display())
+            live_connection_text(&heartbeat),
+            format!("{remedy} Next attempt at 2026-08-25T00:05:00Z.")
         );
         heartbeat.last_error.as_mut().unwrap().detail = "token_expired".into();
         assert_eq!(
-            live_connection_text(&dir, &heartbeat),
+            live_connection_text(&heartbeat),
             "rejected by server (signed out) — fix with: spawnd login"
         );
     }

@@ -490,6 +490,19 @@ async fn credential_change_now(
     credential_change_now_with(active, loader, support).await
 }
 
+// A competing wake can cancel the monitor while its backend read is in flight.
+// Finish that read before a state-file lock or fsync can use up its deadline.
+async fn pending_credential_change(
+    active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
+) -> Option<Result<LiveCredentialSnapshot>> {
+    loader.pending.as_ref()?;
+    credential_change_now(active, loader, support)
+        .await
+        .transpose()
+}
+
 async fn credential_change_now_with(
     active: &LiveCredentialSnapshot,
     loader: &mut CredentialLoader,
@@ -960,11 +973,13 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             attempt = 0;
         }
         match wait_for_retry(
-            &state_store,
             revoked_deadline,
             delay,
-            wait_for_credential_change(&live_credentials, &mut credential_loader, support.as_ref()),
+            &live_credentials,
+            &mut credential_loader,
+            support.as_ref(),
             sighup_signal(),
+            async { state_store.clear_pending_retry() },
         )
         .await?
         {
@@ -988,20 +1003,22 @@ enum RetryWake<T> {
     Shutdown,
 }
 
-async fn wait_for_retry<T>(
-    store: &crate::state::StateStore,
+async fn wait_for_retry(
     revoked_deadline: Option<tokio::time::Instant>,
     delay: Duration,
-    credentials: impl Future<Output = T>,
+    active: &LiveCredentialSnapshot,
+    loader: &mut CredentialLoader,
+    support: Option<&crate::support::Collector>,
     reconnect: impl Future<Output = ()>,
-) -> Result<RetryWake<T>> {
+    clear_pending_retry: impl Future<Output = ()>,
+) -> Result<RetryWake<Result<LiveCredentialSnapshot>>> {
     let sleep = match revoked_deadline {
         Some(deadline) => tokio::time::sleep_until(deadline),
         None => tokio::time::sleep(delay),
     };
-    let wake = tokio::select! {
+    let mut wake = tokio::select! {
         _ = sleep => RetryWake::Timer,
-        reloaded = credentials => RetryWake::Credentials(reloaded),
+        reloaded = wait_for_credential_change(active, loader, support) => RetryWake::Credentials(reloaded),
         _ = reconnect => RetryWake::Reconnect,
         r = tokio::signal::ctrl_c() => {
             r.context("ctrl-c handler")?;
@@ -1014,7 +1031,16 @@ async fn wait_for_retry<T>(
         }
     };
     if revoked_deadline.is_some() {
-        store.clear_pending_retry();
+        match wake {
+            RetryWake::Timer | RetryWake::Reconnect => {
+                if let Some(reload) = pending_credential_change(active, loader, support).await {
+                    wake = RetryWake::Credentials(reload);
+                }
+            }
+            RetryWake::Shutdown => drop(loader.pending.take()),
+            RetryWake::Credentials(_) => {}
+        }
+        clear_pending_retry.await;
     }
     Ok(wake)
 }
@@ -1062,7 +1088,7 @@ async fn serve_one_connection(
     daemon_revoked: &mut RevocationSet,
     support: Option<&crate::support::Collector>,
 ) -> Result<ServeOutcome> {
-    serve_one_connection_with_loader(
+    let outcome = serve_one_connection_with_loader(
         live_credentials,
         ws_url,
         registry,
@@ -1072,7 +1098,14 @@ async fn serve_one_connection(
         daemon_revoked,
         support,
     )
-    .await
+    .await?;
+    // A failed handshake or a session close can leave a monitor read outstanding
+    // just before the supervisor records the disconnect.
+    if let Some(reload) = pending_credential_change(live_credentials, loader, support).await {
+        rtc_sessions.invalidate_trust_and_close_all().await;
+        return Ok(ServeOutcome::CredentialsChanged(Box::new(reload?)));
+    }
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4709,7 +4742,11 @@ mod tests {
         // Charge time between recording the deadline and entering the select,
         // as would happen with a slow heartbeat write.
         tokio::time::advance(Duration::from_secs(5)).await;
-        let origin = config::server_url(None).unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin =
+            url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let host = Uuid::new_v4();
         let record = |generation| {
             credential_record(
@@ -4728,47 +4765,104 @@ mod tests {
         let mut loader = CredentialLoader {
             requests: Some(requests),
             pending: None,
-            load_deadline: hour,
+            load_deadline: CREDENTIAL_LOAD_DEADLINE,
             failed: false,
         };
-        let generation = async {
-            wait_for_credential_change(&active, &mut loader, None)
-                .await
-                .unwrap()
-                .generation
+        let reply = |request: CredentialLoadRequest, generation| {
+            assert!(request
+                .reply
+                .send(CredentialLoadReply::Loaded(record(generation)))
+                .is_ok());
         };
-        let reconnect = tokio::sync::Notify::new();
-        let wait = wait_for_retry(&store, deadline, hour, generation, reconnect.notified());
-        tokio::pin!(wait);
-        assert!(futures_util::poll!(&mut wait).is_pending());
-
-        // Both early wakes arrive well inside the hour. For the timer, also
-        // check that the supervisor is still waiting one second before it.
         let elapsed = match expected {
             RetryWake::Timer => hour,
             _ => Duration::from_secs(15),
         };
-        tokio::time::advance(elapsed - start.elapsed() - Duration::from_secs(1)).await;
+        let slow_write = CREDENTIAL_LOAD_DEADLINE + Duration::from_secs(1);
+        let reconnect = tokio::sync::Notify::new();
+        let mut wait = Box::pin(wait_for_retry(
+            deadline,
+            hour,
+            &active,
+            &mut loader,
+            None,
+            reconnect.notified(),
+            async {
+                assert_eq!(start.elapsed(), elapsed);
+                tokio::time::advance(slow_write).await;
+                store.clear_pending_retry();
+            },
+        ));
+
+        // Start the monitor close enough to the wake for its read to be timely.
+        tokio::time::advance(
+            elapsed - start.elapsed() - CREDENTIAL_RELOAD_INTERVAL - Duration::from_secs(1),
+        )
+        .await;
         assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        let pending = reads.try_recv().unwrap();
         assert_eq!(last_error().next_attempt_at, error.next_attempt_at);
         tokio::time::advance(Duration::from_secs(1)).await;
-        match expected {
-            RetryWake::Credentials(next) => assert!(reads
-                .try_recv()
-                .unwrap()
-                .reply
-                .send(CredentialLoadReply::Loaded(record(next)))
-                .is_ok()),
-            RetryWake::Reconnect => reconnect.notify_one(),
-            RetryWake::Timer => {}
-            RetryWake::Shutdown => unreachable!(),
-        }
-        assert_eq!(wait.await.unwrap(), expected);
-        assert_eq!(start.elapsed(), elapsed);
         if expected == RetryWake::Timer {
             assert_eq!(refused_at + start.elapsed().as_secs() as i64, advertised);
         }
+        match expected {
+            RetryWake::Credentials(next) => reply(pending, next),
+            RetryWake::Timer | RetryWake::Reconnect => {
+                if expected == RetryWake::Reconnect {
+                    reconnect.notify_one();
+                }
+                // Let the timer/signal win, then queue the unchanged reply.
+                assert!(futures_util::poll!(&mut wait).is_pending());
+                reply(pending, active.generation);
+            }
+            RetryWake::Shutdown => unreachable!(),
+        }
+        let active = match (wait.await.unwrap(), expected) {
+            (RetryWake::Timer, RetryWake::Timer) | (RetryWake::Reconnect, RetryWake::Reconnect) => {
+                active
+            }
+            (RetryWake::Credentials(Ok(next)), RetryWake::Credentials(generation)) => {
+                assert_eq!(next.generation, generation);
+                next
+            }
+            _ => panic!("unexpected retry wake"),
+        };
+        assert_eq!(start.elapsed(), elapsed + slow_write);
         assert!(last_error().next_attempt_at.is_none());
+
+        let ws_url = config::ws_url(&origin).unwrap();
+        let registry = SessionRegistry::new();
+        let rtc = RtcSessions::new();
+        let mut revoked = RevocationSet::new();
+        let connect = async {
+            assert!(credential_change_now(&active, &mut loader, None)
+                .await
+                .unwrap()
+                .is_none());
+            serve_one_connection(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc,
+                &mut loader,
+                &mut revoked,
+                None,
+            )
+            .await
+        };
+        tokio::pin!(connect);
+        // Both the supervisor and the socket admission check read afresh after the write.
+        assert!(futures_util::poll!(&mut connect).is_pending());
+        reply(reads.try_recv().unwrap(), active.generation);
+        assert!(futures_util::poll!(&mut connect).is_pending());
+        reply(reads.try_recv().unwrap(), active.generation);
+        tokio::select! {
+            _ = &mut connect => panic!("supervisor exited before connecting"),
+            accepted = listener.accept() => { accepted.unwrap(); }
+        }
     }
 
     #[tokio::test(start_paused = true)]
