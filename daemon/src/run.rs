@@ -676,7 +676,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // wired into clap), then the URL we logged in against.
     let server_url = config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let ws_url = config::ws_url(&server_url)?;
-    let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
+    let live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     // The actor processes inputs lazily as they arrive; startup opens no support storage.
     // Its delivery queue already exists, so early trust/withdrawal is retained.
@@ -737,6 +737,30 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             memory,
         ));
     }
+    supervise_connections(
+        server_url,
+        ws_url,
+        live_credentials,
+        credential_loader,
+        registry,
+        rtc_sessions,
+        state_store,
+        support,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_connections(
+    server_url: url::Url,
+    ws_url: url::Url,
+    mut live_credentials: LiveCredentialSnapshot,
+    mut credential_loader: CredentialLoader,
+    registry: SessionRegistry,
+    rtc_sessions: RtcSessions,
+    state_store: Arc<crate::state::StateStore>,
+    support: Option<crate::support::Collector>,
+) -> Result<()> {
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every
@@ -978,6 +1002,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             &live_credentials,
             &mut credential_loader,
             support.as_ref(),
+            &rtc_sessions,
             sighup_signal(),
             async { state_store.clear_pending_retry() },
         )
@@ -987,7 +1012,6 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             RetryWake::Reconnect => attempt = 0,
             RetryWake::Shutdown => return Ok(()),
             RetryWake::Credentials(reloaded) => {
-                rtc_sessions.invalidate_trust_and_close_all().await;
                 live_credentials = reloaded?;
                 attempt = 0;
             }
@@ -1003,12 +1027,14 @@ enum RetryWake<T> {
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_retry(
     revoked_deadline: Option<tokio::time::Instant>,
     delay: Duration,
     active: &LiveCredentialSnapshot,
     loader: &mut CredentialLoader,
     support: Option<&crate::support::Collector>,
+    rtc_sessions: &RtcSessions,
     reconnect: impl Future<Output = ()>,
     clear_pending_retry: impl Future<Output = ()>,
 ) -> Result<RetryWake<Result<LiveCredentialSnapshot>>> {
@@ -1040,6 +1066,11 @@ async fn wait_for_retry(
             RetryWake::Shutdown => drop(loader.pending.take()),
             RetryWake::Credentials(_) => {}
         }
+    }
+    if matches!(wake, RetryWake::Credentials(_)) {
+        rtc_sessions.invalidate_trust_and_close_all().await;
+    }
+    if revoked_deadline.is_some() {
         clear_pending_retry.await;
     }
     Ok(wake)
@@ -1099,11 +1130,15 @@ async fn serve_one_connection(
         support,
     )
     .await?;
-    // A failed handshake or a session close can leave a monitor read outstanding
-    // just before the supervisor records the disconnect.
-    if let Some(reload) = pending_credential_change(live_credentials, loader, support).await {
-        rtc_sessions.invalidate_trust_and_close_all().await;
-        return Ok(ServeOutcome::CredentialsChanged(Box::new(reload?)));
+    // Only a revoked login adds a retry deadline write. Other closes keep
+    // their disposition and leave the monitor read for the supervisor.
+    let revoked = matches!(&outcome, ServeOutcome::SessionEnded(ended)
+        if ended.result.as_ref().err().and_then(ws::auth_refusal) == Some(ws::AuthRefusal::Revoked));
+    if revoked {
+        if let Some(reload) = pending_credential_change(live_credentials, loader, support).await {
+            rtc_sessions.invalidate_trust_and_close_all().await;
+            return Ok(ServeOutcome::CredentialsChanged(Box::new(reload?)));
+        }
     }
     Ok(outcome)
 }
@@ -4725,6 +4760,18 @@ mod tests {
         }
     }
 
+    fn controlled_credential_loader(
+    ) -> (CredentialLoader, std_mpsc::Receiver<CredentialLoadRequest>) {
+        let (requests, reads) = std_mpsc::sync_channel(1);
+        let loader = CredentialLoader {
+            requests: Some(requests),
+            pending: None,
+            load_deadline: CREDENTIAL_LOAD_DEADLINE,
+            failed: false,
+        };
+        (loader, reads)
+    }
+
     async fn check_revoked_retry(expected: RetryWake<u64>) {
         use crate::state::{parse_rfc3339_seconds, read_path, StateStore};
         let dir = tempfile::tempdir().unwrap();
@@ -4761,13 +4808,7 @@ mod tests {
         };
         let active = LiveCredentialSnapshot::initial(record(1), &origin).unwrap();
         // Answer the real monitor's read in memory, at a chosen clock tick.
-        let (requests, reads) = std_mpsc::sync_channel(1);
-        let mut loader = CredentialLoader {
-            requests: Some(requests),
-            pending: None,
-            load_deadline: CREDENTIAL_LOAD_DEADLINE,
-            failed: false,
-        };
+        let (mut loader, reads) = controlled_credential_loader();
         let reply = |request: CredentialLoadRequest, generation| {
             assert!(request
                 .reply
@@ -4780,15 +4821,22 @@ mod tests {
         };
         let slow_write = CREDENTIAL_LOAD_DEADLINE + Duration::from_secs(1);
         let reconnect = tokio::sync::Notify::new();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
         let mut wait = Box::pin(wait_for_retry(
             deadline,
             hour,
             &active,
             &mut loader,
             None,
+            &rtc,
             reconnect.notified(),
             async {
                 assert_eq!(start.elapsed(), elapsed);
+                assert_eq!(
+                    rtc.trust_epoch_for_test(),
+                    epoch + u64::from(matches!(expected, RetryWake::Credentials(_)))
+                );
                 tokio::time::advance(slow_write).await;
                 store.clear_pending_retry();
             },
@@ -4835,7 +4883,6 @@ mod tests {
 
         let ws_url = config::ws_url(&origin).unwrap();
         let registry = SessionRegistry::new();
-        let rtc = RtcSessions::new();
         let mut revoked = RevocationSet::new();
         let connect = async {
             assert!(credential_change_now(&active, &mut loader, None)
@@ -4878,6 +4925,216 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reconnect_signal_interrupts_the_hourly_retry() {
         check_revoked_retry(RetryWake::Reconnect).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum PendingRead {
+        Changed,
+        Invalid,
+        Failed,
+    }
+
+    async fn check_trust_before_retry_write(read: PendingRead, reconnect: bool) {
+        let origin = config::server_url(None).unwrap();
+        let host = Uuid::new_v4();
+        let record = |generation: u64| {
+            credential_record(
+                generation,
+                generation.into(),
+                "token",
+                host,
+                origin.as_str(),
+                1,
+                &[],
+            )
+        };
+        let active = LiveCredentialSnapshot::initial(record(1), &origin).unwrap();
+        let (mut loader, reads) = controlled_credential_loader();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
+        let delay = CREDENTIAL_RELOAD_INTERVAL * 2;
+        let signal = tokio::sync::Notify::new();
+        let (release, blocked_write) = oneshot::channel();
+        let mut wait = Box::pin(wait_for_retry(
+            Some(tokio::time::Instant::now() + delay),
+            delay,
+            &active,
+            &mut loader,
+            None,
+            &rtc,
+            signal.notified(),
+            async {
+                assert_eq!(rtc.trust_epoch_for_test(), epoch + 1);
+                blocked_write.await.unwrap();
+            },
+        ));
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        let pending = reads.try_recv().unwrap();
+        if reconnect {
+            signal.notify_one();
+        } else {
+            tokio::time::advance(CREDENTIAL_RELOAD_INTERVAL).await;
+        }
+        // Commit to the timer or signal before the monitor can see the reply.
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch);
+        let reply = match read {
+            PendingRead::Changed => CredentialLoadReply::Loaded(record(2)),
+            PendingRead::Invalid => {
+                let mut invalid = record(2);
+                invalid.access_token = None;
+                CredentialLoadReply::Loaded(invalid)
+            }
+            PendingRead::Failed => CredentialLoadReply::Failed,
+        };
+        assert!(pending.reply.send(reply).is_ok());
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch + 1);
+        release.send(()).unwrap();
+        match (wait.await.unwrap(), read) {
+            (RetryWake::Credentials(Ok(next)), PendingRead::Changed) => {
+                assert_eq!(next.generation, 2)
+            }
+            (RetryWake::Credentials(Err(_)), PendingRead::Invalid | PendingRead::Failed) => {}
+            _ => panic!("unexpected credential result"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_credentials_invalidate_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Changed, false).await;
+        check_trust_before_retry_write(PendingRead::Changed, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_credentials_invalidate_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Invalid, false).await;
+        check_trust_before_retry_write(PendingRead::Invalid, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_credential_read_invalidates_trust_before_retry_write() {
+        check_trust_before_retry_write(PendingRead::Failed, false).await;
+        check_trust_before_retry_write(PendingRead::Failed, true).await;
+    }
+
+    async fn check_close_with_changed_credentials(code: u16) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::handshake::server::{Callback, Request};
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Arc::new(crate::state::StateStore::at_path(path.clone(), "", None));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin =
+            url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let ws_url = config::ws_url(&origin).unwrap();
+        let host = Uuid::new_v4();
+        let record = credential_record(1, 1, "first", host, origin.as_str(), 1, &[]);
+        let next = credential_record(2, 2, "second", host, origin.as_str(), 1, &[]);
+        let active = LiveCredentialSnapshot::initial(record.clone(), &origin).unwrap();
+        let registered = Arc::new(AtomicBool::new(false));
+        let monitor_registered = Arc::clone(&registered);
+        let (pending, read_started) = oneshot::channel();
+        let mut pending = Some(pending);
+        let (release, closed) = std_mpsc::channel();
+        let loader = CredentialLoader::start(HANDSHAKE_LIVENESS, move || {
+            if !monitor_registered.load(Ordering::Acquire) {
+                return Ok(record.clone());
+            }
+            if let Some(pending) = pending.take() {
+                pending.send(()).unwrap();
+                closed.recv()?;
+            }
+            Ok(next.clone())
+        })
+        .unwrap();
+        let rtc = RtcSessions::new();
+        let epoch = rtc.trust_epoch_for_test();
+        let registry = SessionRegistry::new();
+        assert!(registry.claim_discovery());
+        let supervisor = Box::pin(supervise_connections(
+            origin,
+            ws_url,
+            active,
+            loader,
+            registry,
+            rtc.clone(),
+            store,
+            None,
+        ));
+        let (retried, retry_seen) = oneshot::channel();
+        let peer = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tcp, SelectDaemonSubprotocol)
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap();
+            registered.store(true, Ordering::Release);
+            read_started.await.unwrap();
+            socket
+                .close(Some(CloseFrame {
+                    code: code.into(),
+                    reason: "".into(),
+                }))
+                .await
+                .unwrap();
+            // The read stays pending until socket teardown, so the close wins
+            // even if both sides run on a single executor thread.
+            let _ = socket.get_mut().read_to_end(&mut Vec::new()).await;
+            release.send(()).unwrap();
+            if code != 4002 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let check_token = |request: &Request, response| {
+                    assert_eq!(request.headers()["Authorization"], "Bearer second");
+                    SelectDaemonSubprotocol.on_request(request, response)
+                };
+                let socket = tokio_tungstenite::accept_hdr_async(tcp, check_token)
+                    .await
+                    .unwrap();
+                assert!(retried.send(socket).is_ok());
+            }
+        };
+        let check = async {
+            if code == 4002 {
+                assert_eq!(
+                    supervisor.await.unwrap_err().to_string(),
+                    "server rejected this daemon as a client bug (close 4002)"
+                );
+            } else {
+                tokio::select! {
+                    result = supervisor => panic!("ordinary close ended the supervisor: {result:?}"),
+                    retry = retry_seen => drop(retry.unwrap()),
+                }
+            }
+        };
+        tokio::time::timeout(HANDSHAKE_LIVENESS, async { tokio::join!(peer, check) })
+            .await
+            .unwrap();
+        let state = crate::state::read_path(&path).unwrap().unwrap();
+        assert!(!state.connected);
+        let error = state.last_error.unwrap();
+        assert_eq!(error.kind, "http");
+        assert_eq!(error.detail, "websocket_handshake");
+        assert!(error.next_attempt_at.is_none());
+        assert_eq!(rtc.trust_epoch_for_test(), epoch + u64::from(code != 4002));
+    }
+
+    #[tokio::test]
+    async fn close_4002_records_disconnect_and_exits_with_a_changed_read_pending() {
+        check_close_with_changed_credentials(4002).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_close_records_disconnect_and_reconnects_with_a_changed_read_pending() {
+        check_close_with_changed_credentials(1000).await;
     }
 
     /// A program that hangs past a capture's timeout is stopped with
