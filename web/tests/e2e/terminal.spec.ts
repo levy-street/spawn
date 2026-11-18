@@ -970,9 +970,11 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   // story is the reconciliation record itself. What must still hold: one
   // dispatch, no automatic retry, honest "may have been published" copy, and
   // a record durable across transient upload statuses.
+  await page.clock.install({ time: new Date(0) });
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
   });
+  await page.clock.pauseAt(new Date(60_000));
   await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(["published"], "maybe.png", { type: "image/png" }));
@@ -985,7 +987,6 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   await expect(page.getByTestId("upload-reconciliation")).toContainText(
     "Check the endpoint destination before retrying",
   );
-  await page.clock.install();
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
   );
@@ -1010,6 +1011,7 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
 
   // Navigation fully unmounts this terminal; the session-scoped record
   // restores on the next component instance.
+  await page.clock.resume();
   await page.goto("/download");
   await page.goto(`/sessions/${SESSION_ID}`);
   await expect(page.getByLabel("Session terminal")).toBeVisible();
@@ -1033,7 +1035,7 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
       }
     ).__spawnRtcTest.releaseHeldUploadCompletion();
   });
-  await page.waitForTimeout(200);
+  await page.clock.fastForward(200);
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
 });
 

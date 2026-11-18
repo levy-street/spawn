@@ -1029,13 +1029,15 @@ async def test_reduce_failure_isolated_to_one_account(app, pump, monkeypatch, ca
 
 async def test_sansio_answers_ping_with_application_traffic_on_a_paused_transport():
     sending, finish = asyncio.Event(), asyncio.Event()
+    sent = asyncio.Event()
     payload = b"support_log.collect"
 
     async def app(scope, receive, send):
         await send({"type": "websocket.accept"})
-        protocol.pause_writing()
+        protocol.writable.clear()
         sending.set()
         await send({"type": "websocket.send", "bytes": payload})
+        sent.set()
         await finish.wait()
 
     config = Config(app, ws="websockets-sansio", ws_ping_interval=None, log_config=None)
@@ -1051,17 +1053,20 @@ async def test_sansio_answers_ping_with_application_traffic_on_a_paused_transpor
     )
     try:
         await asyncio.wait_for(sending.wait(), 30)
-        (handshake,) = transport.write.call_args_list[0].args
+        transport.write.assert_called_once()
+        (handshake,) = transport.write.call_args.args
         assert handshake.startswith(b"HTTP/1.1 101")
         protocol.data_received(Frame(Opcode.PING, b"echo").serialize(mask=True))
+        assert transport.write.call_count == 2
         transport.write.assert_called_with(Frame(Opcode.PONG, b"echo").serialize(mask=False))
+        assert not sent.is_set()
         transport.close.assert_not_called()
     finally:
-        protocol.resume_writing()
+        protocol.writable.set()
         finish.set()
         await asyncio.wait_for(asyncio.gather(*state.tasks), 30)
         protocol.connection_lost(None)
-    transport.write.assert_any_call(Frame(Opcode.BINARY, payload).serialize(mask=False))
+    transport.write.assert_called_with(Frame(Opcode.BINARY, payload).serialize(mask=False))
     assert transport.write.call_count == 3
 
 

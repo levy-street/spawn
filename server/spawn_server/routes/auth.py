@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -18,6 +21,7 @@ from ..ws.broker import get_broker
 from .account_recovery import send_verification_email
 
 router = APIRouter(prefix="/api", tags=["auth"])
+log = logging.getLogger(__name__)
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
@@ -246,14 +250,6 @@ async def delete_account(
     await session.execute(delete(User).where(User.id == owner))
     await session.commit()
 
-    for host_id in host_ids:
-        try:
-            daemon = get_broker().get_daemon_for_host(host_id)
-            if daemon is not None:
-                await daemon.close()
-        except Exception:
-            pass
-
     response.delete_cookie(
         "spawn_session",
         samesite="lax",
@@ -261,3 +257,17 @@ async def delete_account(
     )
     if file_ids:
         background_tasks.add_task(start_file_cleanup, store, file_ids)
+    if host_ids:
+        background_tasks.add_task(_close_daemon_sockets, host_ids)
+
+
+async def _close_daemon_sockets(host_ids: Sequence[str]) -> None:
+    for host_id in host_ids:
+        try:
+            daemon = get_broker().get_daemon_for_host(host_id)
+            if daemon is not None:
+                await asyncio.wait_for(
+                    daemon.websocket.close(code=4001, reason="host revoked"), timeout=1.0
+                )
+        except Exception:
+            log.debug("Could not close daemon socket after account deletion", exc_info=True)
