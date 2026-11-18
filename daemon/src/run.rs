@@ -5059,15 +5059,22 @@ mod tests {
         let epoch = rtc.trust_epoch_for_test();
         let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
-        let supervisor = Box::pin(supervise_connections(
-            origin,
-            ws_url,
-            active,
-            loader,
-            registry,
-            rtc.clone(),
-            store,
-            None,
+        const BLOCKED: &str = "test_no_installation";
+        let supervisor = Box::pin(crate::update::FIXED_CAPABILITY.scope(
+            || crate::update::Capability {
+                self_update: false,
+                blocked: Some(BLOCKED),
+            },
+            supervise_connections(
+                origin,
+                ws_url,
+                active,
+                loader,
+                registry,
+                rtc.clone(),
+                store,
+                None,
+            ),
         ));
         let (retried, retry_seen) = oneshot::channel();
         let peer = async {
@@ -5075,7 +5082,12 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_hdr_async(tcp, SelectDaemonSubprotocol)
                 .await
                 .unwrap();
-            socket.next().await.unwrap().unwrap();
+            let frame = socket.next().await.unwrap().unwrap();
+            let register: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(register["type"], "register");
+            assert_eq!(register["self_update"], false);
+            assert_eq!(register["self_update_blocked"], BLOCKED);
             registered.store(true, Ordering::Release);
             read_started.await.unwrap();
             socket
@@ -5118,6 +5130,9 @@ mod tests {
         tokio::time::timeout(HANDSHAKE_LIVENESS, async { tokio::join!(peer, check) })
             .await
             .unwrap();
+        let mut files = std::fs::read_dir(dir.path()).unwrap();
+        assert_eq!(files.next().unwrap().unwrap().path(), path);
+        assert!(files.next().is_none());
         let state = crate::state::read_path(&path).unwrap().unwrap();
         assert!(!state.connected);
         let error = state.last_error.unwrap();

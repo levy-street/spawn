@@ -643,12 +643,20 @@ mod tests {
     #[test]
     fn heartbeat_path_uses_local_instance_state() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            state_path(dir.path()),
-            crate::service::instance_state_path(dir.path())
-                .unwrap()
-                .join("state.json")
-        );
+        let local = dir.path().join("local");
+        let config = dir.path().join("config");
+        fs::create_dir(&config).unwrap();
+        crate::service::test_local_data::ROOT.sync_scope(local.clone(), || {
+            assert_eq!(
+                state_path(&config),
+                local
+                    .join("spawn")
+                    .join("state")
+                    .join(crate::service::instance_name(&config))
+                    .join("state.json")
+            );
+        });
+        assert!(!local.exists());
     }
 
     #[test]

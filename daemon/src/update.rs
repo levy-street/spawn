@@ -657,7 +657,16 @@ fn release_is_current(
     release_tree == own_tree && !worker_mismatch && own_variant == wanted_variant
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static FIXED_CAPABILITY: fn() -> Capability;
+}
+
 pub fn capability() -> Capability {
+    #[cfg(test)]
+    if let Ok(fixed) = FIXED_CAPABILITY.try_with(|fixed| fixed()) {
+        return fixed;
+    }
     match evaluate_preconditions(Mode::Daemon) {
         Ok(_) => Capability {
             self_update: true,
