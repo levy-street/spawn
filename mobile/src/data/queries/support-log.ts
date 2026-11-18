@@ -23,22 +23,27 @@ export function useSupportLog(accountId: string) {
   });
   const registration = useSyncExternalStore(
     client.getQueryCache().subscribe,
-    () => client.getQueryData<RegisteredPhone>(qk.browserDeviceRegistration(accountId)),
+    () => client.getQueryState<RegisteredPhone>(qk.browserDeviceRegistration(accountId)),
     () => undefined,
   );
-  const [hasIdentity, setHasIdentity] = useState<boolean | null>(null);
+  const local = registration?.data;
+  const removed = !!local?.revoked_at;
+  const deviceId = local?.id;
+  const publicKey = local?.public_key;
+  const [matchingKey, setMatchingKey] = useState<boolean | null>(null);
+  const hasIdentity = registration?.status === "success" ? !removed && matchingKey : null;
   const [message, setMessage] = useState("");
   const available = !!state;
   const panel = useRef<AbortController | null>(null);
   useEffect(() => {
-    if (!available) return;
+    setMatchingKey(null);
+    if (!available || !deviceId || !publicKey || removed) return;
     const controller = new AbortController();
     panel.current = controller;
     const { signal } = controller;
-    setHasIdentity(null);
-    void supportLogDevice(accountId, registration)
+    void supportLogDevice(accountId, deviceId, publicKey)
       .then((signer) => {
-        if (!signal.aborted) setHasIdentity(signer !== null);
+        if (!signal.aborted) setMatchingKey(signer !== null);
       })
       .catch(() => {
         if (!signal.aborted) setMessage(copy.failure);
@@ -47,7 +52,7 @@ export function useSupportLog(accountId: string) {
       controller.abort();
       panel.current = null;
     };
-  }, [registration, accountId, available]);
+  }, [accountId, available, deviceId, publicKey, removed]);
 
   const mutationKey = ["support-log-consent", accountId];
   const busy = useIsMutating({ mutationKey }) > 0;
@@ -62,7 +67,7 @@ export function useSupportLog(accountId: string) {
     networkMode: "always",
     mutationFn: async (enabled: boolean) => {
       const signal = panel.current?.signal;
-      if (!signal || signal.aborted) return;
+      if (!signal || signal.aborted || !deviceId || !publicKey) return;
       if (
         enabled &&
         !(await confirm({
@@ -75,11 +80,11 @@ export function useSupportLog(accountId: string) {
         return;
       if (signal.aborted) return;
       try {
-        const sign = await supportLogDevice(accountId, registration);
+        const sign = await supportLogDevice(accountId, deviceId, publicKey);
         if (signal.aborted) return;
         if (!sign) {
           setMessage("");
-          setHasIdentity(false);
+          setMatchingKey(false);
           return;
         }
         const statement = await sign(client, enabled, signal);

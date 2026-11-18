@@ -1,16 +1,9 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { trust } from "./api";
 import { loadBrowserDeviceIdentity, signSupportLogConsent } from "./browser-device-identity";
-import {
-  type BrowserDeviceRegistrationState,
-  readBrowserDeviceRevocationMarker,
-} from "./browser-device-registration";
+import { readBrowserDeviceRevocationMarker } from "./browser-device-registration";
 import { readSupportLog } from "./support-log";
-import {
-  checkedConsentTime,
-  rememberConsentTime,
-  type SignedSupportLogConsent,
-} from "./support-log-consent";
+import { checkedConsentTime, type SignedSupportLogConsent } from "./support-log-consent";
 
 type Edge = Awaited<ReturnType<typeof trust.accountEndorsements>>[number];
 
@@ -42,14 +35,10 @@ function carriedApprovals(accountId: string, publicKey: string, edges: Edge[]) {
   return carried;
 }
 
-export async function supportLogDevice(
-  accountId: string,
-  registration: BrowserDeviceRegistrationState | undefined,
-) {
-  if (registration?.status !== "ready" || readBrowserDeviceRevocationMarker(accountId)) return null;
-  const local = registration.device;
+export async function supportLogDevice(accountId: string, deviceId: string, publicKey: string) {
+  if (readBrowserDeviceRevocationMarker(accountId)) return null;
   const identity = await loadBrowserDeviceIdentity(accountId);
-  if (!identity || local.revoked_at || local.public_key !== identity.publicKeyWire) return null;
+  if (!identity || publicKey !== identity.publicKeyWire) return null;
 
   return async (
     client: QueryClient,
@@ -61,20 +50,19 @@ export async function supportLogDevice(
       (!cached?.isInvalidated && cached?.data) ||
       (await trust.accountEndorsements().catch(() => []));
     if (signal.aborted) throw new Error("Panel closed");
-    const carried_endorsements = carriedApprovals(accountId, local.public_key, edges);
+    const carried_endorsements = carriedApprovals(accountId, publicKey, edges);
     const fresh = await readSupportLog(accountId, signal);
     if (signal.aborted || readBrowserDeviceRevocationMarker(accountId))
       throw new Error("Device unavailable");
     const statement = {
       version: 1 as const,
       account_id: accountId,
-      signer_device_id: local.id,
-      signer_public_key: local.public_key,
+      signer_device_id: deviceId,
+      signer_public_key: publicKey,
       enabled,
       issued_at_ms: checkedConsentTime(fresh.next_issued_at_ms, accountId),
     };
     const signature = await signSupportLogConsent(identity, statement);
-    rememberConsentTime(accountId, statement.issued_at_ms);
     return { ...statement, signature, carried_endorsements };
   };
 }

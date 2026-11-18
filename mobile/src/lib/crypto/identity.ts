@@ -29,6 +29,7 @@ import { secureStorage } from "@/lib/secure-storage";
 import {
   checkedConsentTime,
   encodeSupportLogConsent,
+  rememberConsentTime,
   type SupportLogConsent,
 } from "./support-log-consent";
 
@@ -271,7 +272,10 @@ export const deviceIdentity = {
     return loaded.publicKey;
   },
 
-  async signSupportLogConsent(statement: SupportLogConsent): Promise<Uint8Array> {
+  async signSupportLogConsent(
+    statement: SupportLogConsent,
+    signal: AbortSignal,
+  ): Promise<Uint8Array> {
     // Only use an existing identity. An ordinary connection may create one.
     const record = await readRecord(statement.account_id);
     if (
@@ -284,10 +288,13 @@ export const deviceIdentity = {
         "Support log consent does not match this device",
       );
     }
-    checkedConsentTime(statement.issued_at_ms, statement.account_id);
     const loaded = validateRecord(record);
     try {
-      return signPureEd25519(loaded.seed, encodeSupportLogConsent(statement));
+      const bytes = encodeSupportLogConsent(statement);
+      if (signal.aborted) throw new Error("Panel closed");
+      checkedConsentTime(statement.issued_at_ms, statement.account_id);
+      rememberConsentTime(statement.account_id, statement.issued_at_ms);
+      return signPureEd25519(loaded.seed, bytes);
     } finally {
       loaded.seed.fill(0);
       loaded.publicKey.fill(0);

@@ -60,7 +60,7 @@ const accountState = z
     collections: z.array(collectionState),
     retention_days: z.literal(7),
   })
-  .refine((state) => state.sharing !== "on" || state.statement !== null);
+  .refine(({ statement, sharing }) => (statement?.enabled ? sharing !== "off" : sharing === "off"));
 export type SupportLogState = z.infer<typeof accountState>;
 
 export async function readSupportLog(
@@ -123,7 +123,10 @@ export function collectionLine(row: SupportLogState["collections"][number]): str
       return copy.waiting.replace("{time}", time).replace("{machine}", () => row.host_name);
     case "declined":
       if (row.decline_code === "not_consented" || row.decline_code === "signer_untrusted") {
-        const line = row.decline_code === "not_consented" ? copy.sharingOff : copy.notAccepted;
+        const line =
+          row.decline_code === "not_consented"
+            ? copy.sharingOff
+            : `${copy.notAccepted} ${copy.signerHelp}`;
         return line.replace("{time}", time).replace("{machine}", () => row.host_name);
       }
   }

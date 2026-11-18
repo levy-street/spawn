@@ -25,6 +25,7 @@ import {
 import {
   checkedConsentTime,
   encodeSupportLogConsent,
+  rememberConsentTime,
   type SupportLogConsent,
 } from "./support-log-consent";
 
@@ -590,8 +591,9 @@ export async function signSupportLogConsent(
       "Support log consent does not match this device",
     );
   }
-  checkedConsentTime(statement.issued_at_ms, statement.account_id);
   const bytes = encodeSupportLogConsent(statement);
+  checkedConsentTime(statement.issued_at_ms, statement.account_id);
+  rememberConsentTime(statement.account_id, statement.issued_at_ms);
   return encodeBase64Url(
     new Uint8Array(await crypto.subtle.sign("Ed25519", record.privateKey, bytes)),
   );

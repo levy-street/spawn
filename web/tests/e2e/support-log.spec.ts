@@ -50,14 +50,15 @@ async function setup(page: Page) {
   });
   const register = page.waitForResponse((r) => r.url().endsWith("/api/browser-devices/register"));
   await page.goto("/hosts");
-  const self = { id: BROWSER_DEVICE_ID, key: (await (await register).json()).public_key as string };
+  const registration = await (await register).json();
+  const self = { id: BROWSER_DEVICE_ID, key: registration.public_key as string };
   const edges: ReturnType<typeof approval>[] = [];
   let approvalReads = 0;
   await page.route("**/api/trust/account-endorsements", (r) => {
     approvalReads++;
     return r.fulfill({ json: edges });
   });
-  return { sockets, edges, self, approvalReads: () => approvalReads };
+  return { sockets, edges, self, registration, approvalReads: () => approvalReads };
 }
 async function consentSigns(page: Page) {
   return page.evaluateHandle(() => {
@@ -82,6 +83,16 @@ for (const [failure, status, body] of [
   ["bad shape", 200, { ...state(), hosts: [{}] }],
   ["201", 201, state()],
   ["on without a statement", 200, { ...state(), sharing: "on" }],
+  ["removed without a statement", 200, { ...state(), sharing: "off_signer_removed" }],
+  ["off with an enabled statement", 200, { ...state("on"), sharing: "off" }],
+  ...(["on", "off_signer_removed"] as const).map(
+    (sharing) =>
+      [
+        `${sharing} with a disabled statement`,
+        200,
+        { ...state(sharing), statement: { ...state(sharing).statement, enabled: false } },
+      ] as const,
+  ),
   ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1].map(
     (time) =>
       [
@@ -217,6 +228,7 @@ test("shows the removed signer, update, ordered history and every reason", async
   await expect(switchFor(page)).not.toBeChecked();
   await expect(switchFor(page)).toBeEnabled();
   await expect(block.getByText(copy.cannotSign)).toHaveCount(0);
+  await expect(block.getByText(copy.help)).toHaveCount(0);
   const rows = block.getByRole("listitem");
   await expect(rows).toHaveCount(data.collections.length);
   const templates = [
@@ -227,7 +239,7 @@ test("shows the removed signer, update, ordered history and every reason", async
     copy.notCollected,
     copy.notCollected,
     copy.notCollected,
-    copy.notAccepted,
+    `${copy.notAccepted} ${copy.signerHelp}`,
     copy.sharingOff,
     copy.notCollected,
     copy.notCollected,
@@ -250,6 +262,38 @@ test("shows the removed signer, update, ordered history and every reason", async
       copy.reason.replace("{reason}", row.reason),
     ]);
   }
+});
+
+test("discovery waits quietly for registration to return the local key", async ({ page }) => {
+  await mockApp(page, { hosts: [] });
+  await page.clock.install({ time: now });
+  const keys: string[] = [];
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  await page.route("**/api/browser-devices/register", async (r) => {
+    keys.push(r.request().postDataJSON().public_key);
+    if (keys.length !== 1) return r.fallback();
+    await pending;
+    return r.fulfill({ status: 503, json: {} });
+  });
+  await page.route("**/api/support-log", (r) => r.fulfill({ json: state() }));
+  await page.goto("/hosts");
+  await openAccount(page);
+  await expect.poll(() => keys.length).toBe(1);
+  await expect(switchFor(page)).toBeDisabled();
+  await expect(page.getByText(copy.cannotSign)).toHaveCount(0);
+  const failed = page.waitForResponse((r) => r.status() === 503);
+  finish();
+  await (await failed).finished();
+  await page.clock.runFor(50);
+  await expect(switchFor(page)).toBeDisabled();
+  await expect(page.getByText(copy.cannotSign)).toHaveCount(0);
+  await page.clock.fastForward(90_000);
+  await expect(switchFor(page)).toBeEnabled();
+  expect(keys).toEqual([keys[0], keys[0]]);
+  await expect(page.getByText(copy.cannotSign)).toHaveCount(0);
 });
 
 test("a browser with a registration but no local key cannot sign", async ({ page }) => {
@@ -289,7 +333,21 @@ test("one confirmed on, immediate off, and the server's returned history", async
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const { edges, self, approvalReads } = await setup(page);
+  const { edges, self, registration, approvalReads } = await setup(page);
+  let refreshes = 0;
+  await page.route("**/api/browser-devices/register", (r) =>
+    r.fulfill({
+      json: { ...registration, last_seen_at: new Date(now + ++refreshes).toISOString() },
+    }),
+  );
+  const refreshRegistration = async () => {
+    const refreshed = page.waitForResponse((r) =>
+      r.url().endsWith("/api/browser-devices/register"),
+    );
+    await page.clock.fastForward(90_000);
+    await (await refreshed).finished();
+    await page.clock.runFor(50);
+  };
   const peers = Array.from({ length: 9 }, peer);
   const path = peers.map((from, i) => approval(from, peers[i - 1] ?? self));
   const branch = approval(peer(), self);
@@ -310,6 +368,7 @@ test("one confirmed on, immediate off, and the server's returned history", async
   });
   await openAccount(page);
   await expect(page.getByText(copy.empty)).toBeVisible();
+  await expect(page.getByText(copy.help)).toBeVisible();
   const toggle = switchFor(page);
   await toggle.click();
   const dialog = page.getByRole("dialog", { name: copy.confirmTitle });
@@ -318,10 +377,13 @@ test("one confirmed on, immediate off, and the server's returned history", async
   expect(sent).toHaveLength(0);
   expect(approvalReads()).toBe(0);
   await toggle.click();
+  await expect(dialog).toBeVisible();
+  await refreshRegistration();
   await dialog.getByRole("button", { name: copy.turnOn }).click();
   await expect.poll(() => sent.length).toBe(1);
   await expect(toggle).toBeDisabled();
   await toggle.evaluate((el) => (el as HTMLButtonElement).click());
+  await refreshRegistration();
   release();
   await expect(toggle).toBeChecked();
   await expect(page.getByText(copy.sent)).toBeVisible();

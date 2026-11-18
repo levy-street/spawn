@@ -125,7 +125,7 @@ function fixture(initial = state()) {
   });
   const show = () =>
     renderWithProviders(<SupportLogSettings accountId={mockAccount} />, { queryClient: client });
-  return { wire, fetch, show, client };
+  return { wire, fetch, show, client, local };
 }
 
 const storage = new Map<string, string>();
@@ -185,6 +185,16 @@ for (const [failure, status, body] of [
   ["network", 0, null],
   ["201", 201, state()],
   ["on without a statement", 200, { ...state(), sharing: "on" }],
+  ["removed without a statement", 200, { ...state(), sharing: "off_signer_removed" }],
+  ["off with an enabled statement", 200, { ...state("on"), sharing: "off" }],
+  ...(["on", "off_signer_removed"] as const).map(
+    (sharing) =>
+      [
+        `${sharing} with a disabled statement`,
+        200,
+        { ...state(sharing), statement: { ...state(sharing).statement, enabled: false } },
+      ] as const,
+  ),
   ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1].map(
     (time) =>
       [
@@ -258,6 +268,7 @@ test("shows removed signer, host update and all collection outcomes in response 
   await tick();
   expect(screen.getByText(copy.offSignerRemoved)).toBeOnTheScreen();
   expect(screen.getByText(copy.needsUpdate.replace("{machine}", "This machine"))).toBeOnTheScreen();
+  expect(screen.queryByText(copy.help)).toBeNull();
   const templates = [
     copy.waiting,
     copy.waiting,
@@ -267,7 +278,7 @@ test("shows removed signer, host update and all collection outcomes in response 
     copy.notCollected,
     copy.notCollected,
     copy.sharingOff,
-    copy.notAccepted,
+    `${copy.notAccepted} ${copy.signerHelp}`,
     copy.notCollected,
     copy.notCollected,
     copy.notCollected,
@@ -288,7 +299,14 @@ test("shows removed signer, host update and all collection outcomes in response 
 });
 
 test("one confirmed on and immediate off use the server's state and signing time", async () => {
-  const { wire, show, fetch } = fixture();
+  const { wire, show, fetch, client, local } = fixture();
+  const refreshRegistration = (time: number) =>
+    act(() => {
+      client.setQueryData(qk.browserDeviceRegistration(mockAccount), {
+        ...local,
+        last_seen_at: new Date(time).toISOString(),
+      });
+    });
   const peers = Array.from({ length: 9 }, peer);
   const path = peers.map((from, i) => approval(from, peers[i - 1] ?? self));
   const branch = approval(peer(), self);
@@ -310,8 +328,18 @@ test("one confirmed on and immediate off use the server's state and signing time
   jest.mocked(confirm).mockResolvedValueOnce(false);
   await fireEvent.press(toggle());
   expect(wire.put).not.toHaveBeenCalled();
+  expect(screen.getByText(copy.help)).toBeOnTheScreen();
+  let answer!: (yes: boolean) => void;
+  jest.mocked(confirm).mockReturnValueOnce(
+    new Promise((resolve) => {
+      answer = resolve;
+    }),
+  );
   const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
   await fireEvent.press(toggle());
+  await waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
+  await refreshRegistration(now + 1);
+  await act(() => answer(true));
   await waitFor(() => expect(wire.put).toHaveBeenCalledTimes(1));
   expect(confirm).toHaveBeenCalledWith({
     title: copy.confirmTitle,
@@ -340,6 +368,7 @@ test("one confirmed on and immediate off use the server's state and signing time
     ),
   });
   wire.get.mockResolvedValue(response(200, { ...state("on"), next_issued_at_ms: stamp + 1 }));
+  await refreshRegistration(now + 2);
   finish(response(200, state())); // A delayed PUT body must not replace the GET.
   await waitFor(() => expect(toggle()).toBeChecked());
   expect(screen.getByText(copy.sent)).toBeOnTheScreen();
@@ -402,6 +431,37 @@ test.each([
   await waitFor(() => expect(screen.getByText(copy.failure)).toBeOnTheScreen());
   expect(sign).not.toHaveBeenCalled();
   expect(wire.put).not.toHaveBeenCalled();
+});
+
+test("discovery waits quietly for registration to return the local key", async () => {
+  const { client, show, local } = fixture();
+  const queryKey = qk.browserDeviceRegistration(mockAccount);
+  client.removeQueries({ queryKey });
+  let fail!: () => void;
+  const pending = client
+    .fetchQuery({
+      queryKey,
+      retry: false,
+      queryFn: () =>
+        new Promise((_, reject) => {
+          fail = () => reject(new Error());
+        }),
+    })
+    .catch(() => {});
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeDisabled());
+  expect(screen.queryByText(copy.cannotSign)).toBeNull();
+  await act(async () => {
+    fail();
+    await pending;
+  });
+  expect(screen.getByRole("switch")).toBeDisabled();
+  expect(screen.queryByText(copy.cannotSign)).toBeNull();
+  await act(() => {
+    client.setQueryData(queryKey, local);
+  });
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  expect(screen.queryByText(copy.cannotSign)).toBeNull();
 });
 
 test("a phone without a local key cannot send a change", async () => {
@@ -590,6 +650,29 @@ test("closing Account ignores a late approval before signing", async () => {
   await act(() => settle(response(200, wire.edges)));
   expect(sign).not.toHaveBeenCalled();
   expect(fetch).toHaveBeenCalledTimes(2);
+  expect(wire.put).not.toHaveBeenCalled();
+});
+
+test("closing Account during the signer's key read produces no consent signature or PUT", async () => {
+  const { wire, show } = fixture(state("on"));
+  const crypto = jest.spyOn(ed25519, "signPureEd25519");
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  let finish!: () => void;
+  wire.get.mockImplementationOnce(async () => {
+    jest.mocked(secureStorage.get).mockImplementationOnce(
+      (k) =>
+        new Promise((resolve) => {
+          finish = () => resolve(storage.get(k) ?? null);
+        }),
+    );
+    return response(200, state("on"));
+  });
+  await fireEvent.press(screen.getByRole("switch"));
+  await waitFor(() => expect(finish).toBeDefined());
+  await screen.unmount();
+  await act(() => finish());
+  expect(crypto.mock.calls.filter(([, bytes]) => bytes.length === 102)).toHaveLength(0);
   expect(wire.put).not.toHaveBeenCalled();
 });
 

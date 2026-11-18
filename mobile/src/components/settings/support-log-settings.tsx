@@ -87,9 +87,13 @@ function VisibleSupportLog({ accountId }: { accountId: string }) {
           <Text color="mutedForeground">{copy.reason.replace("{reason}", () => row.reason)}</Text>
         </View>
       ))}
-      <Text color="mutedForeground" variant="caption">
-        {copy.help}
-      </Text>
+      {!state.collections.some(
+        (row) => row.state === "declined" && row.decline_code === "signer_untrusted",
+      ) && (
+        <Text color="mutedForeground" variant="caption">
+          {copy.help}
+        </Text>
+      )}
     </SettingsSection>
   );
 }
