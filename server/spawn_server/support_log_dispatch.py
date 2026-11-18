@@ -13,7 +13,12 @@ from sqlalchemy.types import NullType
 from .db import get_sessionmaker
 from .models import SupportLogCollection as Collection
 from .models import _utcnow
-from .support_consent import effective_statement, sharing_on, statement_generation
+from .support_consent import (
+    effective_statement,
+    sharing_on,
+    statement_commit_in_progress,
+    statement_generation,
+)
 from .support_log import (
     ACCOUNT_INTERVAL,
     DISPATCH_LIMIT,
@@ -31,7 +36,7 @@ from .ws.broker import SUPPORT_UNSENT, daemon_wire, get_broker
 log = logging.getLogger("spawn.support_log")
 INTERVAL_SECONDS = 10
 PAGE_SIZE = 32
-SEND_SECONDS = 2
+SEND_SECONDS = 0.250
 SUPPORT_LIMIT = 65536 - 1024
 SYNC_BATCH = 32
 
@@ -185,19 +190,16 @@ class SupportLogPump:
         try:
             if not await mark_dispatched(row.id, now=now, connection_id=conn.id, sent_ms=sent_ms):
                 return False
-            live = not self.stopping and broker.get_daemon_for_host(row.host_id) is conn
-            busy = send_busy(conn)
-            changed = generation != statement_generation(conn.user_id)
-            if not changed and live and not busy:
-                send = conn.send_text(frame)
-            elif changed:
-                conn.support_statement_sent = SUPPORT_UNSENT
-                await transition(row.id, "dispatched", "cancelled", now=now)
-                return False
-            elif not live:
-                return True
-            else:
-                # An ordinary send started during the claim. No collect was attempted.
+            committing = statement_commit_in_progress(conn.user_id)
+            if not committing:
+                if generation != statement_generation(conn.user_id):
+                    conn.support_statement_sent = SUPPORT_UNSENT
+                    await transition(row.id, "dispatched", "cancelled", now=now)
+                    return False
+                if self.stopping or broker.get_daemon_for_host(row.host_id) is not conn:
+                    return True
+            if committing or send_busy(conn):
+                # The claim committed, but no collect was handed to the socket.
                 async with get_sessionmaker()() as session:
                     await session.execute(
                         update(Collection)
@@ -210,7 +212,7 @@ class SupportLogPump:
             claim.set_result(None)
         try:
             async with asyncio.timeout(SEND_SECONDS):
-                await send
+                await conn.send_text(frame)
         except Exception as exc:
             if isinstance(exc, TimeoutError):
                 conn.support_statement_sent = SUPPORT_UNSENT

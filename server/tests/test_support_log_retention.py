@@ -11,6 +11,7 @@ import sys
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -192,7 +193,7 @@ async def test_account_deletion_removes_files_and_cascades(
     monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
     with monkeypatch.context() as m:
         if failure == "unlink":
-            m.setattr(storage, "remove", Mock(side_effect=OSError))
+            m.setattr(support_log_files, "_unlink", Mock(side_effect=OSError))
         elif failure == "marker":
             os.removexattr(storage.fd, support_log_files.STORE_ATTRIBUTE)
         elif failure == "mode":
@@ -210,12 +211,15 @@ async def test_account_deletion_removes_files_and_cascades(
             deadline = asyncio.timeout(None)
             timeout = asyncio.timeout
 
-            def held_worker(ids, cutoff):
-                loop.call_soon_threadsafe(entered.set)
-                release.wait(30)
-                loop.call_soon_threadsafe(finished.set)
+            def held_worker(parent, ids, cutoff, stopping):
+                try:
+                    loop.call_soon_threadsafe(entered.set)
+                    release.wait(30)
+                finally:
+                    os.close(parent)
+                    loop.call_soon_threadsafe(finished.set)
 
-            m.setattr(storage, "remove_committed", held_worker)
+            m.setattr(support_log_files, "_remove_committed", held_worker)
             m.setattr(asyncio, "timeout", lambda delay: deadline if delay == 2 else timeout(delay))
         try:
             response = await asyncio.wait_for(
@@ -233,11 +237,15 @@ async def test_account_deletion_removes_files_and_cascades(
                 await asyncio.wait_for(entered.wait(), 30)
                 assert not finished.is_set() and storage.path(record_id).exists()
                 deadline.reschedule(loop.time())
-            await asyncio.wait_for(asyncio.gather(*support_log_retention._cleanup_tasks), 30)
+            waiters = [task for task in storage.cleanup_tasks if isinstance(task, asyncio.Task)]
+            await asyncio.wait_for(asyncio.gather(*waiters), 30)
+            if failure == "timeout":
+                assert len(storage.cleanup_tasks) == 1 and not finished.is_set()
         finally:
             if failure == "timeout":
                 release.set()
                 await asyncio.wait_for(finished.wait(), 30)
+                await asyncio.wait_for(asyncio.gather(*storage.cleanup_tasks), 30)
             elif failure == "marker":
                 os.setxattr(storage.fd, support_log_files.STORE_ATTRIBUTE, support_log_files.STORE_VERSION)
             elif failure == "mode":
@@ -443,13 +451,97 @@ async def test_each_lifespan_checks_storage(lifespan_db, tmp_path, monkeypatch, 
             directory.unlink()
 
 
+async def test_shutdown_bounds_cleanup_with_worker_still_holding_lock(
+    lifespan_db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "storage"))
+    app = main.create_app()
+    ready, shutdown = asyncio.Event(), asyncio.Event()
+    start_sweep, contended = asyncio.Event(), asyncio.Event()
+    locked = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    async def sweep(store, **kwargs):
+        await start_sweep.wait()
+        await sweep_once(store, **kwargs)
+
+    async def serve():
+        async with app.router.lifespan_context(app):
+            ready.set()
+            await shutdown.wait()
+
+    monkeypatch.setattr(support_log_retention, "sweep_once", sweep)
+    server = asyncio.create_task(serve())
+    try:
+        await asyncio.wait_for(ready.wait(), 30)
+        store = get_store(app)
+        bundle = store.path(str(uuid.uuid4()))
+        bundle.touch()
+        try_lock = support_log_files._try_store_lock
+
+        def hold_cleanup_lock(parent):
+            fd = try_lock(parent)
+            if parent == store.fd:
+                assert fd is None
+                loop.call_soon_threadsafe(contended.set)
+            else:
+                assert fd is not None
+                loop.call_soon_threadsafe(locked.set)
+                release.wait(30)
+            return fd
+
+        monkeypatch.setattr(support_log_files, "_try_store_lock", hold_cleanup_lock)
+        timeout = asyncio.timeout
+        cleanup_deadline = timeout(None)
+        monkeypatch.setattr(
+            asyncio, "timeout", lambda delay: cleanup_deadline if delay == 2 else timeout(delay)
+        )
+        await support_log_retention.start_file_cleanup(store, [bundle.stem])
+        await asyncio.wait_for(locked.wait(), 30)
+        cleanup_deadline.reschedule(loop.time())
+        (waiter,) = (job for job in store.cleanup_tasks if isinstance(job, asyncio.Task))
+        await asyncio.wait_for(waiter, 30)
+        (worker,) = store.cleanup_tasks
+        start_sweep.set()
+        await asyncio.wait_for(contended.wait(), 30)
+
+        # Hold the real asyncio.wait timer until the test delivers its deadline.
+        call_later = loop.call_later
+        deadline = loop.create_future()
+
+        def hold_shutdown_deadline(delay, callback, *args, **kwargs):
+            if delay == 2:
+                deadline.set_result(partial(callback, *args))
+                delay = 30
+            return call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", hold_shutdown_deadline)
+        shutdown.set()
+        expire = await asyncio.wait_for(deadline, 30)
+        assert not server.done() and not worker.done() and store.fd is not None
+        expire()
+        await asyncio.wait_for(server, 30)
+        assert store.fd is None and store.cleanup_tasks == {worker}
+        await support_log_retention.start_file_cleanup(store, [bundle.stem])
+        assert store.cleanup_tasks == {worker}
+        release.set()
+        await asyncio.wait_for(worker, 30)
+        assert not store.cleanup_tasks and bundle.exists()
+    finally:
+        release.set()
+        start_sweep.set()
+        shutdown.set()
+        await asyncio.wait_for(server, 30)
+
+
 async def test_startup_and_periodic_sweep(lifespan_db, tmp_path, monkeypatch):
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "storage"))
     first, second = asyncio.Event(), asyncio.Event()
     calls = []
 
-    async def sweep(store):
-        await sweep_once(store)
+    async def sweep(store, **kwargs):
+        await sweep_once(store, **kwargs)
         calls.append(store)
         (first if len(calls) == 1 else second).set()
 
@@ -578,7 +670,7 @@ async def test_upload_during_account_deletion(file_sqlite_client, storage, monke
         proceed.set()
     result = await asyncio.wait_for(deletion, 30)
     assert result.status_code == 204
-    await asyncio.wait_for(asyncio.gather(*retention._cleanup_tasks), 30)
+    await asyncio.wait_for(asyncio.gather(*storage.cleanup_tasks), 30)
     assert not list(storage.root.iterdir())
     assert await get_collection(record_id) is None
 

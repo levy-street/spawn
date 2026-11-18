@@ -1,6 +1,7 @@
 """Durable pacing and ordered, single-attempt delivery."""
 
 import asyncio
+import sqlite3
 import threading
 import uuid
 from contextlib import AsyncExitStack
@@ -8,7 +9,9 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiosqlite import Connection
 from sqlalchemy import delete, event, select, text
+from sqlalchemy.exc import OperationalError
 from websockets.legacy.server import WebSocketServerProtocol
 from websockets.protocol import State
 
@@ -21,7 +24,12 @@ from spawn_server import (
 from spawn_server.config import get_settings
 from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogCollection, _utcnow
-from spawn_server.support_consent import store_statement
+from spawn_server.support_consent import (
+    get_statement,
+    statement_commit_in_progress,
+    statement_generation,
+    store_statement,
+)
 from spawn_server.support_log import (
     RequestRefusal,
     RequestRefused,
@@ -595,7 +603,7 @@ async def test_failed_sync_retries_only_that_connection(
                 await asyncio.wait_for(entered.wait(), 30)
                 assert (await asyncio.wait_for(healthy.get(), 30))["consent"] == value
                 seconds, deadline = send_deadlines[stalled[0]]
-                assert seconds == 2
+                assert seconds == 0.250
                 deadline.reschedule(asyncio.get_running_loop().time())
             await asyncio.wait_for(task, 30)
         assert conn.support_statement_sent is SUPPORT_UNSENT and frames.empty()
@@ -639,7 +647,7 @@ async def test_stall_in_each_send_batch_still_reduces_and_dispatches(
             hosts.append((frames, conn))
         queued = await request(owner, hosts[-1][1].host_id)
         await pump.run_once()
-        assert stalled == [2, 2]
+        assert stalled == [0.250, 0.250]
         for frames, conn in hosts[::2]:
             assert frames.empty() and conn.support_statement_sent is SUPPORT_UNSENT
         for frames, _ in hosts[1::2]:
@@ -813,6 +821,96 @@ async def test_statement_change_after_claim_cancels_on_same_socket(app, pump, po
         assert frames.get_nowait()["consent"] == newer and frames.empty()
 
 
+@pytest.mark.parametrize("notify_first", [False, True])
+async def test_collect_while_sqlite_commit_notification_is_held(
+    app, file_sqlite_client, pump, post_claim, monkeypatch, notify_first
+):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    host = await capable(owner)
+    queued = await request(owner, host)
+    newer = sign({**value, "issued_at_ms": 1001}, key)
+    generation = statement_generation(owner)
+    claimed, release_claim = post_claim
+    committed, notify = asyncio.Event(), asyncio.Event()
+    commit = Connection.commit
+
+    async def hold_notification(connection):
+        await commit(connection)
+        if not committed.is_set():
+            committed.set()
+            await notify.wait()
+
+    async with connected(app, owner, host, supports_support_log=True) as (_, frames, _):
+        frames.get_nowait()
+        scan = asyncio.create_task(pump.run_once())
+        await asyncio.wait_for(claimed.wait(), 30)
+        assert frames.get_nowait()["consent"] == value
+        monkeypatch.setattr(Connection, "commit", hold_notification)
+        writer = asyncio.create_task(store_statement(owner, newer))
+        try:
+            await asyncio.wait_for(committed.wait(), 30)
+            assert await get_statement(owner) == newer
+            assert statement_generation(owner) == generation and statement_commit_in_progress(owner)
+            if notify_first:
+                notify.set()
+                await asyncio.wait_for(writer, 30)
+            release_claim.set()
+            await asyncio.wait_for(scan, 30)
+            record = await get_collection(queued)
+            assert frames.empty()
+            if notify_first:
+                assert record.state == "cancelled"
+            else:
+                assert record.state == "requested" and record.dispatched_at is None
+        finally:
+            notify.set()
+            release_claim.set()
+            await asyncio.wait_for(asyncio.gather(writer, scan), 30)
+        assert statement_generation(owner) == generation + 1
+        assert not statement_commit_in_progress(owner)
+        await pump.run_once()
+        assert frames.get_nowait()["consent"] == newer
+        if not notify_first:
+            assert frames.get_nowait()["request_id"] == queued
+        assert frames.empty()
+
+
+@pytest.mark.parametrize("cancel_caller", [True, False])
+async def test_statement_commit_marker_clears_on_cancellation_or_failure(
+    file_sqlite_client, monkeypatch, cancel_caller
+):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    newer = sign({**value, "issued_at_ms": 1001}, key)
+    generation = statement_generation(owner)
+    entered, release = asyncio.Event(), asyncio.Event()
+    commit = Connection.commit
+
+    async def held_commit(connection):
+        entered.set()
+        await release.wait()
+        if not cancel_caller:
+            raise sqlite3.OperationalError("commit failed")
+        await commit(connection)
+
+    monkeypatch.setattr(Connection, "commit", held_commit)
+    writer = asyncio.create_task(store_statement(owner, newer))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        if cancel_caller:
+            writer.cancel()
+            await asyncio.sleep(0)
+        assert statement_commit_in_progress(owner)
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError if cancel_caller else OperationalError):
+            await asyncio.wait_for(writer, 30)
+    assert not statement_commit_in_progress(owner)
+    assert statement_generation(owner) == generation + int(cancel_caller)
+    assert await get_statement(owner) == (newer if cancel_caller else value)
+
+
 async def test_send_lock_taken_during_claim_defers_request(app, pump, post_claim):
     value, _ = await seed_statement()
     owner = value["account_id"]
@@ -934,23 +1032,41 @@ async def test_ordinary_and_support_writes_on_paused_transport(
             await pump.sync_statements()
             assert frames.get_nowait()["consent"] == value
 
-        # Real frame encoding, transport write and paused drain, entirely in memory.
+        # Leave room for the heartbeat alone. The encoded support frame crosses
+        # this high-water mark and pauses the real protocol's drain.
         writes = asyncio.Queue()
+        room = 64 if first == "support" else 0
 
         def write(data):
+            nonlocal room
+            if 0 <= room < len(data):
+                protocol.pause_writing()
+            room -= len(data)
             writes.put_nowait((asyncio.current_task(), data))
 
         protocol = WebSocketServerProtocol(AsyncMock(), Mock())
         protocol.state = State.OPEN
         protocol.transfer_data_task = asyncio.get_running_loop().create_future()
         protocol.transport = Mock(is_closing=lambda: False, write=write)
-        protocol.pause_writing()
         monkeypatch.setattr(ws, "send_text", protocol.send)
+        # Drive the ordinary path's wait_for deadline by event as well. Keep
+        # the longer test watchdogs live so a missing write fails the test.
+        wait_for = asyncio.wait_for
+
+        async def controlled_wait(awaitable, timeout):
+            if timeout == 2:
+                async with asyncio.timeout(timeout):
+                    return await awaitable
+            return await wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", controlled_wait)
         started, sent = asyncio.Event(), asyncio.Event()
         send = conn.send_text
 
         async def observe(frame):
             if frame["type"] == ordinary:
+                seconds, _ = send_deadlines[asyncio.current_task()]
+                assert seconds == 2
                 started.set()
             await send(frame)
             if frame["type"] == ordinary:
@@ -974,7 +1090,7 @@ async def test_ordinary_and_support_writes_on_paused_transport(
             scan = asyncio.create_task(pump.run_once())
             writer, data = await asyncio.wait_for(writes.get(), 30)
             assert support.encode() in data
-            assert protocol._drain_waiter is not None and not protocol._drain_waiter.done()
+            assert room < 0
             assert get_engine().sync_engine.pool.checkedout() == 0
             traffic = asyncio.create_task(ordinary_frame())
         try:
@@ -982,7 +1098,7 @@ async def test_ordinary_and_support_writes_on_paused_transport(
             assert writes.empty() and conn.send_lock.locked()
             if first == "support":
                 seconds, deadline = send_deadlines[writer]
-                assert seconds == 2
+                assert seconds == 0.250
                 deadline.reschedule(asyncio.get_running_loop().time())
                 _, data = await asyncio.wait_for(writes.get(), 30)
                 assert ordinary.encode() in data
@@ -997,13 +1113,16 @@ async def test_ordinary_and_support_writes_on_paused_transport(
         assert sent.is_set() and writes.empty()
         assert conn.support_registered_bytes == size
 
-        # Compare the same ordinary operation on the same paused transport with the pump idle.
+        # Give the ordinary frame the same initial capacity with the pump idle.
         sent.clear()
-        protocol.pause_writing()
+        room = 64 if first == "support" else 0
         baseline = asyncio.create_task(ordinary_frame())
         try:
             _, ordinary_only = await asyncio.wait_for(writes.get(), 30)
         finally:
-            protocol.resume_writing()
+            if room < 0:
+                protocol.resume_writing()
             await asyncio.wait_for(baseline, 30)
         assert ordinary_only == data and sent.is_set() and writes.empty()
+        if first == "support" and ordinary == "host.heartbeat":
+            assert room >= 0

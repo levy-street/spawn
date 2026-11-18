@@ -19,7 +19,6 @@ log = logging.getLogger("spawn.support_log")
 BATCH = 100
 INTERVAL_SECONDS = 15 * 60
 CLEANUP_SECONDS = 2
-_cleanup_tasks: set[asyncio.Task] = set()
 
 
 async def delete_collected(store, record_id: str, *, now: datetime | None = None):
@@ -28,9 +27,11 @@ async def delete_collected(store, record_id: str, *, now: datetime | None = None
     await transition(record_id, "collected", "deleted", now=now)
 
 
-async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
+async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH, stop=None):
     now = now or _utcnow()
-    async with store.locked():
+    async with store.locked(stop) as acquired:
+        if not acquired:
+            return
         async with get_sessionmaker()() as session:
             expired = (
                 await session.scalars(
@@ -113,22 +114,36 @@ async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
             await asyncio.to_thread(store.unlink, name)
 
 
+def _track_cleanup(pending, future):
+    pending.add(future)
+
+    def finished(done):
+        pending.discard(done)
+        if not done.cancelled():
+            done.exception()  # The waiter may already have timed out.
+
+    future.add_done_callback(finished)
+    return future
+
+
 async def remove_files(store, ids):
     # Try the lock once. A slow filesystem cannot delay the caller past
     # the deadline. The worker owns its locked descriptor until it finishes.
     try:
+        if store.cleanup_stopping.is_set():
+            return
         deadline = time.monotonic() + CLEANUP_SECONDS
+        worker = _track_cleanup(store.cleanup_tasks, store.submit_cleanup(ids, deadline))
         async with asyncio.timeout(CLEANUP_SECONDS):
-            await asyncio.to_thread(store.remove_committed, ids, deadline)
+            await asyncio.shield(worker)
     except Exception:
         log.error("SPAWN D support log file cleanup failed; sweep will retry")
 
 
 async def start_file_cleanup(store, ids):
     """Called after the delete response has been sent. The sweep covers interruptions."""
-    task = asyncio.create_task(remove_files(store, ids))
-    _cleanup_tasks.add(task)
-    task.add_done_callback(_cleanup_tasks.discard)
+    if not store.cleanup_stopping.is_set():
+        _track_cleanup(store.cleanup_tasks, asyncio.create_task(remove_files(store, ids)))
 
 
 async def account_file_ids(session, user_id: str):
@@ -152,7 +167,7 @@ async def run_sweeps(store, stop: asyncio.Event):
     try:
         while not stop.is_set():
             try:
-                await finish_job(sweep_once(store))
+                await finish_job(sweep_once(store, stop=stop))
             except Exception:
                 log.error("SPAWN D support log retention pass failed")
             try:
@@ -160,6 +175,9 @@ async def run_sweeps(store, stop: asyncio.Event):
             except TimeoutError:
                 pass
     finally:
+        store.cleanup_stopping.set()
+        if store.cleanup_tasks:
+            await asyncio.wait(store.cleanup_tasks, timeout=CLEANUP_SECONDS)
         await asyncio.to_thread(store.close)
 
 

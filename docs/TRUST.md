@@ -266,9 +266,10 @@ out of storage, but the daemon independently decides whether the owner's
 statement and signer are valid. Removing the signing device makes server-side
 sharing checks false immediately, without erasing or rewriting the signed row.
 The server process is the only writer of sharing statements. The app route
-runs in that process. If a statement changes after a request is claimed and
-before it is sent, the pump cancels the request. The operator can request again
-under the usual pacing limits.
+runs in that process. While a statement commit is in progress, an unsent claim
+returns to requested for a later pass. If the pump sees a completed statement
+change between claim and handoff, it cancels the request. The operator can
+request again under the usual pacing limits.
 A collect already handed to the socket cannot be recalled.
 A collect already claimed can still be sent just after a device removal commits.
 The daemon learns of the removal through its ordinary trust update. At the

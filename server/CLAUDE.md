@@ -99,9 +99,16 @@ that needs it. A signed off is sent intact. Missing consent or an on whose signe
 has left the account is sent as null. A host can skip intermediate changes.
 The daemon accepts this frame after `registered`. The wire document describes
 delivery inside `registered` and should be aligned when the daemon next changes.
-The pump skips busy connections. Each send uses the ordinary connection lock
-and has a two-second deadline. The pump retries a missed statement on a later pass. Next
-the pump cancels open requests for accounts whose sharing is off. It then
+The pump skips connections whose send lock is held or has waiters. Each
+support send has a 250 ms deadline on that lock. A timeout makes the pump
+resend the current statement on a later pass. An ordinary frame can lose up
+to 250 ms of its two-second deadline waiting for a support send to release the
+lock. On a connection whose write buffer is already close to its limit, the
+support frame's bytes can make the next ordinary frame wait for the buffer
+to drain. That connection is already failing to keep up. If this is observed,
+switch support sharing off for the affected account or host.
+
+Next the pump cancels open requests for accounts whose sharing is off. It then
 checks pending requests against the enabled statement sent on this connection.
 
 The released daemon denies sharing until its process restarts if an ordinary
@@ -138,8 +145,10 @@ sent there, commits the conditional transition, then sends `support_log.collect`
 with the request ID and a window of 60 to 259200 seconds. A failed send stays
 dispatched until retention closes it. The server sends each request at most once.
 The server process is the only writer of statements. The app route runs in
-that process. If a new statement commits between the claim and the send,
-the pump cancels the request. The operator can request again under the usual
+that process. While a statement commit is in progress, the pump returns an
+unsent claim to requested for a later pass. If the pump sees a completed
+statement change between claim and handoff, it cancels the request.
+The operator can request again under the usual
 pacing limits. A collect already handed to the socket cannot be recalled.
 The daemon and upload route still apply the checks above.
 
@@ -214,7 +223,10 @@ cancels open requests and marks collected records deleted in the same commit.
 File cleanup then uses only those record IDs. Account deletion reads its file
 IDs and commits both ordinary deletes. After the response, a background task
 tries the verified directory lock once and has two seconds to remove the
-files. The orphan sweep removes leftovers after its grace period.
+files. Shutdown stops new cleanup and waits up to two seconds for active
+cleanup before closing the store. A filesystem call still in progress owns
+its directory descriptor and the worker stops before the next file. The
+orphan sweep removes leftovers after its grace period.
 
 HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
 first NDJSON object is the header and is excluded from the event count. The

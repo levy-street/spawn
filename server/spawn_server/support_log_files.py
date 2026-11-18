@@ -13,8 +13,10 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -57,6 +59,55 @@ def _lock_directory(root: Path, flags: int, *, parent=None) -> int:
     return fd
 
 
+def _try_store_lock(parent):
+    try:
+        fd = _lock_directory(".", fcntl.LOCK_EX | fcntl.LOCK_NB, parent=parent)
+    except BlockingIOError:
+        return None
+    try:
+        _verify_identity(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _unlink(name, dir_fd):
+    if not STORE_FILE.fullmatch(name):
+        raise ValueError("Unrecognized support file name")
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _remove_committed(parent, ids, deadline, stopping):
+    # Both descriptors belong to this worker, even if a syscall outlasts shutdown.
+    try:
+        if stopping.is_set():
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        fd = _try_store_lock(parent)
+    finally:
+        os.close(parent)
+    if fd is None:
+        raise BlockingIOError("Support store is busy")
+    try:
+        for record_id in ids:
+            if stopping.is_set():
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            try:
+                canonical_uuid(record_id)
+                _unlink(f"{record_id}.ndjson", fd)
+            except Exception:
+                log.error("SPAWN D support log file cleanup failed; sweep will retry")
+    finally:
+        os.close(fd)
+
+
 async def finish_job(awaitable):
     """Do not abandon an in-flight disk write or its database finalization."""
     task = asyncio.ensure_future(awaitable)
@@ -73,6 +124,10 @@ class SupportLogFiles:
     def __init__(self, root: Path):
         self.root = root
         self._entries = None
+        self.cleanup_tasks: set[asyncio.Future] = set()
+        self.cleanup_stopping = threading.Event()
+        # A stalled cleanup must leave the sweep a thread to close the store.
+        self._cleanup_executor = ThreadPoolExecutor(max_workers=1)
         self.fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
     def path(self, record_id: str) -> Path:
@@ -83,22 +138,16 @@ class SupportLogFiles:
         parent = self.fd
         if parent is None:
             raise OSError("Support store is closed")
-        try:
-            fd = _lock_directory(".", fcntl.LOCK_EX | fcntl.LOCK_NB, parent=parent)
-            try:
-                _verify_identity(fd)
-                return fd
-            except BaseException:
-                os.close(fd)
-                raise
-        except BlockingIOError:
-            return None
+        return _try_store_lock(parent)
 
     @asynccontextmanager
-    async def locked(self):
+    async def locked(self, stop=None):
         fd = None
         try:
             while fd is None:
+                if stop is not None and stop.is_set():
+                    yield False
+                    return
                 # Nonblocking flock; no worker thread waits for another request.
                 attempt = asyncio.create_task(asyncio.to_thread(self._try_lock))
                 try:
@@ -108,8 +157,14 @@ class SupportLogFiles:
                     fd = await attempt
                     raise
                 if fd is None:
-                    await asyncio.sleep(0.01)
-            yield
+                    if stop is None:
+                        await asyncio.sleep(0.01)
+                    else:
+                        try:
+                            await asyncio.wait_for(stop.wait(), timeout=0.01)
+                        except TimeoutError:
+                            pass
+            yield True
         finally:
             if fd is not None:
                 os.close(fd)
@@ -131,30 +186,19 @@ class SupportLogFiles:
     def remove(self, record_id: str, *, dir_fd=None):
         self.unlink(self.path(record_id).name, dir_fd=dir_fd)
 
-    def remove_committed(self, ids, deadline):
-        if time.monotonic() >= deadline:
-            raise TimeoutError
-        fd = self._try_lock()
-        if fd is None:
-            raise BlockingIOError("Support store is busy")
+    def submit_cleanup(self, ids, deadline):
+        parent = os.dup(self.fd)
         try:
-            for record_id in ids:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError
-                try:
-                    self.remove(record_id, dir_fd=fd)
-                except Exception:
-                    log.error("SPAWN D support log file cleanup failed; sweep will retry")
-        finally:
-            os.close(fd)
+            return asyncio.get_running_loop().run_in_executor(
+                self._cleanup_executor, _remove_committed, parent, ids, deadline,
+                self.cleanup_stopping,
+            )
+        except BaseException:
+            os.close(parent)
+            raise
 
     def unlink(self, name, *, dir_fd=None):
-        if not STORE_FILE.fullmatch(name):
-            raise ValueError("Unrecognized support file name")
-        try:
-            os.unlink(name, dir_fd=self.fd if dir_fd is None else dir_fd)
-        except FileNotFoundError:
-            pass
+        _unlink(name, self.fd if dir_fd is None else dir_fd)
 
     def read(self, record_id, limit):
         fd = os.open(
@@ -188,6 +232,8 @@ class SupportLogFiles:
         return result
 
     def close(self):
+        self.cleanup_stopping.set()
+        self._cleanup_executor.shutdown(wait=False)
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None

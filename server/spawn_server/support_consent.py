@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 import uuid
+from collections import Counter
 from enum import StrEnum
 
 from cryptography.exceptions import InvalidSignature
@@ -29,10 +30,15 @@ MAGIC = b"SPAWN-SUPPORT-LOG-CONSENT-V1"
 U64_MAX = (1 << 64) - 1
 FUTURE_MS = 86_400_000
 _statement_generations: dict[str, int] = {}
+_statement_commits: Counter[str] = Counter()
 
 
 def statement_generation(user_id: str) -> int:
     return _statement_generations.get(user_id, 0)
+
+
+def statement_commit_in_progress(user_id: str) -> bool:
+    return _statement_commits[user_id] > 0
 
 
 class ConsentReason(StrEnum):
@@ -231,6 +237,7 @@ async def store_statement(
     user_id: str, value: dict | bytes, *, clock_ms: int | None = None, store=None
 ):
     from .support_log import cancel_open
+    from .support_log_files import finish_job
     from .support_log_retention import remove_files
 
     statement = await asyncio.to_thread(verify_statement, value)
@@ -303,7 +310,19 @@ async def store_statement(
         def advance_generation(_session):
             _statement_generations[user_id] = statement_generation(user_id) + 1
 
-        await session.commit()
+        # SQLite may commit on its worker before after_commit runs on this loop.
+        # Even if the caller is cancelled, let this commit publish its outcome.
+        _statement_commits[user_id] += 1
+        try:
+            await finish_job(session.commit())
+        except Exception:
+            # A failed SQLite commit may leave a transaction on the pooled connection.
+            await session.rollback()
+            raise
+        finally:
+            _statement_commits[user_id] -= 1
+            if not _statement_commits[user_id]:
+                del _statement_commits[user_id]
     if store is not None and files:
         await remove_files(store, files)
     return statement
