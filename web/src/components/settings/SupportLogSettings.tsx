@@ -77,9 +77,7 @@ function VisibleSupportLog({ accountId }: { accountId: string }) {
           ))}
         </ul>
       )}
-      {!state.collections.some(
-        (row) => row.state === "declined" && row.decline_code === "signer_untrusted",
-      ) && <p className="text-muted-foreground">{copy.help}</p>}
+      <p className="text-muted-foreground">{copy.help}</p>
     </section>
   );
 }

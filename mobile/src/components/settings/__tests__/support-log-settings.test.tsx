@@ -268,7 +268,7 @@ test("shows removed signer, host update and all collection outcomes in response 
   await tick();
   expect(screen.getByText(copy.offSignerRemoved)).toBeOnTheScreen();
   expect(screen.getByText(copy.needsUpdate.replace("{machine}", "This machine"))).toBeOnTheScreen();
-  expect(screen.queryByText(copy.help)).toBeNull();
+  expect(screen.getByText(copy.help)).toBeOnTheScreen();
   const templates = [
     copy.waiting,
     copy.waiting,
@@ -462,6 +462,20 @@ test("discovery waits quietly for registration to return the local key", async (
   });
   await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
   expect(screen.queryByText(copy.cannotSign)).toBeNull();
+});
+
+test("a successful registration retries a failed local key read", async () => {
+  const { client, show, local } = fixture();
+  const lookup = jest.spyOn(deviceIdentity, "publicKey").mockRejectedValueOnce(new Error());
+  const screen = await show();
+  await waitFor(() => expect(screen.getByText(copy.failure)).toBeOnTheScreen());
+  expect(screen.getByRole("switch")).toBeDisabled();
+  await act(() => {
+    client.setQueryData(qk.browserDeviceRegistration(mockAccount), local);
+  });
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  expect(lookup).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText(copy.failure)).toBeNull();
 });
 
 test("a phone without a local key cannot send a change", async () => {

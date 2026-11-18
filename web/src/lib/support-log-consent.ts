@@ -21,6 +21,7 @@ export interface SupportLogConsent {
 
 // Highest stored or signed time seen in this app instance, including across panel opens.
 const newestTime = new Map<string, number>();
+const inFlight = new Map<string, Set<number>>();
 
 export function rememberConsentTime(accountId: string, time: number) {
   if (time > (newestTime.get(accountId) ?? -1)) newestTime.set(accountId, time);
@@ -30,11 +31,32 @@ export function checkedConsentTime(value: unknown, accountId: string): number {
   if (
     typeof value !== "number" ||
     !Number.isSafeInteger(value) ||
-    value <= (newestTime.get(accountId) ?? -1) ||
+    value <= Math.max(newestTime.get(accountId) ?? -1, ...(inFlight.get(accountId) ?? [])) ||
     Math.abs(Date.now() - value) > 86_400_000
   )
     throw new Error("Invalid consent time");
   return value;
+}
+
+export async function signAtConsentTime<T>(
+  { account_id, issued_at_ms }: SupportLogConsent,
+  signal: AbortSignal,
+  sign: () => T | Promise<T>,
+): Promise<T> {
+  if (signal.aborted) throw new Error("Panel closed");
+  checkedConsentTime(issued_at_ms, account_id);
+  const reserved = inFlight.get(account_id) ?? new Set<number>();
+  reserved.add(issued_at_ms);
+  inFlight.set(account_id, reserved);
+  try {
+    const signature = await sign();
+    if (signal.aborted) throw new Error("Panel closed");
+    rememberConsentTime(account_id, issued_at_ms);
+    return signature;
+  } finally {
+    reserved.delete(issued_at_ms);
+    if (!reserved.size) inFlight.delete(account_id);
+  }
 }
 
 export function encodeSupportLogConsent(statement: SupportLogConsent) {

@@ -40,24 +40,42 @@ export function useSupportLog(accountId: string) {
   const [message, setMessage] = useState("");
   const available = !!state;
   const panel = useRef<AbortController | null>(null);
+  const retryLookup = useRef<(() => void) | null>(null);
   useEffect(() => {
     setMatchingKey(null);
     if (!available || !deviceId || !publicKey || removed) return;
     const controller = new AbortController();
     panel.current = controller;
     const { signal } = controller;
-    void supportLogDevice(accountId, deviceId, publicKey)
-      .then((signer) => {
-        if (!signal.aborted) setMatchingKey(signer !== null);
-      })
-      .catch(() => {
-        if (!signal.aborted) setMessage(copy.failure);
-      });
+    const lookup = () => {
+      retryLookup.current = null;
+      void supportLogDevice(accountId, deviceId, publicKey)
+        .then((signer) => {
+          if (signal.aborted) return;
+          setMatchingKey(signer !== null);
+          if (!signer) retryLookup.current = lookup;
+        })
+        .catch(() => {
+          if (signal.aborted) return;
+          retryLookup.current = lookup;
+          setMessage(copy.failure);
+        });
+    };
+    lookup();
     return () => {
       controller.abort();
       panel.current = null;
+      retryLookup.current = null;
     };
   }, [accountId, available, deviceId, publicKey, removed]);
+
+  const registrationReads = registration?.dataUpdateCount;
+  useEffect(() => {
+    if (registrationReads && retryLookup.current) {
+      setMessage("");
+      retryLookup.current();
+    }
+  }, [registrationReads]);
 
   const mutationKey = ["support-log-consent", accountId];
   const busy = useIsMutating({ mutationKey }) > 0;

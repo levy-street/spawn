@@ -15,6 +15,7 @@ for (const { consent, transcript_hex, signing_seed_hex } of vectors.positive) {
       require("./browser-device-identity") as typeof import("./browser-device-identity");
     const { checkedConsentTime, encodeSupportLogConsent } =
       require("./support-log-consent") as typeof import("./support-log-consent");
+    const { signal } = new AbortController();
     const clock = spyOn(Date, "now").mockReturnValue(consent.issued_at_ms);
     try {
       for (const delta of [-86_400_000, 86_400_000]) {
@@ -32,7 +33,24 @@ for (const { consent, transcript_hex, signing_seed_hex } of vectors.positive) {
         },
         { indexedDBFactory: new IDBFactory() },
       );
-      expect(await signSupportLogConsent(identity, consent)).toBe(consent.signature);
+      if (!consent.enabled) {
+        const cryptoSign = spyOn(crypto.subtle, "sign").mockRejectedValueOnce(
+          new Error("Sign failed"),
+        );
+        try {
+          await expect(signSupportLogConsent(identity, consent, signal)).rejects.toThrow(
+            "Sign failed",
+          );
+        } finally {
+          cryptoSign.mockRestore();
+        }
+      } else {
+        const closing = new AbortController();
+        const pending = signSupportLogConsent(identity, consent, closing.signal);
+        closing.abort();
+        await expect(pending).rejects.toThrow("Panel closed");
+      }
+      expect(await signSupportLogConsent(identity, consent, signal)).toBe(consent.signature);
       const signature = new Uint8Array(Buffer.from(consent.signature, "base64url"));
       const verify = () => crypto.subtle.verify("Ed25519", identity.publicKey, signature, bytes);
       expect(await verify()).toBe(true);
@@ -50,15 +68,19 @@ for (const { consent, transcript_hex, signing_seed_hex } of vectors.positive) {
         consent.issued_at_ms + 0.5,
       ]) {
         await expect(
-          signSupportLogConsent(identity, { ...consent, issued_at_ms: time }),
+          signSupportLogConsent(identity, { ...consent, issued_at_ms: time }, signal),
         ).rejects.toThrow();
       }
       const overlapping = await Promise.allSettled(
         [2, 2, 1].map((delta) =>
-          signSupportLogConsent(identity, {
-            ...consent,
-            issued_at_ms: consent.issued_at_ms + delta,
-          }),
+          signSupportLogConsent(
+            identity,
+            {
+              ...consent,
+              issued_at_ms: consent.issued_at_ms + delta,
+            },
+            signal,
+          ),
         ),
       );
       expect(overlapping.map((result) => result.status)).toEqual([

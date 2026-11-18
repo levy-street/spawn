@@ -62,7 +62,7 @@ export async function supportLogDevice(accountId: string, deviceId: string, publ
       enabled,
       issued_at_ms: checkedConsentTime(fresh.next_issued_at_ms, accountId),
     };
-    const signature = await signSupportLogConsent(identity, statement);
+    const signature = await signSupportLogConsent(identity, statement, signal);
     return { ...statement, signature, carried_endorsements };
   };
 }

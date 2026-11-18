@@ -38,6 +38,20 @@ for (const { consent, transcript_hex, signing_seed_hex } of vectors.positive) {
     }
     const bytes = encodeSupportLogConsent(consent);
     expect(encodeHex(bytes)).toBe(transcript_hex);
+    if (!consent.enabled) {
+      const crypto = jest.requireActual<typeof import("../ed25519")>("../ed25519");
+      const sign = crypto.signPureEd25519;
+      const cryptoSign = jest
+        .spyOn(crypto, "signPureEd25519")
+        .mockImplementation((seed, message) => {
+          if (message.length === bytes.length) throw new Error("Sign failed");
+          return sign(seed, message);
+        });
+      await expect(deviceIdentity.signSupportLogConsent(consent, signal)).rejects.toThrow(
+        "Sign failed",
+      );
+      cryptoSign.mockRestore();
+    }
     const signature = await deviceIdentity.signSupportLogConsent(consent, signal);
     expect(encodeBase64Url(signature)).toBe(consent.signature);
     const pub = decodeBase64Url(consent.signer_public_key);

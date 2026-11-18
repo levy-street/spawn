@@ -228,7 +228,7 @@ test("shows the removed signer, update, ordered history and every reason", async
   await expect(switchFor(page)).not.toBeChecked();
   await expect(switchFor(page)).toBeEnabled();
   await expect(block.getByText(copy.cannotSign)).toHaveCount(0);
-  await expect(block.getByText(copy.help)).toHaveCount(0);
+  await expect(block.getByText(copy.help)).toBeVisible();
   const rows = block.getByRole("listitem");
   await expect(rows).toHaveCount(data.collections.length);
   const templates = [
@@ -294,6 +294,29 @@ test("discovery waits quietly for registration to return the local key", async (
   await expect(switchFor(page)).toBeEnabled();
   expect(keys).toEqual([keys[0], keys[0]]);
   await expect(page.getByText(copy.cannotSign)).toHaveCount(0);
+});
+
+test("a successful registration retries a failed local key read", async ({ page }) => {
+  const { registration } = await setup(page);
+  const restore = await page.evaluateHandle(() => {
+    const open = indexedDB.open;
+    indexedDB.open = function (name, version) {
+      if (name === "spawn-browser-device-identity") throw new Error("Key unavailable");
+      return open.call(this, name, version);
+    };
+    return () => {
+      indexedDB.open = open;
+    };
+  });
+  await page.route("**/api/support-log", (r) => r.fulfill({ json: state() }));
+  await openAccount(page);
+  await expect(page.getByText(copy.failure)).toBeVisible();
+  await expect(switchFor(page)).toBeDisabled();
+  await restore.evaluate((restore) => restore());
+  await page.route("**/api/browser-devices/register", (r) => r.fulfill({ json: registration }));
+  await page.clock.fastForward(90_000);
+  await expect(switchFor(page)).toBeEnabled();
+  await expect(page.getByText(copy.failure)).toHaveCount(0);
 });
 
 test("a browser with a registration but no local key cannot sign", async ({ page }) => {

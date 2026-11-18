@@ -23,10 +23,9 @@ import {
 } from "./signed-signal";
 
 import {
-  checkedConsentTime,
   encodeSupportLogConsent,
-  rememberConsentTime,
   type SupportLogConsent,
+  signAtConsentTime,
 } from "./support-log-consent";
 
 export const BROWSER_DEVICE_IDENTITY_STORAGE_VERSION = 1;
@@ -579,6 +578,7 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
 export async function signSupportLogConsent(
   identity: BrowserDeviceIdentity,
   statement: SupportLogConsent,
+  signal: AbortSignal,
 ): Promise<string> {
   const record = privateIdentityRecords.get(identity);
   if (
@@ -592,11 +592,10 @@ export async function signSupportLogConsent(
     );
   }
   const bytes = encodeSupportLogConsent(statement);
-  checkedConsentTime(statement.issued_at_ms, statement.account_id);
-  rememberConsentTime(statement.account_id, statement.issued_at_ms);
-  return encodeBase64Url(
-    new Uint8Array(await crypto.subtle.sign("Ed25519", record.privateKey, bytes)),
+  const signature = await signAtConsentTime(statement, signal, () =>
+    crypto.subtle.sign("Ed25519", record.privateKey, bytes),
   );
+  return encodeBase64Url(new Uint8Array(signature));
 }
 
 /**

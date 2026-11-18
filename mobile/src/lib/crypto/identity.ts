@@ -27,10 +27,9 @@ import {
 } from "@/lib/crypto/transcripts";
 import { secureStorage } from "@/lib/secure-storage";
 import {
-  checkedConsentTime,
   encodeSupportLogConsent,
-  rememberConsentTime,
   type SupportLogConsent,
+  signAtConsentTime,
 } from "./support-log-consent";
 
 const IDENTITY_KEY_PREFIX = "spawn.identity.ed25519.v1.";
@@ -291,10 +290,7 @@ export const deviceIdentity = {
     const loaded = validateRecord(record);
     try {
       const bytes = encodeSupportLogConsent(statement);
-      if (signal.aborted) throw new Error("Panel closed");
-      checkedConsentTime(statement.issued_at_ms, statement.account_id);
-      rememberConsentTime(statement.account_id, statement.issued_at_ms);
-      return signPureEd25519(loaded.seed, bytes);
+      return signAtConsentTime(statement, signal, () => signPureEd25519(loaded.seed, bytes));
     } finally {
       loaded.seed.fill(0);
       loaded.publicKey.fill(0);
