@@ -281,7 +281,7 @@ async def test_account_deletion_removes_files_and_cascades(
 
 
 @pytest.mark.parametrize("first_close", ["succeeds", "raises", "hangs"])
-async def test_account_deletion_closes_both_daemons_best_effort(client, broker, first_close):
+async def test_account_deletion_closes_both_daemons_after_response(app, broker, first_close):
     statement, _ = await seed_statement()
     user = await linked_user(statement["account_id"])
     hosts = [Host(owner_user_id=user.id, name="") for _ in range(2)]
@@ -289,28 +289,54 @@ async def test_account_deletion_closes_both_daemons_best_effort(client, broker, 
         session.add_all(hosts)
         await session.commit()
 
-    async def hang(**kwargs):
-        await asyncio.Event().wait()
+    close_started, release_close = asyncio.Event(), asyncio.Event()
 
-    sockets = [Mock(close=AsyncMock()), Mock(close=AsyncMock())]
-    if first_close == "raises":
-        sockets[0].close.side_effect = RuntimeError
-    elif first_close == "hangs":
-        sockets[0].close.side_effect = hang
+    async def close(**kwargs):
+        if close_started.is_set():
+            return
+        close_started.set()
+        await release_close.wait()
+        if first_close == "raises":
+            raise RuntimeError
+
+    sockets = [Mock(close=AsyncMock(side_effect=close)) for _ in hosts]
     for host, socket in zip(hosts, sockets, strict=True):
         await broker.register_daemon(DaemonConn(host.id, user.id, socket))
 
-    response = await asyncio.wait_for(
-        client.post(
-            "/api/account/delete",
-            json={"confirm_email": user.email},
-            headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
-        ),
-        30,
+    # The in-process HTTP client waits for background tasks as well. Observe
+    # what the app actually sent while the first close is still blocked.
+    sent = []
+
+    async def observe_response(scope, receive, send):
+        async def observe_send(message):
+            await send(message)
+            sent.append(message)
+
+        await app(scope, receive, observe_send)
+
+    request = asyncio.create_task(
+        raw_request(
+            observe_response,
+            "",
+            path="/api/account/delete",
+            token=auth.issue_access_token(user.id),
+            body=json.dumps({"confirm_email": user.email}).encode(),
+            extra={"content-type": "application/json"},
+        )
     )
-    assert response.status_code == 204 and response.content == b""
-    assert 'spawn_session=""' in response.headers["set-cookie"]
-    assert "Max-Age=0" in response.headers["set-cookie"]
+    try:
+        await asyncio.wait_for(close_started.wait(), 30)
+        assert not request.done()
+        start, body = sent
+        assert start["type"] == "http.response.start" and start["status"] == 204
+        cookie = dict(start["headers"])[b"set-cookie"]
+        assert b'spawn_session=""' in cookie and b"Max-Age=0" in cookie
+        assert body["type"] == "http.response.body" and body["body"] == b""
+        assert not body.get("more_body", False)
+    finally:
+        if first_close != "hangs":
+            release_close.set()
+        await asyncio.wait_for(request, 30)
     for socket in sockets:
         socket.close.assert_awaited_once_with(code=4001, reason="host revoked")
 

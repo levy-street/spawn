@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -249,6 +250,18 @@ async def delete_account(
     await session.execute(delete(User).where(User.id == owner))
     await session.commit()
 
+    response.delete_cookie(
+        "spawn_session",
+        samesite="lax",
+        secure=get_settings().public_url.startswith("https://"),
+    )
+    if file_ids:
+        background_tasks.add_task(start_file_cleanup, store, file_ids)
+    if host_ids:
+        background_tasks.add_task(_close_daemon_sockets, host_ids)
+
+
+async def _close_daemon_sockets(host_ids: Sequence[str]) -> None:
     for host_id in host_ids:
         try:
             daemon = get_broker().get_daemon_for_host(host_id)
@@ -258,11 +271,3 @@ async def delete_account(
                 )
         except Exception:
             log.debug("Could not close daemon socket after account deletion", exc_info=True)
-
-    response.delete_cookie(
-        "spawn_session",
-        samesite="lax",
-        secure=get_settings().public_url.startswith("https://"),
-    )
-    if file_ids:
-        background_tasks.add_task(start_file_cleanup, store, file_ids)
