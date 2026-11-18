@@ -83,6 +83,7 @@ const mockLoadWorker = new Function(
     "return globalThis.spawnWorker.state;",
   ].join("\n"),
 );
+const mockReload = jest.fn<Promise<void>, []>();
 jest.mock("react-native-webview", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
@@ -91,6 +92,8 @@ jest.mock("react-native-webview", () => {
     default: React.forwardRef(
       (
         props: {
+          onLoad: () => void;
+          onError?: (event: { nativeEvent: { description: string } }) => void;
           onMessage: (event: { nativeEvent: { data: string } }) => void;
         },
         ref,
@@ -120,6 +123,13 @@ jest.mock("react-native-webview", () => {
             scrollToBottom: () => {},
           };
           return {
+            reload() {
+              void mockReload().then(
+                () => latest.current.onLoad(),
+                (error: Error) =>
+                  latest.current.onError?.({ nativeEvent: { description: error.message } }),
+              );
+            },
             postMessage(data: string) {
               window.dispatchEvent(new MessageEvent("message", { data }));
             },
@@ -296,6 +306,30 @@ test("a host failure between attempts replaces the restart notice", async () => 
   expect(screen.getByText("Connection failed")).toBeOnTheScreen();
   await advance(501);
   expect(mockAttachments).toHaveLength(1);
+  expect(notice()).toBeNull();
+  expect(screen.queryByText(hint)).toBeNull();
+});
+
+test("a terminated WebView clears the restart notice even when its reload fails", async () => {
+  const { screen, session, advance, notice, pair } = await openTerminal();
+  const worker = screen.getByTestId("worker");
+  await pair("open", "ctl");
+  await pair("data", "ctl", frame);
+  await pair("close");
+  expect(notice()).toBeOnTheScreen();
+  expect(screen.getByText(hint)).toBeOnTheScreen();
+
+  const reload = Promise.withResolvers<void>();
+  mockReload.mockReturnValueOnce(reload.promise);
+  await fireEvent(worker, "contentProcessDidTerminate");
+  expect(mockReload).toHaveBeenCalledTimes(1);
+  expect(notice()).toBeNull();
+  expect(screen.queryByText(hint)).toBeNull();
+  await advance(500);
+  await act(() => reload.reject(new Error("Reload failed")));
+  expect(mockAttachments).toHaveLength(1);
+  expect(screen.queryClient.getQueryData(qk.session(session.id))).toBe(session);
+  expect(screen.getByTestId("connection-state-closed")).toBeOnTheScreen();
   expect(notice()).toBeNull();
   expect(screen.queryByText(hint)).toBeNull();
 });

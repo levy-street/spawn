@@ -222,6 +222,7 @@ class WebViewSessionTransport implements SessionTransport {
   close(): void {
     if (this.#state === "closed") return;
     this.#workerStarted = false;
+    this.options.attachResultListener?.()?.(false);
     this.#detach();
     for (const unsubscribe of this.#subscriptions.splice(0)) unsubscribe();
     try {
