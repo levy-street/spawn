@@ -46,7 +46,7 @@ import {
 import { cachedListItem } from "@/lib/cached-list-item";
 import { askWindowHost } from "@/lib/conversation-inspect";
 import { remove as removeTile } from "@/lib/grid";
-import { sessionAtShell, sessionTitle } from "@/lib/sessions";
+import { sameSessionRun, sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 
@@ -124,8 +124,15 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   // The same restart the pane offers: the window comes back as what it was
   // opened as, its agent resumed in the same conversation where it can be.
   const restartM = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (confirmed?: Session) => {
       if (!session) throw new Error("This session no longer exists.");
+      if (confirmed) {
+        const current = await sessions.get(sessionId);
+        if (!sameSessionRun(current, confirmed)) {
+          updateSessionCaches(queryClient, current);
+          return;
+        }
+      }
       const definitions = await queryClient
         .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
         .catch(() => []);
@@ -149,10 +156,17 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setErrorMessage(null);
+      getHandle()?.recheckNotRunning();
       requestAnimationFrame(() => getHandle()?.focus());
     },
     onError: (error) => setErrorMessage(String(error)),
   });
+  const notRunning = connInfo?.socketState === "not-running";
+  const restartFromWindow = () => {
+    if (notRunning) {
+      if (session) getHandle()?.recheckNotRunning(() => restartM.mutate(session));
+    } else restartM.mutate(undefined);
+  };
 
   // A command a restart queued for the fresh shell is typed the moment that
   // shell's transport opens — the same drain, behind the same gate, the
@@ -343,7 +357,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             <Pencil className="size-4" aria-hidden />
             Rename
           </DropdownMenuItem>
-          <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
+          <DropdownMenuItem disabled={restartM.isPending} onSelect={restartFromWindow}>
             <RotateCcw className="size-4" aria-hidden />
             Restart
           </DropdownMenuItem>
@@ -400,7 +414,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                   <span className="truncate text-muted-foreground">
                     {agentDisplayName(session.foreground_command)} installed an update.
                   </span>
-                  <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
+                  <Button size="sm" disabled={restartM.isPending} onClick={restartFromWindow}>
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending
                       ? "Restarting…"
@@ -409,12 +423,16 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 </div>
               </div>
             )}
-          {(session.status === "exited" || session.status === "killed") && (
+          {(notRunning || session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 shadow-lg">
-                <p className="text-sm font-medium">Shell exited</p>
+                <p className="text-sm font-medium">
+                  {notRunning
+                    ? `This session is no longer running on ${session.host_name ?? "this host"}.`
+                    : "Shell exited"}
+                </p>
                 <div className="flex gap-2">
-                  <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
+                  <Button size="sm" disabled={restartM.isPending} onClick={restartFromWindow}>
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending ? "Restarting…" : "Restart"}
                   </Button>

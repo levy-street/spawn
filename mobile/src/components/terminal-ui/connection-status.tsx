@@ -58,6 +58,13 @@ export function connectionCopy(state: TransportState): ConnectionCopy {
         variant: "warning-soft",
         busy: true,
       };
+    case "not-running":
+      return {
+        title: "Session stopped",
+        detail: "This session is no longer running on this host.",
+        variant: "outline",
+        busy: false,
+      };
     case "closed":
       return {
         title: "Connection closed",

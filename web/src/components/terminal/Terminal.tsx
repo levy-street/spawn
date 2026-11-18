@@ -122,6 +122,7 @@ const BRACKETED_PASTE_END = "\x1b[201~";
 
 const SOCKET_STATE_COPY: Record<SocketState, string> = {
   idle: "waiting",
+  "not-running": "session stopped",
   connecting: "reconnecting",
   open: "connected",
   closed: "reconnecting",
@@ -197,6 +198,7 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
+  recheckNotRunning(onRefused?: () => void): void;
   /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
   /** Tell the daemon the new TTY size. */
@@ -1401,6 +1403,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     connection: daemonConnection,
     sessionId,
     sessionStatus: sessionIdentityQuery.data,
+    active,
     enabled:
       socketWanted &&
       daemonConnection !== null &&
@@ -3381,6 +3384,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   useImperativeHandle(
     ref,
     () => ({
+      recheckNotRunning: (onRefused) => socketRef.current.recheckNotRunning(onRefused),
       sendInput: (data) => {
         snapToLiveEdge();
         socket.sendBinary(data);

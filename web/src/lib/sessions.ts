@@ -199,3 +199,8 @@ export function sessionAgent<T extends Pick<Agent, "id" | "command">>(
   // type nothing can launch any more, so the live process answers instead.
   return known ?? runningAgent(session, agents);
 }
+
+/** The fields that identify the run a device just tried to attach to. */
+export function sameSessionRun(a: Session, b: Session): boolean {
+  return a.host_id === b.host_id && a.status === b.status && a.started_at === b.started_at;
+}

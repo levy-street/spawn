@@ -1643,3 +1643,103 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
   await expect(liveTerminalRows(page)).toContainText("new 01");
   await expect(liveTerminalRows(page)).not.toContainText("old 1");
 });
+
+type AttachMock = {
+  __spawnRtcTest: { attachmentCount(): number; setAttachRefusal(reason?: string): void };
+};
+const attachmentCount = (page: Page) =>
+  page.evaluate(() => (window as unknown as AttachMock).__spawnRtcTest.attachmentCount());
+const setRefusal = (page: Page, reason?: string) =>
+  page.evaluate(
+    (value) => (window as unknown as AttachMock).__spawnRtcTest.setAttachRefusal(value),
+    reason,
+  );
+
+test("not-running notice rechecks on visibility, row change and Restart without stopping a recovered shell", async ({
+  page,
+}) => {
+  await installSessionRtcMock(page, [], {
+    attachRefusal: "session_not_running",
+    autoSnapshot: true,
+  });
+  const store = await mockApp(page, { sessions: [session({ agent_id: null })] });
+  let restarts = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/restart")) restarts++;
+  });
+  await page.routeWebSocket(/\/ws\/alerts/, () => {});
+  await page.clock.install();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  const notice = page.getByText(/This session is no longer running on/);
+  await expect(notice).toBeVisible();
+  await page.reload();
+  await expect(notice).toBeVisible();
+  const first = await attachmentCount(page);
+  await page.clock.fastForward(12_000);
+  expect(await attachmentCount(page)).toBe(first);
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect.poll(() => attachmentCount(page)).toBe(first + 1);
+  await expect(notice).toBeVisible();
+  for (const update of [{ started_at: new Date(0).toISOString() }, { status: "starting" }]) {
+    const before = await attachmentCount(page);
+    Object.assign(store.sessions[0], update);
+    await page.clock.fastForward(5_100);
+    await expect.poll(() => attachmentCount(page)).toBeGreaterThan(before);
+    await expect(notice).toBeVisible();
+  }
+  const beforeReconnect = await attachmentCount(page);
+  await page.evaluate(() =>
+    (window as unknown as { __spawnHostMock: { disconnect(): void } }).__spawnHostMock.disconnect(),
+  );
+  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(beforeReconnect);
+  await expect(notice).toBeVisible();
+  await setRefusal(page);
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await expect(page.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false");
+  await expect(notice).toHaveCount(0);
+  expect(restarts).toBe(0);
+});
+
+test("not-running notice requires a second refusal on the button's own attachment", async ({
+  page,
+}) => {
+  await installSessionRtcMock(page, [], {
+    attachRefusal: "session_not_running",
+    autoSnapshot: true,
+  });
+  const store = await mockApp(page, { sessions: [session({ agent_id: null })] });
+  let restarts = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/restart")) restarts++;
+  });
+  await page.routeWebSocket(/\/ws\/alerts/, () => {});
+  await page.goto(`/sessions/${SESSION_ID}`);
+  const button = page.getByRole("button", { name: "Restart", exact: true });
+  await expect(button).toBeVisible();
+  for (const reason of ["unknown_reason", ""]) {
+    await setRefusal(page, reason);
+    const before = await attachmentCount(page);
+    await button.click();
+    await expect.poll(() => attachmentCount(page)).toBeGreaterThan(before + 1);
+    await setRefusal(page, "session_not_running");
+    await expect(button).toBeVisible();
+    expect(restarts).toBe(0);
+  }
+  // The detail read after the second refusal can catch a newer run before
+  // the list poll reaches this window. The change opens a fresh attachment.
+  store.sessions[0].started_at = new Date(0).toISOString();
+  const stale = await attachmentCount(page);
+  await button.click();
+  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(stale + 1);
+  await expect(button).toBeVisible();
+  expect(restarts).toBe(0);
+  const before = await attachmentCount(page);
+  await button.click();
+  await expect.poll(() => restarts).toBe(1);
+  expect(await attachmentCount(page)).toBeGreaterThan(before);
+});

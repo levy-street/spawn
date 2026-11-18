@@ -6,6 +6,9 @@
 
 use super::*;
 
+const SESSION_NOT_RUNNING: &str =
+    r#"{"version":1,"kind":"event","event":"attach_refused","reason":"session_not_running"}"#;
+
 const MAX_PAIR_SESSIONS: usize = 128;
 const MAX_PAIR_CONTROLS: usize = 32;
 /// Channels of one device connection whose admission has begun and not been
@@ -489,6 +492,98 @@ impl RtcSessions {
                 .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
     }
 
+    /// Check only this id, off admission. An error follows the ordinary
+    /// close-and-retry path. A confirmed running worker rejoins the registry
+    /// without announcing a launch or sending a lifecycle command.
+    async fn missing_pair_session(
+        &self,
+        parent_id: &str,
+        pc: &Arc<RTCPeerConnection>,
+        pair: &PairContext,
+        session_id: Uuid,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            pair.registry.discovery_finished(),
+            "worker discovery in progress"
+        );
+        let gate = pair.registry.worker_gate(session_id);
+        let _inspection = gate
+            .change
+            .try_read()
+            .context("worker change in progress")?;
+        let marker = crate::worker_backend::device_worker_marker(session_id, &gate).await?;
+        anyhow::ensure!(
+            self.pair_is_current(parent_id, pc, pair.trust_epoch).await
+                && !pair.retired.load(Ordering::Acquire),
+            "retired device connection"
+        );
+        if let Some(marker) = marker {
+            // Both halves can discover the same marker. Only the first
+            // connects: a second connection displaces the worker's reader.
+            let _transition = pair.registry.lock_generation_transition(session_id).await;
+            if !pair.registry.contains(session_id) {
+                let launched = crate::worker_backend::adopt_for_device(marker).await?;
+                if let Some(sink) = self.registered_sender() {
+                    launched.handle.control.set_sink((*sink).clone()).await;
+                }
+                let generation = pair.registry.insert_launched(launched.handle, None);
+                tokio::spawn(crate::run::spawn_exit_forwarder(
+                    session_id,
+                    generation,
+                    launched.exit_rx,
+                    pair.registry.clone(),
+                    self.clone(),
+                    None,
+                ));
+            }
+            return Ok(false);
+        }
+        Ok(!pair.registry.contains(session_id)
+            && !pair.registry.generation_transition_in_progress(session_id))
+    }
+
+    fn refuse_missing_session(
+        &self,
+        parent_id: &str,
+        pc: &Arc<RTCPeerConnection>,
+        pair: &PairContext,
+        session_id: Uuid,
+        dc: &Arc<RTCDataChannel>,
+    ) {
+        // Both channels are independently ordered. A close on either
+        // tears down the view, so each carries the answer before FIN.
+        let weak_dc = Arc::downgrade(dc);
+        let registry = pair.registry.clone();
+        let sessions = self.clone();
+        let epoch = pair.trust_epoch;
+        let parent = parent_id.to_owned();
+        let peer = Arc::downgrade(pc);
+        dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                let Some(dc) = weak_dc.upgrade() else { return };
+                if let Some(pc) = peer.upgrade() {
+                    let gate = registry.worker_gate(session_id);
+                    // Keep a launch or restart from entering between this
+                    // final marker check and sending the answer. Other
+                    // windows and the connection's admission remain free.
+                    let inspection = gate.change.try_read();
+                    if inspection.is_ok()
+                        && matches!(
+                            crate::worker_backend::device_worker_marker(session_id, &gate).await,
+                            Ok(None)
+                        )
+                        && sessions.pair_is_current(&parent, &pc, epoch).await
+                        && !registry.generation_transition_in_progress(session_id)
+                        && !registry.contains(session_id)
+                    {
+                        let _ = dc.send_text(SESSION_NOT_RUNNING).await;
+                    }
+                }
+                let _ = dc.close().await;
+            })
+        }));
+    }
+
     async fn attach_pair_channel(
         &self,
         parent_id: &str,
@@ -504,24 +599,17 @@ impl RtcSessions {
         // serializes on admission. Taken the other way round, one device
         // opening a restarting window held admission for all of that, and
         // every other device's channels and offers waited behind it.
-        //
-        // A label is the device's to choose, so a session this daemon is
-        // not running, and whose transition nobody holds, is refused before
-        // its transition is taken: otherwise every such label would be a
-        // lock of its own, made for it and waited on behind admission.
-        // Nothing is weakened: the session is checked again under both locks
-        // below, and one whose transition is held (`register_attached`
-        // inserting it, an exit removing it) is waited for as before. A
-        // launch holds the transition only around that insert, so an attach
-        // that arrives while the worker is still starting is refused at
-        // once, here — as it was below, before this check.
-        anyhow::ensure!(
-            pair.registry.binding_for(label.session).is_some()
-                || pair
-                    .registry
-                    .generation_transition_in_progress(label.session),
-            "session not running on this daemon"
-        );
+        if !pair.registry.contains(label.session)
+            && !pair
+                .registry
+                .generation_transition_in_progress(label.session)
+            && self
+                .missing_pair_session(parent_id, pc, pair, label.session)
+                .await?
+        {
+            self.refuse_missing_session(parent_id, pc, pair, label.session, &dc);
+            return Ok(());
+        }
         let transition = pair
             .registry
             .lock_generation_transition(label.session)
@@ -595,7 +683,7 @@ impl RtcSessions {
             let session = pair
                 .registry
                 .binding_for(label.session)
-                .context("session not running on this daemon")?;
+                .context("session is not running on this daemon")?;
             let control = pair
                 .registry
                 .control_for_binding(session)
@@ -1871,6 +1959,228 @@ mod tests {
             holders, 0,
             "an attach for a session nobody runs took its transition"
         );
+    }
+
+    async fn refusal_frames(pc: &Arc<RTCPeerConnection>, session: Uuid, kind: &str) -> Vec<Value> {
+        let dc = pc
+            .create_data_channel(
+                &format!(
+                    "spawn.{kind}/{session}/{}/{}",
+                    Uuid::new_v4(),
+                    Uuid::new_v4()
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let messages = events.clone();
+        dc.on_message(Box::new(move |message| {
+            let messages = messages.clone();
+            Box::pin(async move {
+                assert!(message.is_string);
+                messages
+                    .send(Some(serde_json::from_slice(&message.data).unwrap()))
+                    .unwrap();
+            })
+        }));
+        dc.on_close(Box::new(move || {
+            let events = events.clone();
+            Box::pin(async move {
+                let _ = events.send(None);
+            })
+        }));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut result = Vec::new();
+            while let Some(frame) = rx.recv().await.unwrap() {
+                result.push(frame);
+            }
+            result
+        })
+        .await
+        .expect("attachment closed")
+    }
+
+    #[tokio::test]
+    async fn device_refusal_and_worker_recovery() {
+        use crate::worker_backend;
+        use spawnd::sessiond::endpoint;
+        let Some(root) = std::env::var_os("SPAWN_TEST_DEVICE_REFUSAL_ROOT") else {
+            #[cfg(unix)]
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(windows)]
+            let temp = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "rtc::pair::tests::device_refusal_and_worker_recovery",
+                    "--nocapture",
+                ])
+                .env("SPAWN_TEST_DEVICE_REFUSAL_ROOT", temp.path())
+                .env("SPAWND_WORKER_DIR", temp.path().join("w"))
+                .env("SPAWN_CONFIG_DIR", temp.path().join("c"))
+                .env("SPAWND_NO_CPU_SCOPES", "1");
+            #[cfg(unix)]
+            command
+                .env("SPAWND_WORKER_BIN", worker_backend::built_worker_bin())
+                .env("HOME", temp.path())
+                .env("SHELL", "/bin/sh")
+                .env("PATH", "/usr/bin:/bin");
+            assert!(command.status().unwrap().success());
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        assert!(root.is_dir());
+        let rtc = RtcSessions::new();
+        rtc.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&rtc, &registry, [24; 32]).await;
+        let (server, mut frames) = mpsc::channel(64);
+        rtc.install_ws_sender(server.clone());
+        rtc.deferred_pruned.store(true, Ordering::Release);
+        let id = Uuid::new_v4();
+        assert!(registry.claim_discovery());
+        assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
+        registry.finish_discovery();
+        let gate = registry.worker_gate(id);
+        let change = gate.change.write().await;
+        assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
+        let another = Uuid::new_v4();
+        let missing = json!({"version": 1, "kind": "event", "event": "attach_refused", "reason": "session_not_running"});
+        assert_eq!(
+            refusal_frames(&pc, another, "pty").await.as_slice(),
+            std::slice::from_ref(&missing)
+        );
+        drop(change);
+        assert_eq!(refusal_frames(&pc, id, "ctl").await, [missing]);
+
+        // Pause a real removal between erasing the entry and finishing its
+        // peer cleanup. A channel that arrived in that gap closes silently.
+        let (old, _commands) = crate::rtc::tests::insert_test_worker(&registry, id);
+        let (exit, exited) = tokio::sync::oneshot::channel();
+        let (exit_sink, _old_exits) = mpsc::channel(2);
+        drop(exit);
+        let peers = rtc.peers.lock().await;
+        let removal = crate::run::spawn_exit_forwarder(
+            id,
+            old.generation(),
+            exited,
+            registry.clone(),
+            rtc.clone(),
+            Some(exit_sink),
+        );
+        tokio::pin!(removal);
+        assert!(futures_util::poll!(&mut removal).is_pending());
+        assert!(!registry.contains(id));
+        let pending = tokio::spawn({
+            let pc = Arc::clone(&pc);
+            async move { refusal_frames(&pc, id, "ctl").await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.generation_transition_holders(id) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(peers);
+        removal.await;
+        assert!(pending.await.unwrap().is_empty());
+
+        let dir = worker_backend::worker_dir().unwrap();
+        let ep = endpoint::endpoint_for(&dir, &endpoint::config_root_tag(), id).unwrap();
+        let endpoint::LockAttempt::Acquired(reservation) = endpoint::try_reserve(&ep).unwrap()
+        else {
+            panic!("expected free endpoint")
+        };
+        assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
+        // A worker waiting for its launch must see neither Start nor Shutdown.
+        let mut endpoints = endpoint::bind_worker(&ep, &reservation, Uuid::new_v4()).unwrap();
+        let unfinished = async {
+            use spawnd::sessiond::wire;
+            let mut stream = endpoint::accept_main(&mut endpoints.main).await.unwrap();
+            assert_eq!(refusal_frames(&pc, another, "ctl").await.len(), 1);
+            let hello = json!({
+                "version": wire::PROTO_VERSION, "session_id": id, "instance_id": Uuid::new_v4(),
+                "state": "awaiting_start"
+            });
+            wire::write_json_frame(&mut stream, wire::T_HELLO, &hello)
+                .await
+                .unwrap();
+            assert!(wire::read_frame(&mut stream).await.unwrap().is_none());
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(refusal_frames(&pc, id, "ctl"), unfinished)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+        endpoints.identity.cleanup().unwrap();
+        drop(endpoints);
+        drop(reservation);
+        // The parent may finish reporting its original connection after the
+        // first channel opens. None of these window decisions emits a frame.
+        while let Ok(frame) = frames.try_recv() {
+            let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+            assert_eq!(
+                (&value["type"], &value["scope_type"], &value["status"]),
+                (&json!("rtc.status"), &json!("host"), &json!("connected")),
+                "{value}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            // The explicit Restart on a missing window goes through the real
+            // daemon handler. A second registry has missed that worker and
+            // must adopt it on this pair without a second session.started.
+            let first = SessionRegistry::new();
+            let (old_server, mut old_frames) = mpsc::channel(64);
+            crate::run::handle_session_restart(
+                crate::proto::SessionCreate {
+                    session_id: id,
+                    cwd: root.to_str().unwrap().into(),
+                    skills: vec![],
+                    create_cwd: false,
+                },
+                &first,
+                &rtc,
+                &old_server,
+            )
+            .await;
+            let started: Value =
+                serde_json::from_str(old_frames.try_recv().unwrap().as_str()).unwrap();
+            assert_eq!(started["type"], "session.started", "{started}");
+            std::fs::write(root.join(".restart-cwd"), []).unwrap();
+            let previous = first.binding_for(id).unwrap();
+            drop(first.remove_if_generation(id, previous.generation()));
+            let (_pty, _ctl) = attach(&pc, id).await;
+            let binding = registry.binding_for(id).unwrap();
+            assert_eq!(
+                std::path::Path::new(&*registry.cwd_for_binding(binding).unwrap()),
+                root
+            );
+            // Ordinary shell exit proves the healed channel has the same live
+            // worker. Its real exit is still forwarded in the ordinary way.
+            assert!(registry.with_handle(id, |h| h
+                .write_stdin(b"test -f .restart-cwd && exit 23; exit 1\n")
+                .unwrap()));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame: Value =
+                        serde_json::from_str(frames.recv().await.unwrap().as_str()).unwrap();
+                    assert_ne!(frame["type"], "session.started");
+                    if frame["type"] == "session.exit" && frame["exit_code"] == 23 {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("shell exited normally");
+        }
+        rtc.close_all().await;
+        pc.close().await.unwrap();
     }
 
     /// The other side of the refusal above: an attach for a session that is

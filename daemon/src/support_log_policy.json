@@ -579,7 +579,7 @@
     {
       "target": "spawnd::worker_backend",
       "file": "src/worker_backend.rs",
-      "line": 735,
+      "line": 800,
       "field": "error",
       "source": "tracing::debug!(%session_id, error = %message, \"worker error\")",
       "why": "Only the unreadable_history branch: local worker segment-path/OS-not-found or fixed disabled-history explanation. Other frame causes use the unlisted WARN callsite."
@@ -704,21 +704,21 @@
     },
     {
       "file": "src/run.rs",
-      "line": 4267,
+      "line": 4278,
       "field": "shell",
       "source": "tracing::warn!(\n                shell = %shell.display(),\n                mode,\n                \"the user's shell did not say its PATH in time and was stopped; what it would have added is not used\"\n            )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4514,
+      "line": 4525,
       "field": "path",
       "source": "tracing::info!(path = %path.display(), \"created the user's Codex home\")",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4516,
+      "line": 4527,
       "field": "path",
       "source": "tracing::warn!(\n            path = %path.display(),\n            %error,\n            \"could not create the user's Codex home; this window's Codex keeps its own\"\n        )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."

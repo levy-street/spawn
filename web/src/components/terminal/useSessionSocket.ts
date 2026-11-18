@@ -43,7 +43,13 @@ import type { DisplayControlState } from "@/lib/ws";
 export interface UseSessionSocketOptions {
   connection?: DaemonConnection | null;
   sessionId: string;
-  sessionStatus?: { status: string; exit_code: number | null } | null;
+  active?: boolean;
+  sessionStatus?: {
+    status: string;
+    exit_code: number | null;
+    host_id?: string;
+    started_at?: string;
+  } | null;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
@@ -102,7 +108,8 @@ export type SocketState =
   | "closed"
   | "error"
   | "unauthorized"
-  | "disabled";
+  | "disabled"
+  | "not-running";
 
 /** How the live connection's signaling was authenticated. */
 export type SignalingTrustLevel = "verified" | "first_contact" | "raw";
@@ -139,6 +146,21 @@ const UPLOAD_READY_WAIT_MS = 20_000;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const MAX_PENDING_INPUT_AGE_MS = 30_000;
 
+function isSessionNotRunning(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 512) return false;
+  try {
+    const message = JSON.parse(data);
+    return (
+      message?.version === 1 &&
+      message.kind === "event" &&
+      message.event === "attach_refused" &&
+      message.reason === "session_not_running"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function newRtcSessionId(): string {
   return crypto.randomUUID();
 }
@@ -148,6 +170,7 @@ export function useSessionSocket({
   sessionId,
   sessionStatus = null,
   enabled = true,
+  active = true,
   initialSize = null,
   onData,
   onHistory,
@@ -282,6 +305,25 @@ export function useSessionSocket({
       lastExit.current = null;
     }
   }, [sessionId, sessionStatus?.status, sessionStatus?.exit_code]);
+  const recheckRef = useRef<(onRefused?: () => void) => void>(() => {});
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const recheckNotRunning = useCallback(
+    (onRefused?: () => void) => recheckRef.current(onRefused),
+    [],
+  );
+  const sessionRow = JSON.stringify([
+    sessionStatus?.host_id,
+    sessionStatus?.status,
+    sessionStatus?.started_at,
+  ]);
+  const previousRow = useRef(sessionRow);
+  useEffect(() => {
+    const changed = previousRow.current !== sessionRow;
+    previousRow.current = sessionRow;
+    if (changed || active) recheckNotRunning();
+  }, [active, recheckNotRunning, sessionRow]);
+
   useEffect(() => {
     const sessionGeneration = ++sessionGenerationRef.current;
     activeSessionIdRef.current = enabled && connection ? sessionId : null;
@@ -295,6 +337,9 @@ export function useSessionSocket({
       return;
     }
     let cancelled = false;
+    let notRunning = false;
+    let restartIfRefused: (() => void) | undefined;
+    let hostGeneration = connection.getSnapshot().generation;
     let rtcRetryAttempts = 0;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -317,6 +362,7 @@ export function useSessionSocket({
       )
         return;
       clearRtcConnectTimer();
+      restartIfRefused = undefined;
       rtcRef.current = {
         sessionId: null,
         sessionGeneration: 0,
@@ -348,10 +394,12 @@ export function useSessionSocket({
     const scheduleRtcRetry = () => {
       if (
         !isActiveSessionGeneration() ||
+        notRunning ||
         rtcRetryTimer ||
         connection.getSnapshot().state !== "ready"
       )
         return;
+      restartIfRefused = undefined;
       const delay = Math.min(10_000, 500 * 2 ** rtcRetryAttempts++);
       setState("connecting");
       rtcRetryTimer = setTimeout(() => {
@@ -362,6 +410,7 @@ export function useSessionSocket({
     const startRtc = () => {
       if (
         !isActiveSessionGeneration() ||
+        notRunning ||
         rtcRef.current.ptyDc ||
         connection.getSnapshot().state !== "ready"
       )
@@ -794,6 +843,16 @@ export function useSessionSocket({
       ptyDc.bufferedAmountLowThreshold = 64 * 1024;
       ptyDc.onbufferedamountlow = flushPendingInput;
 
+      const acceptRefusal = (data: unknown) => {
+        if (serverReady || !isSessionNotRunning(data)) return false;
+        const restart = restartIfRefused;
+        notRunning = true;
+        cleanupRtc(true, false, rtcGeneration);
+        setState("not-running");
+        if (activeRef.current && document.visibilityState === "visible") restart?.();
+        return true;
+      };
+
       const markReady = () => {
         const current = rtcRef.current;
         if (
@@ -809,6 +868,7 @@ export function useSessionSocket({
         rtcRef.current = { ...current, open: true };
         clearRtcConnectTimer();
         rtcRetryAttempts = 0;
+        restartIfRefused = undefined;
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
         settleUploadReadiness(true);
@@ -1047,6 +1107,7 @@ export function useSessionSocket({
       ptyDc.onmessage = (event) => {
         if (!isCurrentRtcGeneration()) return;
         const data = event.data;
+        if (acceptRefusal(data)) return;
         if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
         void ptyMessages
           .enqueue(
@@ -1084,6 +1145,7 @@ export function useSessionSocket({
         ctlDc.onmessage = (event) => {
           if (!isCurrentRtcGeneration()) return;
           const data = event.data;
+          if (acceptRefusal(data)) return;
           if (
             typeof data !== "string" &&
             !(data instanceof ArrayBuffer) &&
@@ -1169,6 +1231,11 @@ export function useSessionSocket({
     const sync = () => {
       if (!isActiveSessionGeneration()) return;
       const snapshot = connection.getSnapshot();
+      if (snapshot.state !== "ready" || snapshot.generation !== hostGeneration) {
+        notRunning = false;
+        restartIfRefused = undefined;
+      }
+      hostGeneration = snapshot.generation;
       setSignedRtcRefusal(snapshot.refusal);
       setSignalingTrust(snapshot.trust);
       setConnInfo(snapshot.info ?? EMPTY_CONN_INFO);
@@ -1179,6 +1246,7 @@ export function useSessionSocket({
         setState(snapshot.state === "open" ? "connecting" : snapshot.state);
         return;
       }
+      if (notRunning) return;
       if (rtcRef.current.open) {
         setDcOpen(true);
         setState("open");
@@ -1187,11 +1255,31 @@ export function useSessionSocket({
         startRtc();
       }
     };
+    recheckRef.current = (onRefused) => {
+      // A new view or row cancels a pending button press. Only this fresh
+      // attachment may authorize Restart. A plain close forgets the press.
+      if (!onRefused && restartIfRefused) {
+        cleanupRtc();
+        notRunning = true;
+      }
+      if (!notRunning || connection.getSnapshot().state !== "ready") return;
+      notRunning = false;
+      restartIfRefused = onRefused;
+      setState("connecting");
+      startRtc();
+    };
+    const visibility = () => {
+      restartIfRefused = undefined;
+      if (document.visibilityState === "visible") recheckRef.current();
+    };
+    document.addEventListener("visibilitychange", visibility);
     const unsubscribe = connection.subscribe(sync);
     sync();
     return () => {
       cancelled = true;
       unsubscribe();
+      recheckRef.current = () => {};
+      document.removeEventListener("visibilitychange", visibility);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
       clearRtcConnectTimer();
       cleanupRtc(false);
@@ -1308,6 +1396,7 @@ export function useSessionSocket({
       sendBinary,
       sendJson,
       uploadFile,
+      recheckNotRunning,
     }),
     [
       state,
@@ -1320,6 +1409,7 @@ export function useSessionSocket({
       sendBinary,
       sendJson,
       uploadFile,
+      recheckNotRunning,
     ],
   );
 }

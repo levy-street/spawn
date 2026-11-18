@@ -19,6 +19,7 @@ import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { AgentNotice } from "@/lib/agent-notice";
 import { type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
+import { sameSessionRun } from "@/lib/sessions";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -228,13 +229,10 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
 /**
  * Where a warm terminal's window runs, as this tab knows it.
  *
- * Read from the window's own row (`["session", id]`), the one the terminal
- * also reads its status from. Nothing polls that row, though, while the
- * session list is polled wherever windows are shown — so when the list has
- * heard of a move the row has not (its data frame lost to a dropped alert
- * socket, say), the row is refetched rather than trusted for ever. Only
- * refetched: a list response that left the server before the move can arrive
- * after it, and must never send a terminal back to the host it left.
+ * The terminal reads its host and status from the window's detail row.
+ * A newer list can reveal a move or restart missed on the alert socket.
+ * Refetch the detail because the list itself may have been in flight
+ * while the window was changing.
  */
 function useIncarnationHost(sessionId: string): string | null {
   const queryClient = useQueryClient();
@@ -252,14 +250,13 @@ function useIncarnationHost(sessionId: string): string | null {
     enabled: false,
   });
   const hostId = row.data?.host_id ?? null;
-  const listedHostId = list.data?.find((item) => item.id === sessionId)?.host_id ?? null;
+  const listed = list.data?.find((item) => item.id === sessionId);
+  const rowChanged = listed && row.data && !sameSessionRun(row.data, listed);
   const listIsNewer = list.dataUpdatedAt > row.dataUpdatedAt;
   useEffect(() => {
-    if (!listIsNewer || listedHostId === null || hostId === null || listedHostId === hostId) {
-      return;
-    }
+    if (!listIsNewer || !rowChanged) return;
     void queryClient.invalidateQueries({ queryKey: ["session", sessionId], exact: true });
-  }, [hostId, listIsNewer, listedHostId, queryClient, sessionId]);
+  }, [listIsNewer, rowChanged, queryClient, sessionId]);
   return hostId;
 }
 

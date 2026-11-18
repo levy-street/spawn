@@ -4,6 +4,7 @@ import type { TerminalTheme } from "@/theme";
 
 export type TransportState =
   | "idle"
+  | "not-running"
   | "signalling"
   | "connecting"
   | "ready"
@@ -144,6 +145,7 @@ export interface SessionTransport {
   readonly displayOwner?: boolean;
   /** Retains the app-owned daemon connection before the terminal WebView loads. */
   prepare?(): void;
+  recheckNotRunning?(onRefused?: () => void): void;
   networkChanged?(): void;
   open(): Promise<void>;
   close(): void;
@@ -335,6 +337,7 @@ export interface HostTransport {
   /** Null until this RTC generation's hello frame is decoded. */
   readonly capabilities?: HostCapabilities | null;
   prepare?(): void;
+  recheckNotRunning?(onRefused?: () => void): void;
   networkChanged?(): void;
   open(): Promise<void>;
   close(): void;

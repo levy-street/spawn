@@ -110,6 +110,63 @@ afterEach(() => {
 });
 
 describe("session channels on the shared daemon connection", () => {
+  test("a refusal before the renderer loads parks just this view; Restart rechecks one attachment", async () => {
+    jest.useFakeTimers();
+    try {
+      const { bridge, transport } = view();
+      transport.prepare?.();
+      const attempts = () => commands.filter((frame) => frame.type === "pair-attach");
+      function refuse(reason: string, channel: "pty" | "ctl" = "ctl") {
+        root.shared.bridge.receive(
+          JSON.stringify({
+            v: 1,
+            type: "pair-event",
+            attachmentId: attempts().at(-1)?.attachmentId,
+            channel,
+            event: "data",
+            sequence: 1,
+            binary: false,
+            data: JSON.stringify({ version: 1, kind: "event", event: "attach_refused", reason }),
+          }),
+        );
+      }
+      refuse("session_not_running", "pty");
+      const opening = transport.open();
+      state("ready");
+      jest.advanceTimersByTime(30_000);
+      expect(transport.state).toBe("not-running");
+      expect(attempts()).toHaveLength(1);
+      state("connecting");
+      state("ready");
+      expect(attempts()).toHaveLength(2);
+      const restart = jest.fn();
+      refuse("session_not_running");
+      transport.recheckNotRunning?.(restart);
+      bridge.emit({ v: 1, type: "state", state: "ready" });
+      await opening;
+      expect(restart).not.toHaveBeenCalled();
+      expect(transport.state).toBe("ready");
+
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      jest.advanceTimersByTime(500);
+      refuse("session_not_running");
+      transport.recheckNotRunning?.(restart);
+      refuse("unknown_reason");
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      const before = attempts().length;
+      jest.advanceTimersByTime(500);
+      expect(attempts()).toHaveLength(before + 1);
+      refuse("session_not_running");
+      expect(restart).not.toHaveBeenCalled();
+      transport.recheckNotRunning?.(restart);
+      refuse("session_not_running");
+      expect(restart).toHaveBeenCalledTimes(1);
+      expect(mockClose).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("first-open channel setup overlaps renderer loading without allowing early input", async () => {
     const { bridge, transport } = view();
     transport.prepare?.();

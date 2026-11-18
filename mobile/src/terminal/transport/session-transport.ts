@@ -47,6 +47,21 @@ type ConnectionInfoListener = (info: ConnectionInfo) => void;
 type PairEvent = Extract<WorkerToNativeMessage, { type: "pair-command" | "pair-event" }>;
 const MAX_PENDING_VIEW_EVENTS = 512;
 const MAX_PENDING_VIEW_EVENT_BYTES = 2 * 1024 * 1024;
+function isSessionNotRunning(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 512) return false;
+  try {
+    const message = JSON.parse(data);
+    return (
+      message?.version === 1 &&
+      message.kind === "event" &&
+      message.event === "attach_refused" &&
+      message.reason === "session_not_running"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function newUuid(): string {
   const bytes = randomBytes(16);
   bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
@@ -63,6 +78,7 @@ class WebViewSessionTransport implements SessionTransport {
   #lease: HostTransportLease | null = null;
   #attachmentId: string | null = null;
   #workerStarted = false;
+  #restartIfRefused: (() => void) | undefined;
   #pendingViewEvents: PairEvent[] = [];
   #pendingViewBytes = 0;
   #displayOwner = false;
@@ -115,6 +131,18 @@ class WebViewSessionTransport implements SessionTransport {
       shared.bridge.onMessage((message) => {
         if (activeDeviceIdentityAccount() !== this.#accountId) return;
         if (message.type === "pair-event" && message.attachmentId === this.#attachmentId) {
+          if (
+            this.#state === "connecting" &&
+            message.event === "data" &&
+            message.binary === false &&
+            isSessionNotRunning(message.data)
+          ) {
+            const restart = this.#restartIfRefused;
+            this.#detach();
+            this.#setState("not-running");
+            restart?.();
+            return;
+          }
           if (!this.#workerStarted) {
             // Open the channels while the terminal document loads. Receive
             // credits stay outstanding until that document consumes the data;
@@ -146,6 +174,16 @@ class WebViewSessionTransport implements SessionTransport {
         this.#emitError(error);
       }),
     );
+    this.#syncConnection();
+  }
+  recheckNotRunning(onRefused?: () => void): void {
+    if (!onRefused && this.#restartIfRefused) {
+      this.#detach();
+      this.#setState("not-running");
+    }
+    if (this.#state !== "not-running" || this.daemonState !== "ready") return;
+    this.#restartIfRefused = onRefused;
+    this.#setState("connecting");
     this.#syncConnection();
   }
   networkChanged(): void {
@@ -337,7 +375,7 @@ class WebViewSessionTransport implements SessionTransport {
       } else this.#setState("reconnecting");
       return;
     }
-    if (this.#attachmentId || this.#retry) return;
+    if (this.#state === "not-running" || this.#attachmentId || this.#retry) return;
     const attachment = { attachmentId: newUuid(), sessionId: this.sessionId, viewId: this.#viewId };
     this.#attachmentId = attachment.attachmentId;
     this.#setState("connecting");
@@ -374,6 +412,7 @@ class WebViewSessionTransport implements SessionTransport {
     }
   }
   #detach(): void {
+    this.#restartIfRefused = undefined;
     clearTimeout(this.#retry ?? undefined);
     this.#retry = null;
     clearTimeout(this.#deadline ?? undefined);
@@ -446,6 +485,7 @@ class WebViewSessionTransport implements SessionTransport {
         ) {
           clearTimeout(this.#deadline ?? undefined);
           this.#deadline = null;
+          this.#restartIfRefused = undefined;
           this.#setState("ready");
           this.#resolveOpen?.();
           this.#settleOpening();

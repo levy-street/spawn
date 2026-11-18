@@ -66,9 +66,16 @@ its tiles before deleting the workspace.
 | Browser session signaling | `/ws/browser?session_id=<session UUID>` | WS subprotocol `spawn.v3` | RTC signaling and disclosed `session.status` / `session.exit`; no terminal-content fallback |
 | Daemon control | `/ws/daemon` | WS subprotocol `spawn.control.v3` | registration, lifecycle, disclosed activity, agent availability, and RTC signaling |
 | Browser host signaling | `/ws/host?host_id=<host UUID>` | WS subprotocol `spawn.host.v1` | RTC signaling for the host control channel |
-| Session PTY | DataChannel `spawn.pty` | protocol version 2 | raw PTY bytes |
+| Session PTY | DataChannel `spawn.pty` | protocol version 2 | raw PTY bytes on an admitted channel |
 | Session control | DataChannel `spawn.ctl` | locked protocol version 1 | replay, viewport/display ownership, and session uploads |
 | Host control | DataChannel `spawn.host.ctl` | protocol version 1 | host filesystem and host-scoped protected operations |
+
+On a shared host connection, either half of a refused terminal attachment can
+close first. When the host finds no worker for that window, each channel sends
+one text event before closing, with `version: 1`, `kind: "event"`,
+`event: "attach_refused"` and `reason: "session_not_running"`. Older devices
+ignore PTY text and unknown control events and retry on close. Other reasons
+and closes without a reason keep that retry behavior.
 
 `spawn.host.ctl` advertises what a daemon can do in its `hello`. A new
 operation family is one versioned capability for the whole family (`conv.v1`

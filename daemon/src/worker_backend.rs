@@ -440,9 +440,74 @@ pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
         .await;
         return Ok(None);
     }
+    finish_adoption(worker_endpoint, stream, hello)
+        .await
+        .map(Some)
+}
+
+/// Inspect just this window's directory entries. Only NotFound is absence.
+/// An existing reservation can outlive a worker; check whether it is busy.
+/// Never create a reservation file for an arbitrary id supplied by a device.
+pub async fn device_worker_marker(
+    session_id: Uuid,
+    gate: &crate::sessions::WorkerGate,
+) -> Result<Option<endpoint::Endpoint>> {
+    let _inspection = gate.inspection.lock().await;
+    tokio::task::spawn_blocking(move || inspect_worker_marker(session_id)).await?
+}
+
+fn inspect_worker_marker(session_id: Uuid) -> Result<Option<endpoint::Endpoint>> {
+    let dir = worker_dir()?;
+    let ep = session_endpoint(&dir, session_id)?;
+    #[cfg(unix)]
+    let marker = std::path::PathBuf::from(ep.main_arg());
+    #[cfg(windows)]
+    let marker = dir.join(format!("{session_id}.endpoint"));
+    let present = |path: &std::path::Path| -> Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if present(&marker)? {
+        return Ok(Some(ep));
+    }
+    #[cfg(unix)]
+    anyhow::ensure!(
+        !present(ep.lifecycle_arg().as_ref())?,
+        "worker lifecycle socket remains"
+    );
+    if present(&dir.join(format!("{session_id}.lock")))? {
+        anyhow::ensure!(
+            matches!(endpoint::try_reserve(&ep)?, LockAttempt::Acquired(_)),
+            "worker reservation busy"
+        );
+    }
+    Ok(None)
+}
+
+/// A device can recover a running worker. Failed handshakes and workers
+/// waiting for Start are left alone, including their endpoint files.
+pub async fn adopt_for_device(ep: endpoint::Endpoint) -> Result<pty::Launched> {
+    let mut stream = connect_with_retry(&ep, ADOPT_CONNECT_TIMEOUT).await?;
+    let hello = read_hello(&mut stream, ep.session_id).await?;
+    anyhow::ensure!(
+        hello.state == "running",
+        "worker is not ready for attachment"
+    );
+    finish_adoption(ep, stream, hello).await
+}
+
+async fn finish_adoption(
+    worker_endpoint: endpoint::Endpoint,
+    mut stream: endpoint::SupervisorSideStream,
+    hello: wire::Hello,
+) -> Result<pty::Launched> {
+    let session_id = worker_endpoint.session_id;
     tracing::info!(%session_id, state = %hello.state, pid = ?hello.pid, "adopting session worker");
     subscribe_history(&mut stream, &hello).await?;
-    Ok(Some(assemble(
+    Ok(assemble(
         session_id,
         hello.pid.unwrap_or(0),
         WorkerConnection {
@@ -455,7 +520,7 @@ pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
             lifecycle_instance: hello.instance_id,
             stream,
         },
-    )))
+    ))
 }
 
 /// Whether the worker socket still exists. This deliberately does not connect:

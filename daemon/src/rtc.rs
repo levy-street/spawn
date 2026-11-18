@@ -1099,7 +1099,7 @@ impl RtcSessions {
     /// arrived on, so nothing a peer says later may go through a sender
     /// captured at admission — after a reconnect that is a socket nobody
     /// reads.
-    fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+    pub(crate) fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
         if !self.deferred_pruned.load(Ordering::Acquire) {
             return None;
         }

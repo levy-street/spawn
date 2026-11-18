@@ -42,7 +42,13 @@ import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@
 import { askWindowHost } from "@/lib/conversation-inspect";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
-import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
+import {
+  sameSessionRun,
+  sessionAtShell,
+  sessionOwnName,
+  sessionTitle,
+  sessionTitleDetail,
+} from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
@@ -185,8 +191,15 @@ export function SessionPane({
   // agent back in the same conversation. The session is restarted and the
   // agent's resume command queued for the fresh shell (`agent-restart.ts`).
   const restartM = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (confirmed?: Session) => {
       if (!session) throw new Error("This session no longer exists.");
+      if (confirmed) {
+        const current = await sessions.get(sessionId);
+        if (!sameSessionRun(current, confirmed)) {
+          writeSessionToCache(queryClient, current);
+          return;
+        }
+      }
       const definitions = await queryClient
         .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
         .catch(() => []);
@@ -210,10 +223,17 @@ export function SessionPane({
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       onError(null);
+      getHandle()?.recheckNotRunning();
       requestAnimationFrame(() => getHandle()?.focus());
     },
     onError: (error) => onError(String(error)),
   });
+  const notRunning = connInfo?.socketState === "not-running";
+  const restartFromWindow = () => {
+    if (notRunning) {
+      if (session) getHandle()?.recheckNotRunning(() => restartM.mutate(session));
+    } else restartM.mutate(undefined);
+  };
   const closeM = useMutation({
     mutationFn: () => sessions.remove(sessionId),
     onSuccess: () => {
@@ -466,7 +486,7 @@ export function SessionPane({
             </DropdownMenuItem>
           )}
           {session && (
-            <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
+            <DropdownMenuItem disabled={restartM.isPending} onSelect={restartFromWindow}>
               <RotateCcw className="size-4" aria-hidden />
               Restart
             </DropdownMenuItem>
@@ -561,7 +581,7 @@ export function SessionPane({
                   <button
                     type="button"
                     disabled={restartM.isPending}
-                    onClick={() => restartM.mutate()}
+                    onClick={restartFromWindow}
                     className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-primary px-2.5 font-medium text-primary-foreground disabled:opacity-50"
                   >
                     <RotateCcw className="size-3.5" aria-hidden />
@@ -572,22 +592,28 @@ export function SessionPane({
                 </div>
               </div>
             )}
-          {(session.status === "exited" || session.status === "killed") && (
+          {(notRunning || session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex max-w-xs flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 text-center shadow-lg">
                 <div className="space-y-1">
-                  <p className="text-sm font-medium">Shell exited</p>
-                  <p className="text-xs text-muted-foreground">
-                    {session.exit_code === null
-                      ? "The session stopped."
-                      : `Exit code ${session.exit_code}`}
+                  <p className="text-sm font-medium">
+                    {notRunning
+                      ? `This session is no longer running on ${session.host_name ?? "this host"}.`
+                      : "Shell exited"}
                   </p>
+                  {!notRunning && (
+                    <p className="text-xs text-muted-foreground">
+                      {session.exit_code === null
+                        ? "The session stopped."
+                        : `Exit code ${session.exit_code}`}
+                    </p>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
                     disabled={restartM.isPending}
-                    onClick={() => restartM.mutate()}
+                    onClick={restartFromWindow}
                     className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground disabled:opacity-50"
                   >
                     <RotateCcw className="size-3.5" aria-hidden />

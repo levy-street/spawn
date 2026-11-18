@@ -43,6 +43,7 @@ import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
 import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
+import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -56,6 +57,7 @@ import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui"
 import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
 import type { AgentDef } from "@/data/types/domain";
+import { useAppActive } from "@/lib/app-active";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { encodeKey } from "@/terminal/key-encoder";
@@ -84,7 +86,7 @@ export interface TerminalOverlayProps {
   onRename: (name: string) => Promise<void>;
   /** Restart the window as what it was opened as: a fresh shell, with the
    *  agent's resume command queued for it. */
-  onRestart: () => Promise<AgentRestartResult>;
+  onRestart: (confirmed?: SessionOut) => Promise<AgentRestartResult | null>;
   /** What restarting brings back, for the menu row. */
   restartDetail?: string;
   /** Agent definitions, for naming which agent's transcript this is. */
@@ -134,6 +136,9 @@ export function TerminalOverlay({
   onKill,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
+  const appActive = useAppActive();
+  const visibleRef = useRef(focused && appActive);
+  visibleRef.current = focused && appActive;
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
@@ -322,6 +327,14 @@ export function TerminalOverlay({
     [armLaunchFocus, host.host_public_key, session.status, transfers.setNotice, updateFollow],
   );
 
+  const sessionRow = JSON.stringify([session.host_id, session.status, session.started_at]);
+  const previousRow = useRef(sessionRow);
+  useEffect(() => {
+    const changed = previousRow.current !== sessionRow;
+    previousRow.current = sessionRow;
+    if (changed || (focused && appActive)) transportRef.current?.recheckNotRunning?.();
+  }, [focused, appActive, sessionRow]);
+
   const handleConnectionState = (next: TransportState): void => {
     const previous = previousConnectionState.current;
     previousConnectionState.current = next;
@@ -447,11 +460,12 @@ export function TerminalOverlay({
    * restarted and the agent's resume command waits for the fresh shell, which
    * the transport has to be reopened for.
    */
-  const restartFromHere = (): void => {
+  const restart = (confirmed?: SessionOut): void => {
     if (restarting) return;
     setRestarting(true);
-    void onRestart()
+    void onRestart(confirmed)
       .then((result) => {
+        if (!result) return;
         const agent = result.plan.kind === "agent" ? result.plan.agent.name : null;
         transfers.setNotice(
           agent
@@ -464,6 +478,18 @@ export function TerminalOverlay({
         transfers.setNotice(error instanceof Error ? error.message : "Session restart failed.");
       })
       .finally(() => setRestarting(false));
+  };
+
+  const notRunning = connectionState === "not-running";
+  const restartFromHere = () => {
+    if (notRunning) {
+      const transport = transportRef.current;
+      if (transport?.hostId === session.host_id) {
+        transport.recheckNotRunning?.(() => {
+          if (visibleRef.current && transportRef.current === transport) restart(session);
+        });
+      }
+    } else restart();
   };
 
   const takeDisplayControl = (): void => {
@@ -595,19 +621,38 @@ export function TerminalOverlay({
           </View>
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
-        <ConnectionStateOverlay
-          awaitingApproval={awaitingApproval}
-          error={connectionError}
-          hasEverBeenReady={hasEverBeenReady}
-          sharedConnectionReady={transportRef.current?.daemonState === "ready"}
-          sharedConnectionUnavailable={
-            transportRef.current?.daemonState !== undefined &&
-            transportRef.current.daemonState !== "ready"
-          }
-          onDeviceTrust={() => setApprovalVisible(true)}
-          onRetry={retry}
-          state={hostKey ? connectionState : "failed"}
-        />
+        {notRunning ? (
+          <View
+            style={[
+              StyleSheet.absoluteFill,
+              styles.unavailable,
+              {
+                gap: theme.space(2),
+                padding: theme.space(6),
+                backgroundColor: theme.colors.terminalBg,
+              },
+            ]}
+          >
+            <Text variant="label">{`This session is no longer running on ${session.host_name ?? host.name}.`}</Text>
+            <Button disabled={restarting} onPress={restartFromHere}>
+              {restarting ? "Restarting…" : "Restart"}
+            </Button>
+          </View>
+        ) : (
+          <ConnectionStateOverlay
+            awaitingApproval={awaitingApproval}
+            error={connectionError}
+            hasEverBeenReady={hasEverBeenReady}
+            sharedConnectionReady={transportRef.current?.daemonState === "ready"}
+            sharedConnectionUnavailable={
+              transportRef.current?.daemonState !== undefined &&
+              transportRef.current.daemonState !== "ready"
+            }
+            onDeviceTrust={() => setApprovalVisible(true)}
+            onRetry={retry}
+            state={hostKey ? connectionState : "failed"}
+          />
+        )}
         {shouldShowJumpToLatest(followState) ? (
           <View
             pointerEvents="box-none"

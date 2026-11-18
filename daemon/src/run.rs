@@ -3936,6 +3936,17 @@ async fn handle_session_create(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
+    let gate = registry.worker_gate(create.session_id);
+    let _change = gate.change.write().await;
+    launch_session(create, registry, rtc_sessions, out_tx).await;
+}
+
+async fn launch_session(
+    create: SessionCreate,
+    registry: &SessionRegistry,
+    rtc_sessions: &RtcSessions,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
     let session_id = create.session_id;
     tracing::info!(%session_id, "session.create");
 
@@ -8192,6 +8203,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_device_cannot_read_absence_during_a_window_change() {
+        let registry = SessionRegistry::new();
+        let rtc = RtcSessions::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let create = skilled_create(".");
+        let id = create.session_id;
+        let gate = registry.worker_gate(id);
+        let _hold = gate.change.read().await;
+        // These operations are parked at their first await, before any
+        // endpoint or registry entry exists. A queued writer excludes probes.
+        {
+            let launch = handle_session_create(create.clone(), &registry, &rtc, &tx);
+            tokio::pin!(launch);
+            assert!(futures_util::poll!(&mut launch).is_pending());
+            assert!(gate.change.try_read().is_err());
+        }
+        {
+            let adoption = ensure_session_attached(id, &registry, &rtc, &tx);
+            tokio::pin!(adoption);
+            assert!(futures_util::poll!(&mut adoption).is_pending());
+            assert!(gate.change.try_read().is_err());
+        }
+        {
+            let restart = handle_session_restart(create, &registry, &rtc, &tx);
+            tokio::pin!(restart);
+            assert!(futures_util::poll!(&mut restart).is_pending());
+            assert!(gate.change.try_read().is_err());
+        }
+        assert!(gate.change.try_read().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
     fn skilled_create(cwd: &str) -> SessionCreate {
         SessionCreate {
             session_id: Uuid::new_v4(),
@@ -8572,13 +8616,15 @@ mod tests {
     }
 }
 
-async fn handle_session_restart(
+pub(crate) async fn handle_session_restart(
     create: SessionCreate,
     registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let session_id = create.session_id;
+    let gate = registry.worker_gate(session_id);
+    let _change = gate.change.write().await;
     let daemon_pid = std::process::id();
     tracing::info!(daemon_pid, %session_id, "session.restart");
 
@@ -8659,7 +8705,7 @@ async fn handle_session_restart(
         return;
     }
     tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
-    handle_session_create(create, registry, rtc_sessions, out_tx).await;
+    launch_session(create, registry, rtc_sessions, out_tx).await;
     // The replacement is registered (or its failure is on the wire): a device
     // re-offering on this word is not refused for a session that is gone.
     if let Some(announcements) = announcements {
@@ -8822,13 +8868,13 @@ async fn send_spawn_failed_exit(session_id: Uuid, out_tx: &mpsc::Sender<WsOutbou
     }
 }
 
-async fn spawn_exit_forwarder(
+pub(crate) async fn spawn_exit_forwarder(
     session_id: Uuid,
     generation: u64,
     exit_rx: tokio::sync::oneshot::Receiver<pty::ExitReason>,
     registry: SessionRegistry,
     rtc_sessions: RtcSessions,
-    out_tx: mpsc::Sender<WsOutbound>,
+    out_tx: Option<mpsc::Sender<WsOutbound>>,
 ) {
     let reason = exit_rx.await.unwrap_or(pty::ExitReason {
         exit_code: None,
@@ -8851,7 +8897,8 @@ async fn spawn_exit_forwarder(
         exit_code: reason.exit_code,
         signal: reason.signal,
     };
-    if let Ok(s) = serde_json::to_string(&exit) {
+    let out_tx = out_tx.or_else(|| rtc_sessions.registered_sender().as_deref().cloned());
+    if let (Some(out_tx), Ok(s)) = (out_tx, serde_json::to_string(&exit)) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
     }
     // Only now: a device told `unavailable` before the exit would re-offer
@@ -8934,7 +8981,7 @@ async fn register_attached(
         exit_rx,
         registry.clone(),
         rtc_sessions.clone(),
-        out_tx.clone(),
+        Some(out_tx.clone()),
     ));
 }
 
@@ -8960,7 +9007,8 @@ async fn ensure_session_attached(
     }
     // Serialize lazy adoption: snapshot bursts and stdin dispatch racing here
     // would double-connect and displace each other's worker connections.
-    let _guard = registry.lock_attach().await;
+    let gate = registry.worker_gate(session_id);
+    let _guard = gate.change.write().await;
     if registry.contains(session_id) {
         return AttachOutcome::Attached;
     }
@@ -8999,4 +9047,5 @@ async fn rediscover_existing_sessions(
             }
         }
     }
+    registry.finish_discovery();
 }

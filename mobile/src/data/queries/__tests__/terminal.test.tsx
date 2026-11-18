@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react-native";
+import { act, renderHook, waitFor } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession } from "@/data/api/endpoints/sessions";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
-import { useTerminalData } from "@/data/queries/terminal";
+import { useRestartTerminalSession, useTerminalData } from "@/data/queries/terminal";
 import { qk } from "@/data/queryKeys";
 
 jest.mock("@/data/api/endpoints/hosts", () => ({ getHost: jest.fn() }));
@@ -23,6 +23,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   client = new QueryClient({
     defaultOptions: {
+      mutations: { gcTime: 0 },
       queries: { retry: false, staleTime: 10_000, gcTime: Number.POSITIVE_INFINITY },
     },
   });
@@ -63,3 +64,21 @@ test("invalidated and removed account data cannot seed a terminal", async () => 
   expect(next.result.current.session).toBeUndefined();
   expect(next.result.current.host).toBeUndefined();
 });
+
+test.each([{ status: "starting" as const }, { started_at: new Date(0).toISOString() }])(
+  "a newer list and the Restart detail check both notice a replacement on the same host",
+  async (change) => {
+    const replacement = { ...session, ...change };
+    client.setQueryData(qk.session(session.id), session, { updatedAt: Date.now() - 1000 });
+    client.setQueryData(qk.sessions(), [replacement]);
+    jest.mocked(getSession).mockResolvedValue(replacement);
+    const { result } = await renderHook(
+      () => ({ data: useTerminalData(session.id), restart: useRestartTerminalSession(session.id) }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.data.session).toEqual(replacement));
+    await act(async () => {
+      expect(await result.current.restart.mutateAsync(session)).toBeNull();
+    });
+  },
+);
