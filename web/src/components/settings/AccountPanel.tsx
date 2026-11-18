@@ -2,6 +2,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
+import { SupportLogSettings } from "@/components/settings/SupportLogSettings";
 import { Button } from "@/components/ui/button";
 import { confirm as confirmAction } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
@@ -290,6 +291,8 @@ export function AccountPanel() {
           </Button>
         </div>
       </div>
+
+      {user && <SupportLogSettings key={user.id} accountId={user.id} />}
 
       <div className="space-y-3 rounded-md border border-destructive/50 p-3">
         <div>

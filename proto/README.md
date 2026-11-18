@@ -46,6 +46,7 @@ optional `registered.support_log_consent`, `host.support_log_consent`, and
 The daemon can verify and upload, but no server sender/storage or app signer
 exists yet, so sharing remains off. The spec defines null versus absent,
 account/device authorization, NDJSON body limits, local receipts and POST headers.
+Since that daemon release, web and phone sign the choice in Account and check the wording against `support-log-copy.json`.
 
 ## Identifiers
 

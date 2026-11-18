@@ -163,6 +163,10 @@ export default function SecurityPage() {
                 <LedgerItem tone="ash">That an agent stirred — never what it said</LedgerItem>
                 <LedgerItem tone="ash">Connection timing and approximate volume</LedgerItem>
                 <LedgerItem tone="ash">
+                  If you turn on diagnostic logs, the server can receive and keep a machine’s SPAWN
+                  D log for 7 days.
+                </LedgerItem>
+                <LedgerItem tone="ash">
                   Self-host the whole stack if even this is too much
                 </LedgerItem>
               </ul>

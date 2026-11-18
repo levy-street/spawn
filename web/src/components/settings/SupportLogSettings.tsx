@@ -1,0 +1,65 @@
+"use client";
+
+import { useSyncExternalStore } from "react";
+import { SwitchRow } from "@/components/ui/switch";
+import { useSupportLog } from "@/hooks/useSupportLog";
+import { collectionLine } from "@/lib/support-log";
+import copy from "@/lib/support-log-copy.json";
+
+function subscribeVisibility(listener: () => void) {
+  document.addEventListener("visibilitychange", listener);
+  return () => document.removeEventListener("visibilitychange", listener);
+}
+
+export function SupportLogSettings({ accountId }: { accountId: string }) {
+  const visible = useSyncExternalStore(
+    subscribeVisibility,
+    () => !document.hidden,
+    () => false,
+  );
+  return visible ? <VisibleSupportLog accountId={accountId} /> : null;
+}
+
+function VisibleSupportLog({ accountId }: { accountId: string }) {
+  const { state, approved, change, busy, message } = useSupportLog(accountId);
+  if (!state) return null;
+  return (
+    <section
+      aria-label={copy.title}
+      className="space-y-3 rounded-md border border-border p-3 text-sm"
+    >
+      <h3 className="font-medium">{copy.title}</h3>
+      <SwitchRow
+        label={copy.switchLabel}
+        hint={copy.description}
+        checked={state.sharing === "on"}
+        onCheckedChange={change}
+        disabled={busy || approved !== true}
+      />
+      {approved === false && <p>{copy.cannotSign}</p>}
+      {state.sharing === "off_signer_removed" && <p>{copy.offSignerRemoved}</p>}
+      {message && <p role="status">{message}</p>}
+      {state.hosts
+        .filter((host) => !host.capable)
+        .map((host) => (
+          <p key={host.id}>{copy.needsUpdate.replace("{machine}", () => host.name)}</p>
+        ))}
+      <h4 className="font-medium">{copy.collected}</h4>
+      {state.collections.length === 0 ? (
+        <p>{copy.empty}</p>
+      ) : (
+        <ul className="space-y-2">
+          {state.collections.map((row) => (
+            <li key={row.id}>
+              <p>{collectionLine(row)}</p>
+              <p className="text-muted-foreground">
+                {copy.reason.replace("{reason}", () => row.reason)}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-muted-foreground">{copy.help}</p>
+    </section>
+  );
+}

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { clearNotificationPreferences } from "@/components/settings/notification-preferences";
 import { SettingsScreen } from "@/components/settings/settings-screen";
+import { SupportLogSettings } from "@/components/settings/support-log-settings";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Collapse } from "@/components/ui/collapse";
@@ -153,6 +154,8 @@ export function AccountPanel(): React.JSX.Element {
           Sign out everywhere
         </Button>
       )}
+
+      {user && <SupportLogSettings key={user.id} accountId={user.id} />}
 
       <Card
         style={{ borderColor: theme.colors.destructive }}

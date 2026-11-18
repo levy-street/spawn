@@ -26,6 +26,11 @@ import {
   type RegistrationTranscript,
 } from "@/lib/crypto/transcripts";
 import { secureStorage } from "@/lib/secure-storage";
+import {
+  checkedConsentTime,
+  encodeSupportLogConsent,
+  type SupportLogConsent,
+} from "./support-log-consent";
 
 const IDENTITY_KEY_PREFIX = "spawn.identity.ed25519.v1.";
 const REGISTRATION_KEY_PREFIX = "spawn.identity.registration.v1.";
@@ -264,6 +269,29 @@ export const deviceIdentity = {
     const loaded = validateRecord(record);
     loaded.seed.fill(0);
     return loaded.publicKey;
+  },
+
+  async signSupportLogConsent(statement: SupportLogConsent): Promise<Uint8Array> {
+    // Only use an existing identity. An ordinary connection may create one.
+    const record = await readRecord(statement.account_id);
+    if (
+      !record ||
+      currentAccount() !== record.accountId ||
+      record.publicKey !== statement.signer_public_key
+    ) {
+      throw new DeviceIdentityError(
+        "IDENTITY_ABSENT",
+        "Support log consent does not match this device",
+      );
+    }
+    checkedConsentTime(statement.issued_at_ms);
+    const loaded = validateRecord(record);
+    try {
+      return signPureEd25519(loaded.seed, encodeSupportLogConsent(statement));
+    } finally {
+      loaded.seed.fill(0);
+      loaded.publicKey.fill(0);
+    }
   },
 
   signSignalTranscript(transcript: SignalTranscript): Promise<Uint8Array> {

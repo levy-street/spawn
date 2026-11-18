@@ -1,3 +1,4 @@
+import supportLogCopy from "@/components/settings/support-log-copy.json";
 import type { IconName } from "@/components/ui/icon";
 
 export type SettingsPanelKey =
@@ -30,6 +31,7 @@ export const SETTINGS_PANELS = [
       "Signed in as",
       "Resend verification email",
       "Log out",
+      supportLogCopy.switchLabel,
       "Delete account…",
       "Type your email to confirm",
       "Password",

@@ -22,6 +22,12 @@ import {
   verifySignedSignalTranscript,
 } from "./signed-signal";
 
+import {
+  checkedConsentTime,
+  encodeSupportLogConsent,
+  type SupportLogConsent,
+} from "./support-log-consent";
+
 export const BROWSER_DEVICE_IDENTITY_STORAGE_VERSION = 1;
 export const BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS = 32;
 export const BROWSER_DEVICE_IDENTITY_STORE_NAME = "device-identities";
@@ -567,6 +573,28 @@ function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
   };
   privateIdentityRecords.set(identity, record);
   return Object.freeze(identity);
+}
+
+export async function signSupportLogConsent(
+  identity: BrowserDeviceIdentity,
+  statement: SupportLogConsent,
+): Promise<string> {
+  const record = privateIdentityRecords.get(identity);
+  if (
+    !record ||
+    record.accountId !== statement.account_id ||
+    record.publicKeyWire !== statement.signer_public_key
+  ) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "Support log consent does not match this device",
+    );
+  }
+  checkedConsentTime(statement.issued_at_ms);
+  const bytes = encodeSupportLogConsent(statement);
+  return encodeBase64Url(
+    new Uint8Array(await crypto.subtle.sign("Ed25519", record.privateKey, bytes)),
+  );
 }
 
 /**

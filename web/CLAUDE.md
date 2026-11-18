@@ -142,6 +142,12 @@ from the catalogue. Every claim about spawnd survives a diff against
   a deposed tab on page code from before #101 and is never followed.
   Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
 
+## Account settings
+
+Diagnostic logs appear before account deletion when the support log route answers.
+Opening Account, returning to it, or receiving a `support-log` data event there
+refreshes the setting and collection history. A saved change supplies both in its response.
+
 ## Before calling a change done
 
 ```bash
