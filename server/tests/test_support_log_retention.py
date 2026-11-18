@@ -19,7 +19,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, update
 
-from spawn_server import auth, main, support_log_files, support_log_retention
+from spawn_server import auth, main, support_log_cli, support_log_files, support_log_retention
 from spawn_server.config import get_settings
 from spawn_server.db import Base, dispose_engine, get_sessionmaker, init_engine
 from spawn_server.models import AuthIdentity, Host, SupportLogCollection, User
@@ -35,6 +35,7 @@ from tests.test_support_consent import seed_statement, sign
 from tests.test_support_log_uploads import (
     BODY,
     app,
+    bundle_entries,
     post,
     raw_request,
     seed_request,
@@ -169,16 +170,9 @@ async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     assert not await mark_dispatched(requested)
 
 
-@pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup", "timeout"])
-async def test_account_deletion_removes_files_and_cascades(
-    client, storage, monkeypatch, caplog, failure
-):
-    record_id, token, statement, _key, host = await setup_request()
-    assert (await post(client, record_id, token)).status_code == 204
-    other, other_token, *_ = await setup_request()
-    assert (await post(client, other, other_token)).status_code == 204
+async def linked_user(owner):
     async with get_sessionmaker()() as session:
-        user = await session.get(User, statement["account_id"])
+        user = await session.get(User, owner)
         session.add(
             AuthIdentity(
                 user_id=user.id,
@@ -188,6 +182,18 @@ async def test_account_deletion_removes_files_and_cascades(
             )
         )
         await session.commit()
+    return user
+
+
+@pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup", "timeout"])
+async def test_account_deletion_removes_files_and_cascades(
+    client, storage, monkeypatch, caplog, failure
+):
+    record_id, token, statement, _key, host = await setup_request()
+    assert (await post(client, record_id, token)).status_code == 204
+    other, other_token, *_ = await setup_request()
+    assert (await post(client, other, other_token)).status_code == 204
+    user = await linked_user(statement["account_id"])
     socket = Mock(close=AsyncMock())
     broker = Mock(get_daemon_for_host=Mock(return_value=socket))
     monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
@@ -268,8 +274,62 @@ async def test_account_deletion_removes_files_and_cascades(
         assert storage.path(other).exists()
 
 
+async def test_stalled_cleanup_leaves_later_deletions_to_the_orphan_sweep(client, storage, monkeypatch):
+    requests = []
+    bundles = []
+    for _ in range(10):
+        record, token, statement, *_ = await setup_request()
+        assert (await post(client, record, token)).status_code == 204
+        user = await linked_user(statement["account_id"])
+        requests.append(dict(
+            json={"confirm_email": user.email},
+            headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
+        ))
+        bundles.append(storage.path(record))
+
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+    remove = support_log_files._remove_committed
+
+    def stall(*args):
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(30)
+        remove(*args)
+
+    timeout = asyncio.timeout
+    deadline = timeout(None)
+    monkeypatch.setattr(asyncio, "timeout", lambda delay: deadline if delay == 2 else timeout(delay))
+    monkeypatch.setattr(support_log_files, "monotonic", lambda: 0)
+    monkeypatch.setattr(support_log_files, "_remove_committed", stall)
+    dup = Mock(wraps=os.dup)
+    submit = Mock(wraps=storage.submit_cleanup)
+    monkeypatch.setattr(os, "dup", dup)
+    monkeypatch.setattr(storage, "submit_cleanup", submit)
+    try:
+        for i, credentials in enumerate(requests):
+            result = await client.post("/api/account/delete", **credentials)
+            assert result.status_code == 204 and result.content == b""
+            assert 'spawn_session=""' in result.headers["set-cookie"]
+            assert "Max-Age=0" in result.headers["set-cookie"]
+            if i == 0:
+                await asyncio.wait_for(entered.wait(), 30)
+                (waiter,) = (job for job in storage.cleanup_tasks if isinstance(job, asyncio.Task))
+                deadline.reschedule(loop.time())
+                await asyncio.wait_for(waiter, 30)
+        dup.assert_called_once_with(storage.fd)
+        submit.assert_called_once()
+        (worker,) = storage.cleanup_tasks
+        assert not worker.done() and all(bundle.exists() for bundle in bundles)
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*storage.cleanup_tasks), 30)
+    assert not bundles[0].exists() and all(bundle.exists() for bundle in bundles[1:])
+    await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
+    assert not bundle_entries(storage)
+
+
 @pytest_asyncio.fixture
-async def lifespan_db(tmp_path, monkeypatch):
+async def lifespan_db(tmp_path, monkeypatch, sansio_launch):
     monkeypatch.setattr(get_settings(), "database_url", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
     engine = init_engine()
     try:
@@ -297,10 +357,12 @@ async def assert_unknown_paths(app):
 
 async def test_disabled_routes_match_unknown_paths(lifespan_db, no_sweeps, monkeypatch, caplog):
     monkeypatch.setattr(get_settings(), "support_log_dir", None)
+    monkeypatch.setattr(support_log_files, "_uses_sansio", Mock(side_effect=AssertionError))
     monkeypatch.setattr(support_log_files, "_store", lambda _: pytest.fail("unexpected store"))
     caplog.set_level(logging.INFO, logger="spawn.support_log")
     app = main.create_app()
     async with app.router.lifespan_context(app):
+        assert get_store(app) is None and not hasattr(app.state, "support_log_pump")
         await assert_unknown_paths(app)
     assert not any(r.name == "spawn.support_log" for r in caplog.records)
 
@@ -427,10 +489,40 @@ async def test_bad_configuration_logs_once_and_stays_off(
     assert not list(tmp_path.glob(".support-*"))
 
 
-@pytest.mark.parametrize("first_usable", [True, False])
-async def test_each_lifespan_checks_storage(lifespan_db, tmp_path, monkeypatch, first_usable):
+@pytest.mark.parametrize("argv", [
+    [], ["--ws", "websockets"], ["--ws=auto"], ["--ws=websockets-sansio", "--ws", "auto"],
+    ["--root-path", "--ws=websockets-sansio"], ["--", "--ws=websockets-sansio"],
+])
+async def test_backend_refusal_disables_the_whole_feature(
+    lifespan_db, no_sweeps, tmp_path, monkeypatch, caplog, argv
+):
     directory = tmp_path / "storage"
     monkeypatch.setattr(get_settings(), "support_log_dir", str(directory))
+    # Leave the marked directory from a previous, successful launch in place.
+    store = await support_log_files.prepare_store()
+    store.close()
+    monkeypatch.setenv("UVICORN_WS", "websockets-sansio")
+    monkeypatch.setattr(sys, "argv", [sys.argv[0], *argv])
+    monkeypatch.setattr(support_log_files, "_store", Mock(side_effect=AssertionError))
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="spawn.support_log")
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        assert get_store(app) is None and not hasattr(app.state, "support_log_pump")
+        await assert_unknown_paths(app)
+        assert await support_log_cli.run(["accounts"]) == 8
+    assert [(r.levelno, r.message) for r in caplog.records if r.name == "spawn.support_log"] == [
+        (logging.ERROR, "SPAWN D support logs require --ws websockets-sansio")
+    ]
+
+
+@pytest.mark.parametrize(("first_usable", "argv"), [
+    (True, ["--ws", "websockets-sansio"]), (False, ["--ws=websockets-sansio"]),
+])
+async def test_each_lifespan_checks_storage(lifespan_db, tmp_path, monkeypatch, first_usable, argv):
+    directory = tmp_path / "storage"
+    monkeypatch.setattr(get_settings(), "support_log_dir", str(directory))
+    monkeypatch.setattr(sys, "argv", [sys.argv[0], *argv])
     app = main.create_app()
     for usable in (first_usable, not first_usable):
         if usable:
@@ -440,12 +532,15 @@ async def test_each_lifespan_checks_storage(lifespan_db, tmp_path, monkeypatch, 
         async with app.router.lifespan_context(app):
             if usable:
                 assert get_store(app).root == directory
+                assert hasattr(app.state, "support_log_pump")
+                assert await support_log_cli.run(["accounts"]) == 0
                 assert "post" in app.openapi()["paths"][url("{request_id}")]
             else:
                 assert get_store(app) is None
                 await assert_unknown_paths(app)
         assert get_store(app) is None
         if usable:
+            (directory / support_log_files.READY_PIPE).unlink()
             directory.rmdir()
         else:
             directory.unlink()
@@ -461,6 +556,8 @@ async def test_shutdown_bounds_cleanup_with_worker_still_holding_lock(
     locked = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
+    monkeypatch.setattr(support_log_files, "monotonic", lambda: 0)
+    cleanup_threads = []
 
     async def sweep(store, **kwargs):
         await start_sweep.wait()
@@ -487,6 +584,7 @@ async def test_shutdown_bounds_cleanup_with_worker_still_holding_lock(
                 loop.call_soon_threadsafe(contended.set)
             else:
                 assert fd is not None
+                cleanup_threads.append(threading.current_thread())
                 loop.call_soon_threadsafe(locked.set)
                 release.wait(30)
             return fd
@@ -522,6 +620,8 @@ async def test_shutdown_bounds_cleanup_with_worker_still_holding_lock(
         assert not server.done() and not worker.done() and store.fd is not None
         expire()
         await asyncio.wait_for(server, 30)
+        (thread,) = cleanup_threads
+        assert thread.daemon and thread.is_alive() and not release.is_set()
         assert store.fd is None and store.cleanup_tasks == {worker}
         await support_log_retention.start_file_cleanup(store, [bundle.stem])
         assert store.cleanup_tasks == {worker}
@@ -671,7 +771,7 @@ async def test_upload_during_account_deletion(file_sqlite_client, storage, monke
     result = await asyncio.wait_for(deletion, 30)
     assert result.status_code == 204
     await asyncio.wait_for(asyncio.gather(*storage.cleanup_tasks), 30)
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
     assert await get_collection(record_id) is None
 
 
@@ -684,13 +784,13 @@ async def test_sweep_only_unlinks_store_names_and_rechecks_identity(client, stor
         path.write_bytes(BODY)
         os.utime(path, (1, 1))
     await sweep_once(storage)
-    assert set(storage.root.iterdir()) == {unrelated, unrelated_temp}
+    assert bundle_entries(storage) == {unrelated, unrelated_temp}
     old.write_bytes(BODY)
     os.utime(old, (1, 1))
     os.removexattr(storage.root, support_log_files.STORE_ATTRIBUTE)
     with pytest.raises(OSError):
         await sweep_once(storage)
-    assert set(storage.root.iterdir()) == {unrelated, unrelated_temp, old}
+    assert bundle_entries(storage) == {unrelated, unrelated_temp, old}
 
 
 async def test_delayed_off_cleanup_only_removes_its_committed_files(client, storage, monkeypatch):

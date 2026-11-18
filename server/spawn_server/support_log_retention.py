@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
@@ -130,10 +129,10 @@ async def remove_files(store, ids):
     # Try the lock once. A slow filesystem cannot delay the caller past
     # the deadline. The worker owns its locked descriptor until it finishes.
     try:
-        if store.cleanup_stopping.is_set():
+        worker = store.submit_cleanup(ids, CLEANUP_SECONDS)
+        if worker is None:
             return
-        deadline = time.monotonic() + CLEANUP_SECONDS
-        worker = _track_cleanup(store.cleanup_tasks, store.submit_cleanup(ids, deadline))
+        _track_cleanup(store.cleanup_tasks, worker)
         async with asyncio.timeout(CLEANUP_SECONDS):
             await asyncio.shield(worker)
     except Exception:
@@ -142,7 +141,7 @@ async def remove_files(store, ids):
 
 async def start_file_cleanup(store, ids):
     """Called after the delete response has been sent. The sweep covers interruptions."""
-    if not store.cleanup_stopping.is_set():
+    if not store.cleanup_tasks and not store.cleanup_stopping.is_set():
         _track_cleanup(store.cleanup_tasks, asyncio.create_task(remove_files(store, ids)))
 
 

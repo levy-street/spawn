@@ -31,7 +31,7 @@ from tests.test_ws_daemon import FakeDaemonWebSocket, _create_host, _create_sess
 
 
 @pytest.mark.parametrize("unusable", [False, True])
-async def test_disabled_lifecycle(app, file_sqlite_client, tmp_path, monkeypatch, unusable):
+async def test_disabled_lifecycle(app, file_sqlite_client, tmp_path, monkeypatch, unusable, sansio_launch):
     settings = get_settings()
     configured = tmp_path / "unusable"
     configured.touch()

@@ -1653,12 +1653,14 @@ then start depending on them in the next.
 
 The support log storage migration (0072) adds two tables and the
 default-false `hosts.support_log_capable` column. Old server code tolerates all
-three additions. `SPAWN_SUPPORT_LOG_DIR` is the one storage setting: leave it
-unset to keep support storage and dispatch off.
-If enabled later, it must name an absolute private directory outside the
-checkout and database backups. The directory must be on the server's local
-disk because each startup waits for a worker thread to prepare it with mode
-0700 and check locking and writing. A failure logs one error and keeps storage
+three additions. Leave `SPAWN_SUPPORT_LOG_DIR` unset to keep support logs off.
+To switch them on, create an empty private directory (mode 0700) on local
+disk outside the checkout and database backups. Set `SPAWN_SUPPORT_LOG_DIR` to
+its absolute path, add `--ws websockets-sansio` to the server launch command,
+and restart the server. This backend can answer a daemon Ping while an
+application write is paused without closing the connection.
+Startup checks the launch flag before a worker checks the directory's locking
+and writing. A failure logs one error and keeps storage
 off for that lifespan. The apps still need to sign the owner's statement before
 collection is possible. Read the support log section of `docs/TRUST.md` before
 enabling this storage.

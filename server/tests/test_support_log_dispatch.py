@@ -12,8 +12,12 @@ import pytest
 from aiosqlite import Connection
 from sqlalchemy import delete, event, select, text
 from sqlalchemy.exc import OperationalError
+from uvicorn import Config
+from uvicorn.server import ServerState
+from websockets.frames import Frame, Opcode
 from websockets.legacy.server import WebSocketServerProtocol
 from websockets.protocol import State
+from websockets.utils import generate_key
 
 from spawn_server import (
     auth,
@@ -850,11 +854,17 @@ async def test_collect_while_sqlite_commit_notification_is_held(
         writer = asyncio.create_task(store_statement(owner, newer))
         try:
             await asyncio.wait_for(committed.wait(), 30)
+            writer.cancel()
+            await asyncio.sleep(0)
+            writer.cancel()
+            await asyncio.sleep(0)
             assert await get_statement(owner) == newer
+            assert not writer.done()
             assert statement_generation(owner) == generation and statement_commit_in_progress(owner)
             if notify_first:
                 notify.set()
-                await asyncio.wait_for(writer, 30)
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writer, 30)
             release_claim.set()
             await asyncio.wait_for(scan, 30)
             record = await get_collection(queued)
@@ -866,7 +876,9 @@ async def test_collect_while_sqlite_commit_notification_is_held(
         finally:
             notify.set()
             release_claim.set()
-            await asyncio.wait_for(asyncio.gather(writer, scan), 30)
+            await asyncio.wait_for(scan, 30)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(writer, 30)
         assert statement_generation(owner) == generation + 1
         assert not statement_commit_in_progress(owner)
         await pump.run_once()
@@ -1013,6 +1025,44 @@ async def test_reduce_failure_isolated_to_one_account(app, pump, monkeypatch, ca
     assert (await get_collection(requests[broken])).state == "requested"
     assert (await get_collection(requests[healthy])).state == "cancelled"
     assert "one account" in caplog.text
+
+
+async def test_sansio_answers_ping_with_application_traffic_on_a_paused_transport():
+    sending, finish = asyncio.Event(), asyncio.Event()
+    payload = b"support_log.collect"
+
+    async def app(scope, receive, send):
+        await send({"type": "websocket.accept"})
+        protocol.pause_writing()
+        sending.set()
+        await send({"type": "websocket.send", "bytes": payload})
+        await finish.wait()
+
+    config = Config(app, ws="websockets-sansio", ws_ping_interval=None, log_config=None)
+    config.load()
+    state = ServerState()
+    protocol = config.ws_protocol_class(config, state, {})
+    transport = Mock(get_extra_info=Mock(return_value=None), is_closing=lambda: False)
+    protocol.connection_made(transport)
+    key = generate_key().encode()
+    protocol.data_received(
+        b"GET / HTTP/1.1\r\nHost:\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + b"\r\n\r\n"
+    )
+    try:
+        await asyncio.wait_for(sending.wait(), 30)
+        (handshake,) = transport.write.call_args_list[0].args
+        assert handshake.startswith(b"HTTP/1.1 101")
+        protocol.data_received(Frame(Opcode.PING, b"echo").serialize(mask=True))
+        transport.write.assert_called_with(Frame(Opcode.PONG, b"echo").serialize(mask=False))
+        transport.close.assert_not_called()
+    finally:
+        protocol.resume_writing()
+        finish.set()
+        await asyncio.wait_for(asyncio.gather(*state.tasks), 30)
+        protocol.connection_lost(None)
+    transport.write.assert_any_call(Frame(Opcode.BINARY, payload).serialize(mask=False))
+    assert transport.write.call_count == 3
 
 
 @pytest.mark.parametrize("ordinary", ["host.heartbeat", "host.browser_pins"])

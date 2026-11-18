@@ -12,13 +12,14 @@ import logging
 import os
 import re
 import stat
+import sys
 import tempfile
 import threading
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from concurrent.futures import Future
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from time import monotonic
 
 try:
     import fcntl
@@ -33,6 +34,7 @@ log = logging.getLogger("spawn.support_log")
 
 STORE_ATTRIBUTE = "user.spawnd.support-log-store"
 STORE_VERSION = b"v1"
+READY_PIPE = ".server-ready"
 UUID_NAME = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 STORE_FILE = re.compile(rf"(?:{UUID_NAME}\.ndjson|\.upload-{UUID_NAME}\.tmp)")
 
@@ -86,7 +88,7 @@ def _remove_committed(parent, ids, deadline, stopping):
     try:
         if stopping.is_set():
             return
-        if time.monotonic() >= deadline:
+        if monotonic() >= deadline:
             raise TimeoutError
         fd = _try_store_lock(parent)
     finally:
@@ -97,7 +99,7 @@ def _remove_committed(parent, ids, deadline, stopping):
         for record_id in ids:
             if stopping.is_set():
                 break
-            if time.monotonic() >= deadline:
+            if monotonic() >= deadline:
                 raise TimeoutError
             try:
                 canonical_uuid(record_id)
@@ -111,13 +113,16 @@ def _remove_committed(parent, ids, deadline, stopping):
 async def finish_job(awaitable):
     """Do not abandon an in-flight disk write or its database finalization."""
     task = asyncio.ensure_future(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    cancelled = None
+    while not task.done():
         try:
-            await task
-        finally:
-            raise
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    result = task.result()
+    if cancelled is not None:
+        raise cancelled
+    return result
 
 
 class SupportLogFiles:
@@ -126,8 +131,8 @@ class SupportLogFiles:
         self._entries = None
         self.cleanup_tasks: set[asyncio.Future] = set()
         self.cleanup_stopping = threading.Event()
-        # A stalled cleanup must leave the sweep a thread to close the store.
-        self._cleanup_executor = ThreadPoolExecutor(max_workers=1)
+        self._cleanup_thread: threading.Thread | None = None
+        self.ready_reader = None
         self.fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
     def path(self, record_id: str) -> Path:
@@ -186,16 +191,34 @@ class SupportLogFiles:
     def remove(self, record_id: str, *, dir_fd=None):
         self.unlink(self.path(record_id).name, dir_fd=dir_fd)
 
-    def submit_cleanup(self, ids, deadline):
+    def submit_cleanup(self, ids, seconds):
+        # Only the event loop submits. The job outlives a timed-out waiter.
+        if self.cleanup_stopping.is_set() or (
+            self._cleanup_thread is not None and self._cleanup_thread.is_alive()
+        ):
+            return None
+        deadline = monotonic() + seconds
+        job = Future()
+        job.set_running_or_notify_cancel()
+        waiter = asyncio.wrap_future(job)
         parent = os.dup(self.fd)
+
+        def run():
+            try:
+                _remove_committed(parent, ids, deadline, self.cleanup_stopping)
+            except BaseException as exc:
+                job.set_exception(exc)
+            else:
+                job.set_result(None)
+
         try:
-            return asyncio.get_running_loop().run_in_executor(
-                self._cleanup_executor, _remove_committed, parent, ids, deadline,
-                self.cleanup_stopping,
-            )
+            thread = threading.Thread(target=run, name="support-log-cleanup", daemon=True)
+            thread.start()
         except BaseException:
             os.close(parent)
             raise
+        self._cleanup_thread = thread
+        return waiter
 
     def unlink(self, name, *, dir_fd=None):
         _unlink(name, self.fd if dir_fd is None else dir_fd)
@@ -233,7 +256,8 @@ class SupportLogFiles:
 
     def close(self):
         self.cleanup_stopping.set()
-        self._cleanup_executor.shutdown(wait=False)
+        if self.ready_reader is not None:
+            self.ready_reader.close()
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
@@ -295,13 +319,54 @@ def _store(directory: str) -> SupportLogFiles:
     return SupportLogFiles(root)
 
 
+def _uses_sansio(argv: list[str]) -> bool:
+    try:
+        from click.core import ParameterSource
+        from uvicorn import main as uvicorn_cli
+
+        # Distinguish an explicit option from an environment default or another option's value.
+        with uvicorn_cli.make_context("uvicorn", argv.copy(), resilient_parsing=True) as ctx:
+            return (
+                ctx.get_parameter_source("ws") is ParameterSource.COMMANDLINE
+                and ctx.params.get("ws") == "websockets-sansio"
+            )
+    except Exception:
+        return False
+
+
+def _open_ready_pipe(parent, flags):
+    fd = os.open(READY_PIPE, flags | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise OSError("Expected a support readiness pipe")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _prepare_server_store(directory):
+    store = _store(directory)
+    try:
+        with suppress(FileExistsError):
+            os.mkfifo(READY_PIPE, 0o600, dir_fd=store.fd)
+        store.ready_reader = os.fdopen(_open_ready_pipe(store.fd, os.O_RDONLY), "rb", buffering=0)
+        return store
+    except BaseException:
+        store.close()
+        raise
+
+
 async def prepare_store() -> SupportLogFiles | None:
     directory = get_settings().support_log_dir
     if not directory:
         return None
+    if not _uses_sansio(sys.argv[1:]):
+        log.error("SPAWN D support logs require --ws websockets-sansio")
+        return None
     log.info("Checking support log storage")
     try:
-        return await finish_job(asyncio.to_thread(_store, directory))
+        return await finish_job(asyncio.to_thread(_prepare_server_store, directory))
     except Exception:
         log.error("SPAWN D support log storage is unusable; sharing storage is off")
         return None
@@ -313,6 +378,9 @@ def open_existing_store(*, probe_write=False):
         raise OSError("Support log storage is not configured or usable.")
     store = SupportLogFiles(_store_root(directory))
     try:
+        _verify_identity(store.fd)
+        # A nonblocking writer can open the FIFO only while a ready server holds its reader.
+        os.close(_open_ready_pipe(store.fd, os.O_WRONLY))
         if probe_write:
             fcntl.flock(store.fd, fcntl.LOCK_EX)
             try:
@@ -320,8 +388,6 @@ def open_existing_store(*, probe_write=False):
                 _write_probe(store.fd)
             finally:
                 fcntl.flock(store.fd, fcntl.LOCK_UN)
-        else:
-            _verify_identity(store.fd)
         return store
     except BaseException:
         store.close()

@@ -23,10 +23,13 @@ from tests.test_support_log_uploads import BODY
 
 
 @pytest.fixture
-async def configured(tmp_path, monkeypatch):
+async def configured(tmp_path, monkeypatch, sansio_launch):
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
     store = await prepare_store()
-    store.close()
+    try:
+        yield store
+    finally:
+        store.close()
 
 
 def collect(owner, host):
@@ -215,8 +218,7 @@ async def test_show_checks_record_file_expiry_and_purge(app, configured, capsys)
         digest=hashlib.sha256(BODY).hexdigest(), size_bytes=len(BODY), line_count=1,
     )
     assert "file is missing" in (await output(["show", queued], capsys, 9))["error"]
-    store = await prepare_store()
-    store.write(queued, BODY)
+    configured.write(queued, BODY)
     assert (await output(["show", queued], capsys))["bundle"] == [{"format": 3}, {"event": 1}]
     assert await cli.run(["show", queued, "--raw"]) == 0
     assert capsys.readouterr().out.encode() == BODY
@@ -226,8 +228,7 @@ async def test_show_checks_record_file_expiry_and_purge(app, configured, capsys)
     assert "expired" in (await output(["show", queued], capsys, 9))["error"]
     assert await cli.run(["purge"]) == 0
     assert "finished" in capsys.readouterr().out
-    assert (await get_collection(queued)).state == "deleted" and not store.path(queued).exists()
-    store.close()
+    assert (await get_collection(queued)).state == "deleted" and not configured.path(queued).exists()
 
 
 @pytest.mark.parametrize(
@@ -240,8 +241,7 @@ async def test_show_verifies_entire_file_before_output(app, configured, capsys, 
     owner = value["account_id"]
     record = await request(owner, await capable(owner))
     assert await mark_dispatched(record)
-    store = await prepare_store()
-    path = store.path(record)
+    path = configured.path(record)
     contents = BODY
     expected = BODY
     if damage == "swapped":
@@ -257,8 +257,8 @@ async def test_show_verifies_entire_file_before_output(app, configured, capsys, 
             line_count=1,
             expires_at=_utcnow() + timedelta(days=1),
         )
-        store.write(other, contents)
-        contents = store.path(other).read_bytes()
+        configured.write(other, contents)
+        contents = configured.path(other).read_bytes()
     elif damage == "truncated":
         contents = b'{"format":3}\n'
     elif damage == "oversized":
@@ -268,12 +268,11 @@ async def test_show_verifies_entire_file_before_output(app, configured, capsys, 
     elif damage == "array":
         contents = expected = b'{"format":3}\n[]\n'
     if damage == "symlink":
-        target = store.root / "target"
+        target = configured.root / "target"
         target.write_bytes(contents)
         path.symlink_to(target)
     else:
         path.write_bytes(contents)
-    store.close()
     assert await transition(
         record,
         "dispatched",
@@ -307,9 +306,7 @@ async def test_show_escapes_controls_and_raw_requires_redirection(
         line_count=1,
         expires_at=_utcnow() + timedelta(days=1),
     )
-    store = await prepare_store()
-    store.write(record, body)
-    store.close()
+    configured.write(record, body)
     assert await cli.run(["show", record]) == 0
     assert capsys.readouterr().out == "{}\n" + json.dumps(event, ensure_ascii=True) + "\n"
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
@@ -319,7 +316,7 @@ async def test_show_escapes_controls_and_raw_requires_redirection(
 
 
 async def test_unrelated_directory_is_untouched_by_commands_startup_and_sweep(
-    app, monkeypatch, tmp_path, capsys
+    app, monkeypatch, tmp_path, capsys, sansio_launch
 ):
     import os
 

@@ -103,10 +103,8 @@ The pump skips connections whose send lock is held or has waiters. Each
 support send has a 250 ms deadline on that lock. A timeout makes the pump
 resend the current statement on a later pass. An ordinary frame can lose up
 to 250 ms of its two-second deadline waiting for a support send to release the
-lock. On a connection whose write buffer is already close to its limit, the
-support frame's bytes can make the next ordinary frame wait for the buffer
-to drain. That connection is already failing to keep up. If this is observed,
-switch support sharing off for the affected account or host.
+lock. The installed sans-I/O backend can leave both frames buffered in the
+transport after their sends return.
 
 Next the pump cancels open requests for accounts whose sharing is off. It then
 checks pending requests against the enabled statement sent on this connection.
@@ -180,15 +178,20 @@ record or readable collection result. Use the host ID when names repeat.
 to a dispatched collection.
 
 `SPAWN_SUPPORT_LOG_DIR` is unset by default. Unset means 404 without reading
-the body, no support file access and no sweep task. Use an absolute private
-directory outside the repository checkout. It must be on the server's local
-disk because startup waits for a worker thread to prepare it with mode 0700
-and check locking and writing. Under the directory lock, the server marks a
+the body, no support file access and no sweep task. To switch on, create an
+empty private directory on local disk outside the checkout and database backups,
+set `SPAWN_SUPPORT_LOG_DIR` to its absolute path, add `--ws websockets-sansio` to the
+server launch command, and restart. This backend writes an automatic Pong
+without competing with a paused application write for a drain waiter.
+Startup checks the launch arguments before a worker prepares the directory
+with mode 0700 and checks locking and writing. Under the directory lock, the server marks a
 new or empty directory with the extended attribute `user.spawnd.support-log-store`,
 version `v1`. A populated unmarked directory, including a legacy store, is
 left alone. Keep it for manual recovery and configure a fresh empty directory.
-The filesystem must support user extended attributes. The CLI opens an existing
-private marked directory and never creates, marks or chmods it. Before inserting
+The filesystem must support user extended attributes and named pipes. A ready
+server holds the read end of `.server-ready` open. The CLI opens an existing
+private marked directory and checks readiness by opening the write end of
+the pipe without blocking or sending data. Before inserting
 a request, `collect` locks and verifies the directory and runs the startup write probe.
 Each lifespan starts dispatch, installs the
 upload route and starts retention only after that check succeeds. With storage
@@ -223,10 +226,11 @@ cancels open requests and marks collected records deleted in the same commit.
 File cleanup then uses only those record IDs. Account deletion reads its file
 IDs and commits both ordinary deletes. After the response, a background task
 tries the verified directory lock once and has two seconds to remove the
-files. Shutdown stops new cleanup and waits up to two seconds for active
-cleanup before closing the store. A filesystem call still in progress owns
-its directory descriptor and the worker stops before the next file. The
-orphan sweep removes leftovers after its grace period.
+files. Each store admits one filesystem cleanup job at a time. Deletions
+during that job leave their files to the orphan sweep after its grace period.
+Shutdown stops new cleanup and waits up to two seconds for active cleanup
+before closing the store. A stuck daemon thread owns its directory descriptor
+and allows the process to exit. If it resumes, it stops before the next file.
 
 HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
 first NDJSON object is the header and is excluded from the event count. The

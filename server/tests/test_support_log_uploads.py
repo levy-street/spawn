@@ -20,7 +20,7 @@ from spawn_server.models import BrowserDevice, Host, SupportLogCollection
 from spawn_server.routes import support_log as route
 from spawn_server.support_consent import store_statement
 from spawn_server.support_log import get_collection, mark_dispatched, transition
-from spawn_server.support_log_files import file_status, get_store
+from spawn_server.support_log_files import READY_PIPE, file_status, get_store
 from spawn_server.support_log_retention import sweep_once
 from tests.test_support_consent import seed_statement, sign
 
@@ -44,8 +44,14 @@ def storage(app):
     return get_store(app)
 
 
+def bundle_entries(store):
+    entries = set(store.root.iterdir())
+    entries.remove(store.root / READY_PIPE)
+    return entries
+
+
 @pytest_asyncio.fixture
-async def app(app, tmp_path, monkeypatch):
+async def app(app, tmp_path, monkeypatch, sansio_launch):
     # The shared fixture owns the database. These tests drive retention explicitly.
     monkeypatch.setattr(main, "init_engine", Mock())
     monkeypatch.setattr(main, "dispose_engine", AsyncMock())
@@ -166,7 +172,7 @@ async def test_auth_refuses_without_body_or_file_io(app, storage, kind):
     status, _body, reads = await raw_request(app, record_id, token=token)
     assert status == 401
     assert reads == 0
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
     assert (await get_collection(record_id)).state == "dispatched"
 
 
@@ -179,7 +185,7 @@ async def test_unknown_foreign_and_malformed_are_identical(app, storage):
         assert status == 404 and reads == 0
         results.append(body)
     assert results[0] == results[1] == results[2] == b'{"detail":"Not Found"}'
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
     assert (await get_collection(record_id)).state == "dispatched"
 
 
@@ -197,7 +203,7 @@ async def test_closed_record_conflicts_without_body(app, storage, state):
         await session.commit()
     status, _body, reads = await raw_request(app, record_id, token=token)
     assert status == 409 and reads == 0
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 async def test_success_modes_metadata_and_one_outcome(client, storage):
@@ -233,7 +239,7 @@ async def test_typed_refusal(client, storage, code):
     assert response.status_code == 204
     record = await get_collection(record_id)
     assert record.state == "declined" and record.decline_code == code
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
     assert (await post(client, record_id, token)).status_code == 409
 
 
@@ -258,7 +264,7 @@ async def test_malformed_refusal(client, storage, body):
     response = await post(client, record_id, token, body, {"content-type": "application/json"})
     assert response.status_code == 400
     assert (await get_collection(record_id)).state == "failed"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 @pytest.mark.parametrize(
@@ -281,7 +287,7 @@ async def test_invalid_bundles_fail_without_files(client, storage, body, extra):
     record_id, token, *_ = await setup_request()
     assert (await post(client, record_id, token, body, extra)).status_code == 400
     assert (await get_collection(record_id)).state == "failed"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 @pytest.mark.parametrize(
@@ -315,7 +321,7 @@ async def test_header_syntax_and_ranges(app, storage, suffix, value):
     )
     assert status == 400 and reads == 0
     assert (await get_collection(record_id)).state == "failed"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 @pytest.mark.parametrize("length", [str(route.MAX_BUNDLE + 1), "1", None])
@@ -331,7 +337,7 @@ async def test_stream_limit_including_lying_and_absent_length(app, storage, leng
     assert status == 413
     assert reads == (0 if length == str(route.MAX_BUNDLE + 1) else 2)
     assert (await get_collection(record_id)).state == "failed"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 async def test_single_large_chunk_and_exact_bound(app, storage):
@@ -387,7 +393,7 @@ async def test_sharing_off_at_arrival_does_not_read(app, storage, off):
     status, _, reads = await raw_request(app, record_id, token=token)
     assert status == 409 and reads == 0
     assert (await get_collection(record_id)).state == "cancelled"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 @pytest.mark.parametrize("boundary", ["rename", "commit", "lost_race", "withdrawn"])
@@ -430,7 +436,7 @@ async def test_atomic_publication_failure(client, storage, monkeypatch, boundary
     assert (await get_collection(record_id)).state == (
         "cancelled" if boundary == "withdrawn" else "failed"
     )
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 async def test_concurrent_uploads_keep_winning_file(file_sqlite_client, storage):
@@ -591,7 +597,7 @@ async def test_bundle_against_refusal_has_one_outcome(app, file_sqlite_client, s
     await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
     record = await get_collection(record_id)
     assert record.state == ("collected" if first_kind == "bundle" else "declined")
-    assert set(storage.root.iterdir()) == (
+    assert bundle_entries(storage) == (
         {storage.path(record_id)} if record.state == "collected" else set()
     )
     if first_kind == "bundle":
@@ -689,7 +695,7 @@ async def test_total_receive_deadline_fails_and_releases(app, storage, monkeypat
     status, _, reads = await asyncio.wait_for(task, 30)
     assert status == 408 and reads == 2
     assert (await get_collection(record_id)).state == "failed"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
     assert not route._inflight and not route._reading
 
 
@@ -748,7 +754,7 @@ async def test_sweep_waits_for_publication_between_rename_and_commit(
     response, _ = await asyncio.wait_for(asyncio.gather(upload, sweep), 30)
     assert response.status_code == 204
     assert (await get_collection(record_id)).state == "collected"
-    assert set(storage.root.iterdir()) == {storage.path(record_id)}
+    assert bundle_entries(storage) == {storage.path(record_id)}
     assert storage.path(record_id).read_bytes() == BODY
 
 
@@ -792,7 +798,7 @@ async def test_signer_removed_during_upload_cannot_publish(
     assert (await get_collection(record_id)).state == "cancelled"
     await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
     assert (await get_collection(record_id)).state == "cancelled"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 
 async def test_refusal_wins_against_publication_in_another_worker(
@@ -839,7 +845,7 @@ async def test_refusal_wins_against_publication_in_another_worker(
     await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
     record = await get_collection(record_id)
     assert record.state == "declined" and record.decline_code == "no_log"
-    assert not list(storage.root.iterdir())
+    assert not bundle_entries(storage)
 
 async def test_waiting_authenticated_uploads_release_pool(app, file_sqlite_client, monkeypatch):
     from spawn_server.db import get_engine
