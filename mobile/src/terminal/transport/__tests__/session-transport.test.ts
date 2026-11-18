@@ -7,6 +7,7 @@ import {
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
   SessionTransport,
+  SessionTransportOptions,
   TransportError,
   TransportState,
   UploadProgress,
@@ -20,7 +21,6 @@ const mockListeners = new Set<(state: TransportState) => void>();
 let mockState: TransportState = "ready";
 let mockLastError: TransportError | null = null;
 let mockCounter = 0;
-let mockRebound: (() => void) | undefined;
 const mockCreateHostTransport = jest.fn(() => ({
   get state() {
     return mockState;
@@ -29,12 +29,6 @@ const mockCreateHostTransport = jest.fn(() => ({
     return mockLastError;
   },
   close: mockClose,
-  onRebound(fn: () => void) {
-    mockRebound = fn;
-    return () => {
-      mockRebound = undefined;
-    };
-  },
   on: (event: string, fn: (state: TransportState) => void) => {
     if (event === "state") mockListeners.add(fn);
     return () => mockListeners.delete(fn);
@@ -82,7 +76,7 @@ function state(next: TransportState) {
   mockState = next;
   for (const listener of mockListeners) listener(next);
 }
-function view() {
+function view(optionsForView: Pick<SessionTransportOptions, "attachResultListener"> = {}) {
   const bridge = new FakeBridge();
   const transport = createSessionTransport({
     ...options,
@@ -90,6 +84,7 @@ function view() {
     initialSize: { cols: 80, rows: 24 },
     theme: terminalDark,
     bridge,
+    ...optionsForView,
   });
   views.push(transport);
   return { bridge, transport };
@@ -117,83 +112,6 @@ afterEach(() => {
 });
 
 describe("session channels on the shared daemon connection", () => {
-  test("only the current running window parks; visible notices recheck one attachment", async () => {
-    jest.useFakeTimers();
-    try {
-      const { bridge, transport } = view();
-      const row = {
-        host_id: options.hostId,
-        status: "running" as const,
-        started_at: new Date(0).toISOString(),
-      };
-      const attempts = () => commands.filter((frame) => frame.type === "pair-attach");
-      const current = () => attempts().at(-1)?.attachmentId;
-      const refuse = (reason = "session_not_running", attachmentId = current(), channel = "ctl") =>
-        root.shared.bridge.receive(
-          JSON.stringify({
-            v: 1,
-            type: "pair-event",
-            attachmentId,
-            channel,
-            event: "data",
-            sequence: 1,
-            binary: false,
-            data: JSON.stringify({ version: 1, kind: "event", event: "attach_refused", reason }),
-          }),
-        );
-      const detail = jest.fn(async () => row);
-      transport.observeWindow?.(row, true, detail);
-      transport.prepare?.();
-      const first = current();
-      refuse("session_not_running", first, "pty");
-      await jest.advanceTimersByTimeAsync(0);
-      expect(transport.state).toBe("not-running");
-      expect(detail).toHaveBeenCalledTimes(1);
-      const parked = attempts().length;
-      await jest.advanceTimersByTimeAsync(29_999);
-      expect(attempts()).toHaveLength(parked);
-      await jest.advanceTimersByTimeAsync(1);
-      expect(attempts()).toHaveLength(parked + 1);
-      refuse("session_not_running", first);
-      expect(transport.state).toBe("connecting");
-      refuse();
-      transport.observeWindow?.(row, false, detail);
-      await jest.advanceTimersByTimeAsync(60_000);
-      mockRebound?.();
-      expect(detail).toHaveBeenCalledTimes(2);
-      transport.observeWindow?.(row, true, detail);
-      await jest.advanceTimersByTimeAsync(0);
-      expect(attempts()).toHaveLength(parked + 2);
-      refuse();
-      mockRebound?.();
-      await jest.advanceTimersByTimeAsync(0);
-      expect(attempts()).toHaveLength(parked + 3);
-      refuse();
-      state("connecting");
-      state("ready");
-      await jest.advanceTimersByTimeAsync(0);
-      expect(attempts()).toHaveLength(parked + 4);
-      refuse();
-      const check = transport.recheckNotRunning?.();
-      expect(transport.recheckNotRunning?.()).toBe(check);
-      await check;
-      expect(attempts()).toHaveLength(parked + 5);
-      const opening = transport.open();
-      refuse("unknown_reason");
-      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
-      await jest.advanceTimersByTimeAsync(500);
-      expect(attempts()).toHaveLength(parked + 6);
-      bridge.emit({ v: 1, type: "state", state: "ready" });
-      await opening;
-      mockRebound?.();
-      expect(attempts()).toHaveLength(parked + 6);
-      expect(mockClose).not.toHaveBeenCalled();
-      expect(bridge.sent.some((frame) => frame.type === "input")).toBe(false);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
   test("first-open channel setup overlaps renderer loading without allowing early input", async () => {
     const { bridge, transport } = view();
     transport.prepare?.();
@@ -558,4 +476,35 @@ test("reopening a reconnecting view does not duplicate bridge subscriptions", as
   state("ready");
   bridge.emit({ v: 1, type: "state", state: "ready" });
   await opening;
+});
+
+test("readiness clears the previous attach result", async () => {
+  jest.useFakeTimers();
+  const report = jest.fn();
+  const { transport, bridge } = view({ attachResultListener: () => report });
+  const opening = transport.open();
+  const attempt = commands.find((f) => f.type === "pair-attach");
+  if (!attempt) throw new Error("Missing attachment");
+  root.shared.bridge.receive(
+    JSON.stringify({
+      v: 1,
+      type: "pair-event",
+      attachmentId: attempt.attachmentId,
+      channel: "ctl",
+      event: "data",
+      binary: false,
+      data: JSON.stringify({
+        version: 1,
+        kind: "event",
+        event: "attach_refused",
+        reason: "session_not_running",
+      }),
+    }),
+  );
+  bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+  jest.advanceTimersByTime(500);
+  expect(report.mock.calls).toEqual([[true]]);
+  bridge.emit({ v: 1, type: "state", state: "ready" });
+  await opening;
+  expect(report.mock.calls).toEqual([[true], [false]]);
 });

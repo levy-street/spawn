@@ -8,7 +8,6 @@ import {
 } from "@playwright/test";
 import {
   HOST_ID,
-  host,
   mockApp,
   pinKeyboard,
   SESSION_B_ID,
@@ -29,7 +28,6 @@ async function openTerminalWithMockSocket(
   options: {
     control?: { owner: boolean; cols: number; rows: number; viewers: number };
     history?: string;
-    workspacePane?: boolean;
     reconnect?: boolean;
     secondHistory?: string;
     noChannels?: boolean;
@@ -99,7 +97,7 @@ async function openTerminalWithMockSocket(
     }
   });
 
-  await page.goto(options.workspacePane ? `/w/${WORKSPACE_ID}` : `/sessions/${SESSION_ID}`);
+  await page.goto(`/sessions/${SESSION_ID}`);
   await expect(page.getByLabel("Session terminal")).toBeVisible();
   if (!options.noChannels && !options.noReady && options.autoSnapshot !== false) {
     await expect(page.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false");
@@ -311,15 +309,9 @@ function longHistory(lines: number) {
 }
 
 test("terminal renders ANSI color and sends keystrokes without refresh", async ({ page }) => {
-  let details = 0;
-  page.on("request", (request) => {
-    if (request.url().endsWith(`/api/sessions/${SESSION_ID}`)) details++;
-  });
-  const { messages } = await openTerminalWithMockSocket(page, { workspacePane: true });
+  const { messages } = await openTerminalWithMockSocket(page);
 
   await expect(liveTerminalRows(page)).toContainText("RED");
-  expect(details).toBe(0);
-  expect(await attachmentCount(page)).toBe(1);
   const redColor = await liveTerminalRows(page)
     .locator("span", { hasText: "RED" })
     .evaluate((node) => {
@@ -1652,412 +1644,139 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
   await expect(liveTerminalRows(page)).not.toContainText("old 1");
 });
 
-type AttachMock = {
-  __spawnRtcTest: {
-    attachmentCount(): number;
-    setAttachRefusal(reason?: string): void;
-    deliverLateRefusal(index: number): void;
-  };
+const notRunningFrame = {
+  version: 1,
+  kind: "event",
+  event: "attach_refused",
+  reason: "session_not_running",
 };
-const attachmentCount = (page: Page) =>
-  page.evaluate(() => (window as unknown as AttachMock).__spawnRtcTest.attachmentCount());
-const setRefusal = (page: Page, reason?: string) =>
-  page.evaluate(
-    (value) => (window as unknown as AttachMock).__spawnRtcTest.setAttachRefusal(value),
-    reason,
-  );
 
-async function refusedWindow(
-  page: Page,
-  workspacePane = false,
-  reason = "session_not_running",
-  twoHosts = false,
-) {
-  const messages: Array<string | Buffer> = [];
-  await installSessionRtcMock(page, messages, {
-    attachRefusal: reason,
-    autoSnapshot: true,
-    control: { owner: false, cols: 100, rows: 30, viewers: 2 },
+for (const route of [`/sessions/${SESSION_ID}`, `/w/${WORKSPACE_ID}`]) {
+  test(`a refusal changes only the waiting copy on ${route.split("/")[1]}`, async ({
+    browser,
+    baseURL,
+  }) => {
+    async function trace(typed: boolean) {
+      const page = await browser.newPage({ baseURL });
+      try {
+        const messages: Array<string | Buffer> = [];
+        await installSessionRtcMock(page, messages, { sendReady: false });
+        const store = await mockApp(page, {
+          sessions: [session()],
+          workspaces: [
+            workspace({
+              layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
+            }),
+          ],
+        });
+        await page.routeWebSocket(/\/ws\/alerts/, () => {});
+        await page.clock.install({ time: new Date(0) });
+        await page.clock.pauseAt(new Date(1000));
+        await page.goto(route);
+        const overlay = page.getByTestId("terminal-opening-status");
+        await expect
+          .poll(async () => {
+            await page.clock.runFor(50);
+            return (
+              (await overlay.isVisible()) &&
+              (await page.evaluate(() => window.attachProbe.trace.length === 2))
+            );
+          })
+          .toBe(true);
+        messages.length = 0;
+        const start = await page.evaluate(() => Date.now());
+        const requests: string[] = [];
+        page.on("request", (req) => {
+          const url = new URL(req.url());
+          if (url.pathname.startsWith("/api/"))
+            requests.push(`${req.method()} ${url.pathname}${url.search}`);
+        });
+        const send = (channel: string, frame: unknown) =>
+          page.evaluate(([label, data]) => window.attachProbe.receive(label, data), [
+            channel,
+            JSON.stringify(frame),
+          ] as const);
+        const terminal = page.getByLabel("Session terminal");
+        const title = `This session is no longer running on ${store.hosts[0].name}.`;
+        const hint = "Choose Restart from the window menu to start it again.";
+        for (const [index, channel] of ["spawn.pty", "spawn.ctl", "spawn.pty"].entries()) {
+          if (typed) await send(channel, notRunningFrame);
+          await page.clock.fastForward(25);
+          await page.evaluate((label) => window.attachProbe.close(label), channel);
+          if (typed) {
+            await expect(overlay).toContainText(title);
+            await expect(overlay).toContainText(hint);
+            await expect(terminal).toHaveAttribute("aria-busy", "false");
+            if (route.startsWith("/sessions")) {
+              const chip = page
+                .getByRole("button", { name: "Connection details: session stopped" })
+                .last();
+              await expect(chip).toBeVisible();
+              await expect(chip.locator(".animate-pulse")).toHaveCount(0);
+            }
+          } else {
+            await expect(overlay).toHaveText("Opening terminal");
+            await expect(terminal).toHaveAttribute("aria-busy", "true");
+          }
+          if (index === 2) await page.evaluate(() => window.attachProbe.acceptNext());
+          await page.clock.fastForward(500 * 2 ** index);
+        }
+        await page.clock.runFor(100);
+        await expect(overlay).toHaveCount(0);
+        await expect(terminal).toHaveAttribute("data-input-ready", "true");
+        await expect(terminal).not.toContainText(title);
+        const events = await page.evaluate(
+          (start) =>
+            window.attachProbe.trace.map(({ event, at }, i) => ({
+              event,
+              at: i < 2 ? 0 : at - start,
+            })),
+          start,
+        );
+        expect(
+          events.filter((item) => item.event === "attach spawn.pty").map((item) => item.at),
+        ).toEqual([0, 525, 1550, 3575]);
+        const commands = messages.map((message) => {
+          if (typeof message !== "string") return message.toString("base64");
+          const { request_id: _id, ...command } = JSON.parse(message);
+          return command;
+        });
+        expect(commands.filter((c) => c.operation === "take_control")).toHaveLength(1);
+        return { events, requests, commands };
+      } finally {
+        await page.close();
+      }
+    }
+    const closes = await trace(false);
+    expect(await trace(true)).toEqual(closes);
   });
-  const store = await mockApp(page, {
-    hosts: twoHosts ? [host, { ...host, id: SESSION_B_ID }] : [host],
-    sessions: [session({ agent_id: null })],
-    workspaces: [
-      workspace({
-        layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
-      }),
-    ],
-  });
-  let mutations = 0;
-  let details = 0;
-  page.on("request", (req) => {
-    if (req.method() === "GET" && req.url().endsWith(`/api/sessions/${SESSION_ID}`)) details++;
-    if (req.url().includes("/api/sessions/") && req.method() !== "GET") mutations++;
-  });
-  await page.routeWebSocket(/\/ws\/alerts/, () => {});
-  await page.clock.install();
-  return {
-    store,
-    mutations: () => mutations,
-    details: () => details,
-    messages,
-    open: () => page.goto(workspacePane ? `/w/${WORKSPACE_ID}` : `/sessions/${SESSION_ID}`),
-    button: page.getByRole("button", { name: "Try again", exact: true }),
-    notice: page.getByText(/This session is no longer running on/),
-  };
 }
 
-const visibility = (page: Page, state: "hidden" | "visible") =>
-  page.evaluate((value) => {
-    Object.defineProperty(document, "visibilityState", { configurable: true, value });
-    document.dispatchEvent(new Event("visibilitychange"));
-  }, state);
-
-const rebound = (page: Page) =>
-  page.evaluate(
-    (id) =>
-      (
-        window as unknown as { __spawnHostMock: { rebound(id: string): void } }
-      ).__spawnHostMock.rebound(id),
-    HOST_ID,
-  );
-
-const attachedHosts = (page: Page) =>
-  page.evaluate(() =>
-    (
-      window as unknown as { __spawnHostMock: { attachments(): string[] } }
-    ).__spawnHostMock.attachments(),
-  );
-
-test("not-running notice retries once on click, visibility, timer and host recovery", async ({
+test("the waiting overlay uses the in-hand row and clears after an unanswered retry", async ({
   page,
 }) => {
-  const view = await refusedWindow(page);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  const terminal = page.getByLabel("Session terminal");
-  await expect(terminal).toHaveAttribute("aria-busy", "false");
-  await expect(
-    page.getByRole("button", { name: "Connection details: session stopped" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Choose Restart from the window menu to start it again."),
-  ).toBeVisible();
-  let count = await attachmentCount(page);
-  await view.button.click();
-  await expect.poll(() => attachmentCount(page)).toBe(++count);
-  await expect(view.notice).toBeVisible();
-  await page.clock.fastForward(30_000);
-  await expect.poll(() => attachmentCount(page)).toBe(++count);
-  await expect(view.notice).toBeVisible();
-  await visibility(page, "hidden");
-  await page.clock.fastForward(60_000);
-  expect(await attachmentCount(page)).toBe(count);
-  await visibility(page, "visible");
-  await expect.poll(() => attachmentCount(page)).toBe(++count);
-  await expect(view.notice).toBeVisible();
-  await rebound(page);
-  await expect.poll(() => attachmentCount(page)).toBe(++count);
-  await expect(view.notice).toBeVisible();
-  await page.evaluate(() =>
-    (window as unknown as { __spawnHostMock: { disconnect(): void } }).__spawnHostMock.disconnect(),
+  await installSessionRtcMock(page, [], { sendReady: false });
+  const store = await mockApp(page, { sessions: [session({ status: "starting" })] });
+  await page.routeWebSocket(/\/ws\/alerts/, () => {});
+  await page.clock.install();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  const overlay = page.getByTestId("terminal-opening-status");
+  await expect(overlay).toHaveText("Opening terminal");
+  await page.clock.pauseAt(new Date(await page.evaluate(() => Date.now() + 500)));
+  await page.evaluate((data) => {
+    window.attachProbe.receive("spawn.ctl", data);
+    window.attachProbe.close("spawn.ctl");
+  }, JSON.stringify(notRunningFrame));
+  await expect(overlay).toHaveText("Opening terminal");
+  store.sessions[0].status = "running";
+  const poll = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === `/api/sessions/${SESSION_ID}`,
   );
-  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(count);
-  await expect(view.notice).toBeVisible();
-  await setRefusal(page);
-  await view.button.click();
-  await expect(view.notice).toHaveCount(0);
-  await expect(terminal).toHaveAttribute("aria-busy", "false");
-  const take = page.getByRole("button", { name: "Take control" });
-  await expect(take).toBeVisible();
-  expect(jsonMessages(view.messages).filter((m) => m.type === "take_control")).toHaveLength(0);
-  await take.click();
-  await expect
-    .poll(() => jsonMessages(view.messages).filter((m) => m.type === "take_control").length)
-    .toBe(1);
-  const healthy = await attachmentCount(page);
-  await rebound(page);
-  await page.clock.fastForward(30_000);
-  expect(await attachmentCount(page)).toBe(healthy);
-  expect(view.mutations()).toBe(0);
-});
-
-test("not-running refusals on a starting row and ordinary closes keep retrying", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page);
-  view.store.sessions[0].status = "starting";
-  await view.open();
-  await expect.poll(() => attachmentCount(page)).toBe(1);
-  await page.clock.fastForward(30_000);
-  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(1);
-  await expect(view.notice).toHaveCount(0);
-  view.store.sessions[0].status = "running";
-  await page.clock.fastForward(5_100);
-  await expect(view.notice).toBeVisible();
-  for (const reason of ["unknown_reason", ""]) {
-    const before = await attachmentCount(page);
-    await setRefusal(page, reason);
-    await view.button.click();
-    await expect(view.notice).toHaveCount(0);
-    await page.clock.fastForward(10_100);
-    await expect.poll(() => attachmentCount(page)).toBeGreaterThan(before + 1);
-    await setRefusal(page, "session_not_running");
-    await page.clock.fastForward(10_100);
-    await expect(view.notice).toBeVisible();
-  }
-  expect(view.mutations()).toBe(0);
-});
-
-test("workspace not-running notice requires loaded detail and the displayed host", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page, true);
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const detail = `**/api/sessions/${SESSION_ID}`;
-  await page.route(detail, async (route) => {
-    await held;
-    await route.fallback();
-  });
-  await view.open();
-  await expect.poll(view.details).toBe(1);
-  expect(await attachmentCount(page)).toBe(1);
-  await expect(view.notice).toHaveCount(0);
-  // Exercise the switcher's optimistic cache write without launching an agent.
-  await page.getByLabel("Session terminal").evaluate((node, id) => {
-    type Client = import("@tanstack/react-query").QueryClient;
-    type Fiber = { return: Fiber | null; memoizedProps?: { client?: Client } };
-    const key = Object.keys(node).find((name) => name.startsWith("__reactFiber$"));
-    let fiber: Fiber | null = key ? Reflect.get(node, key) : null;
-    while (fiber && !fiber.memoizedProps?.client?.setQueryData) fiber = fiber.return;
-    const client = fiber?.memoizedProps?.client;
-    if (!client) throw new Error("Missing query provider");
-    client.setQueryData<Record<string, unknown>>(["session", id], (row) => {
-      if (!row) throw new Error("Expected list-seeded detail");
-      return { ...row, foreground_command: "codex" };
-    });
-  }, SESSION_ID);
-  await rebound(page);
-  expect(await attachmentCount(page)).toBe(1);
-  expect(view.details()).toBe(1);
-  await expect(view.notice).toHaveCount(0);
-  release();
-  await expect(view.notice).toBeVisible();
-  await page.unroute(detail);
-  const oldDetail = { ...view.store.sessions[0] };
-  let read = false;
-  let finish!: () => void;
-  const refetch = new Promise<void>((resolve) => {
-    finish = resolve;
-  });
-  await page.route(detail, async (route) => {
-    read = true;
-    await refetch;
-    await route.fulfill({ json: oldDetail });
-  });
-  try {
-    const before = await attachmentCount(page);
-    view.store.sessions[0].host_id = SESSION_B_ID;
-    await page.clock.fastForward(5_100);
-    await expect.poll(() => read).toBe(true);
-    expect(await attachmentCount(page)).toBe(before);
-    await expect(view.notice).toHaveCount(0);
-    expect(view.mutations()).toBe(0);
-  } finally {
-    finish();
-  }
-});
-
-test("a delayed not-running refusal cannot park a replacement or a reopened workspace pane", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page, true);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  await setRefusal(page, "hold");
-  await view.button.click();
-  await expect(view.notice).toHaveCount(0);
-  for (const change of ["replacement", "reopened"]) {
-    const before = await attachmentCount(page);
-    if (change === "replacement") {
-      view.store.sessions[0].started_at = new Date(0).toISOString();
-      await page.clock.fastForward(5_100);
-    } else {
-      await visibility(page, "hidden");
-      await visibility(page, "visible");
-    }
-    await expect.poll(() => attachmentCount(page)).toBeGreaterThan(before);
-    await page.evaluate(
-      (index) => (window as unknown as AttachMock).__spawnRtcTest.deliverLateRefusal(index),
-      before - 1,
-    );
-    await expect(view.notice).toHaveCount(0);
-  }
-  expect(view.mutations()).toBe(0);
-});
-
-test("a visible workspace notice checks twice per minute and a hidden one adds no requests", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page, true);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  const count = await attachmentCount(page);
-  const reads = view.details();
-  for (const tick of [1, 2]) {
-    await page.clock.fastForward(30_000);
-    await expect.poll(() => attachmentCount(page)).toBe(count + tick);
-    await expect(view.notice).toBeVisible();
-    expect(view.details()).toBe(reads + tick);
-  }
-  await visibility(page, "hidden");
-  await rebound(page);
-  await page.clock.fastForward(60_000);
-  expect(view.details()).toBe(reads + 2);
-  expect(await attachmentCount(page)).toBe(count + 2);
-  expect(view.mutations()).toBe(0);
-});
-
-test("rebounds and refocuses preserve the first deadline and simultaneous checks join", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page, true, "session_not_running", true);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  // The workspace misses the move. Only the refused window can discover it.
-  await page.route("**/api/sessions", (route) => route.fulfill({ status: 503, json: {} }));
-  for (const trigger of ["rebound", "focus", "rebound", "focus"]) {
-    const count = await attachmentCount(page);
-    await page.clock.fastForward(6_000);
-    if (trigger === "rebound") await rebound(page);
-    else await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await expect.poll(() => attachmentCount(page)).toBe(count + 1);
-    await expect(view.notice).toBeVisible();
-  }
-  const reads = view.details();
-  const attachments = await attachedHosts(page);
-  const moved = { ...view.store.sessions[0], host_id: SESSION_B_ID };
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  await page.route(`**/api/sessions/${SESSION_ID}`, async (route) => {
-    await held;
-    await route.fulfill({ json: moved });
-  });
-  try {
-    await page.clock.fastForward(6_000);
-    await expect.poll(view.details).toBe(reads + 1);
-    await Promise.all([view.button.dispatchEvent("click"), rebound(page)]);
-    // The signaling mock delivers its rebound on a zero-delay browser timer.
-    await page.clock.runFor(1);
-    expect(view.details()).toBe(reads + 1);
-    expect(await attachedHosts(page)).toEqual(attachments);
-    await setRefusal(page);
-  } finally {
-    release();
-  }
-  await expect.poll(() => attachedHosts(page)).toEqual([...attachments, SESSION_B_ID]);
-  expect(view.details()).toBe(reads + 1);
-  expect(view.mutations()).toBe(0);
-  expect(jsonMessages(view.messages).filter((m) => m.type === "take_control")).toHaveLength(0);
-});
-
-test("a failed check leaves the mounted workspace terminal waiting for its next deadline", async ({
-  page,
-}) => {
-  const view = await refusedWindow(page, true, "session_not_running", true);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  // The workspace misses the move. Only the refused window can discover it.
-  await page.route("**/api/sessions", (route) => route.fulfill({ status: 503, json: {} }));
-  const terminal = await page.getByLabel("Session terminal").elementHandle();
-  const reads = view.details();
-  let unavailable = true;
-  await page.route(`**/api/sessions/${SESSION_ID}`, (route) =>
-    unavailable
-      ? route.fulfill({ status: 503, json: {} })
-      : route.fulfill({ json: { ...view.store.sessions[0], host_id: SESSION_B_ID } }),
-  );
-  await page.clock.fastForward(30_000);
-  await expect.poll(view.details).toBe(reads + 1);
-  await page.clock.fastForward(1_100);
-  await expect(view.notice).toHaveCount(0);
-  expect(view.details()).toBe(reads + 2);
-  expect(await terminal?.evaluate((node) => node.isConnected)).toBe(true);
-  expect(await attachedHosts(page)).toEqual([HOST_ID]);
-  unavailable = false;
-  await setRefusal(page);
-  await page.clock.fastForward(29_000);
-  await expect.poll(() => attachedHosts(page)).toEqual([HOST_ID, SESSION_B_ID]);
-  expect(view.details()).toBe(reads + 3);
-  expect(view.mutations()).toBe(0);
-});
-
-test("a later list poll retries failed detail for the same move", async ({ page }) => {
-  const view = await refusedWindow(page, true, "session_not_running", true);
-  await view.open();
-  await expect(view.notice).toBeVisible();
-  const reads = view.details();
-  const moved = view.store.sessions[0];
-  moved.host_id = SESSION_B_ID;
-  let unavailable = true;
-  await page.route(`**/api/sessions/${SESSION_ID}`, (route) =>
-    unavailable ? route.fulfill({ status: 503, json: {} }) : route.fulfill({ json: moved }),
-  );
-  await page.clock.fastForward(5_100);
-  await expect.poll(view.details).toBe(reads + 1);
-  await page.clock.fastForward(1_100);
-  await expect.poll(view.details).toBe(reads + 2);
-  await expect(view.notice).toHaveCount(0);
-  expect(await attachedHosts(page)).toEqual([HOST_ID]);
-  unavailable = false;
-  await setRefusal(page);
-  await page.clock.fastForward(5_100);
-  await expect.poll(() => attachedHosts(page)).toEqual([HOST_ID, SESSION_B_ID]);
-  expect(view.details()).toBe(reads + 3);
-  expect(view.mutations()).toBe(0);
-});
-
-test("a starting workspace pane keeps retrying without a notice", async ({ page }) => {
-  const view = await refusedWindow(page, true);
-  view.store.sessions[0].status = "starting";
-  await view.open();
-  await expect.poll(() => attachmentCount(page)).toBe(1);
-  await page.clock.fastForward(30_000);
-  await expect.poll(() => attachmentCount(page)).toBeGreaterThan(1);
-  await expect(view.notice).toHaveCount(0);
-  expect(view.mutations()).toBe(0);
-});
-
-test("activating a split column rechecks its focused terminal before expiry", async ({ page }) => {
-  const view = await refusedWindow(page, true);
-  const second = crypto.randomUUID();
-  view.store.sessions.push(session({ id: SESSION_B_ID }));
-  view.store.workspaces.push(
-    workspace({
-      id: second,
-      layout: {
-        version: 3,
-        tiles: [{ session_id: SESSION_B_ID, x: 0, y: 0, w: 24, h: 24 }],
-      },
-    }),
-  );
-  await page.addInitScript(
-    (members) => {
-      localStorage.setItem("spawn.workspaces.split", JSON.stringify({ members }));
-    },
-    [WORKSPACE_ID, second],
-  );
-  await view.open();
-  await expect(view.notice).toHaveCount(2);
-  const column = page.locator(`[data-workspace-pane="${second}"]`);
-  const count = await attachmentCount(page);
-  await column.dispatchEvent("pointerdown");
-  await expect.poll(() => attachmentCount(page)).toBe(count + 1);
-  await expect(column.getByText(/This session is no longer running on/)).toBeVisible();
-  expect(view.mutations()).toBe(0);
+  await page.clock.fastForward(5_000);
+  await poll;
+  await page.clock.runFor(20);
+  await expect(overlay).toContainText("Choose Restart from the window menu to start it again.");
+  await page.clock.fastForward(10_000);
+  await expect(overlay).toHaveText("Opening terminal is taking longer than usual.");
+  await expect(page.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "true");
 });

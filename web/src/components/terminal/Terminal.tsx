@@ -28,7 +28,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
-import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
+import { ConnectingOverlay, RESTART_HINT } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import {
   LiveTerminalWriteBuffer,
@@ -61,7 +61,6 @@ import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
-import { sameSessionRun } from "@/lib/sessions";
 import { paneSizing } from "@/lib/terminal-grid";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
@@ -123,7 +122,6 @@ const BRACKETED_PASTE_END = "\x1b[201~";
 
 const SOCKET_STATE_COPY: Record<SocketState, string> = {
   idle: "waiting",
-  "not-running": "session stopped",
   connecting: "reconnecting",
   open: "connected",
   closed: "reconnecting",
@@ -199,7 +197,6 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
-  recheckNotRunning(): Promise<void> | undefined;
   /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
   /** Tell the daemon the new TTY size. */
@@ -261,7 +258,6 @@ export interface TerminalProps {
    *  takes control, so it can't disturb another client. Re-activating it
    *  focuses its view within the owning device and fits its container. Default true. */
   active?: boolean;
-  displayedRow?: Session | null;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
@@ -288,7 +284,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onDisplayControl,
     onConnectionInfo,
     active = true,
-    displayedRow,
     onExit,
     onAgentNotice,
   },
@@ -322,7 +317,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // a terminal mounted for a window that moved here is a reconnect, unless
   // this device moved it (`claimDisplayOnOpen`).
   const displayClaimOwedRef = useRef(active && claimDisplayOnOpen);
-  const reattachingAfterRefusal = useRef(false);
   const payDisplayClaimRef = useRef<() => void>(() => {});
   // GPU renderer for FOREGROUND terminals, within the page's budget. The DOM
   // renderer rebuilds row elements and forces style/layout/paint after every
@@ -440,7 +434,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // take control and fit to the now-visible container. Two rAFs let the
       // host's appendChild move and the container's layout settle before we
       // measure + resize.
-      displayClaimOwedRef.current = !reattachingAfterRefusal.current;
+      displayClaimOwedRef.current = true;
       requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));
       // Catch up on the refreshes the parked quiescence skipped.
       if (scrollbackCacheDirtyRef.current) {
@@ -1407,27 +1401,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     connection: daemonConnection,
     sessionId,
     sessionStatus: sessionIdentityQuery.data,
-    hostId: signalingHostId,
-    refreshDetail: async () => {
-      const result = await sessionIdentityQuery.refetch({ cancelRefetch: false });
-      return result.isSuccess ? result.data : null;
-    },
-    canShowNotRunning:
-      sessionIdentityQuery.isSuccess &&
-      displayedRow?.status === "running" &&
-      displayedRow.host_id === signalingHostId &&
-      sameSessionRun(displayedRow, sessionIdentityQuery.data),
-    onNotRunning: () => {
-      reattachingAfterRefusal.current = true;
-      displayClaimOwedRef.current = false;
-    },
-    active,
     enabled:
       socketWanted &&
       daemonConnection !== null &&
-      (reattachingAfterRefusal.current ||
-        (sessionIdentityQuery.data?.status !== "exited" &&
-          sessionIdentityQuery.data?.status !== "killed")),
+      sessionIdentityQuery.data?.status !== "exited" &&
+      sessionIdentityQuery.data?.status !== "killed",
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -1682,9 +1660,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
   });
   useEffect(() => {
-    if (!socket.dcOpen) return;
-    reattachingAfterRefusal.current = false;
-    if (!active) return;
+    if (!socket.dcOpen || !active) return;
     if (displayClaimOwedRef.current) {
       // Measure after layout settles, as the foreground path does.
       requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));
@@ -1714,11 +1690,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Surface the live transport for connection indicators without forcing the
   // callback identity into effect deps (workspace panes pass inline closures).
+  const notRunningNotice =
+    socket.sessionNotRunning && sessionIdentityQuery.data?.status === "running"
+      ? `This session is no longer running on ${hostIdentityQuery.data?.name ?? sessionIdentityQuery.data.host_name ?? "this host"}.`
+      : null;
   const onConnectionInfoRef = useRef(onConnectionInfo);
   onConnectionInfoRef.current = onConnectionInfo;
   useEffect(() => {
     onConnectionInfoRef.current?.({
       socketState: socket.state,
+      notRunningNotice,
       v3: socket.v3,
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
@@ -1729,6 +1710,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
   }, [
     socket.state,
+    notRunningNotice,
     socket.v3,
     socket.dcOpen,
     socket.signedRtcRefusal,
@@ -3657,7 +3639,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           endUploadTrack(uploadId);
         }
       },
-      recheckNotRunning: () => socketRef.current.recheckNotRunning(),
       focus: () => {
         focusViewRef.current();
         termRef.current?.focus();
@@ -3757,7 +3738,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       aria-label="Session terminal"
       data-session-id={sessionId}
       data-input-ready={socket.dcOpen && controlState?.owner === true}
-      aria-busy={!socket.dcOpen && socket.state !== "not-running"}
+      aria-busy={!socket.dcOpen && !notRunningNotice}
       onFocusCapture={() => {
         focusViewRef.current();
         // The terminal being typed in is the one the GPU renderer is for.
@@ -3811,38 +3792,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       {/* Before the first byte lands there is nothing under here but the
           terminal's own black: the overlay explains the wait, and gets out of
           the way the moment output arrives. */}
-      {socket.state === "not-running" ? (
-        <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 p-3 text-center backdrop-blur-[2px]">
-          <div className="flex max-w-xs flex-col items-center gap-2 rounded-lg border border-border bg-popover p-4 text-sm shadow-lg">
-            <p role="status">
-              This session is no longer running on{" "}
-              {displayedRow?.host_name ?? hostIdentityQuery.data?.name ?? "this host"}.
-            </p>
-            <p className="text-xs text-muted-foreground">
-              Choose Restart from the window menu to start it again.
-            </p>
-            <button
-              type="button"
-              className="rounded-md bg-primary px-3 py-2 font-medium text-primary-foreground"
-              onClick={socket.recheckNotRunning}
-            >
-              Try again
-            </button>
-          </div>
-        </div>
-      ) : (
-        <ConnectingOverlay
-          sharedConnectionReady={daemonReady}
-          rebuilding={daemonRebuilding}
-          socketState={socket.state}
-          v3={socket.v3}
-          dcOpen={socket.dcOpen}
-          refusal={socket.signedRtcRefusal}
-          painted={painted}
-          hostName={hostIdentityQuery.data?.name ?? null}
-          hostOffline={hostIdentityQuery.data?.status === "offline"}
-        />
-      )}
+      <ConnectingOverlay
+        sharedConnectionReady={daemonReady}
+        rebuilding={daemonRebuilding}
+        socketState={socket.state}
+        v3={socket.v3}
+        dcOpen={socket.dcOpen}
+        refusal={socket.signedRtcRefusal}
+        notRunningNotice={notRunningNotice}
+        painted={painted}
+        hostName={hostIdentityQuery.data?.name ?? null}
+        hostOffline={hostIdentityQuery.data?.status === "offline"}
+      />
       {tooSmallPlaceholder && (
         // A pane too small for any terminal, before it knows the session's
         // own size: said quietly, in the pane's own ground, rather than left
@@ -3868,18 +3829,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           Transport disabled by this server.
         </div>
       )}
-      {showReconnectBanner &&
-        socket.state !== "not-running" &&
-        socket.state !== "unauthorized" &&
-        socket.state !== "disabled" && (
-          <div
-            role="status"
-            data-testid="terminal-reconnect-banner"
-            className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
-          >
-            Connection paused. Your terminal output is still available to copy.
-          </div>
-        )}
+      {showReconnectBanner && socket.state !== "unauthorized" && socket.state !== "disabled" && (
+        <div
+          role="status"
+          data-testid="terminal-reconnect-banner"
+          className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
+        >
+          Connection paused. Your terminal output is still available to copy.
+        </div>
+      )}
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
           data-testid="upload-reconciliation"
@@ -4043,7 +4001,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         aria-live="polite"
       >
         {[
-          socket.state !== "open" ? SOCKET_STATE_COPY[socket.state] : null,
+          notRunningNotice
+            ? `${notRunningNotice} ${RESTART_HINT}`
+            : socket.state !== "open"
+              ? SOCKET_STATE_COPY[socket.state]
+              : null,
           channelPending ? "connecting direct channel…" : null,
           exitBanner,
           uploadStatus,

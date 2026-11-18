@@ -75,6 +75,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(sessionId);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -95,10 +96,6 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     [sessionId, workspacesQ.data],
   );
   const session = sessionQ.data;
-  const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(
-    sessionId,
-    session,
-  );
   const daemonConnection = useDaemonConnection(session?.host_id ?? null);
 
   useEffect(() => {

@@ -168,7 +168,7 @@ interface MockSurfaceProps {
   onLink?: (url: string) => void;
   onDisplayChange?: (display: DisplayControlState) => void;
   onTransport?: (transport: unknown) => void;
-  onStateChange?: (state: "not-running" | "connecting" | "ready" | "failed") => void;
+  onStateChange?: (state: "connecting" | "ready" | "failed") => void;
   onError?: (error: { code: string; message: string; retryable: boolean }) => void;
 }
 
@@ -257,7 +257,6 @@ const host: HostOut = {
 };
 
 interface OverlayOverrides {
-  onRestart?: () => Promise<never>;
   focused?: boolean;
   onDismiss?: () => void;
   onKill?: () => Promise<void>;
@@ -275,48 +274,21 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
     >
       <ThemeProvider>
         <TerminalOverlay
-          detailLoaded
           focused={options.focused ?? false}
           host={host}
           onDismiss={options.onDismiss ?? jest.fn()}
           onKill={options.onKill ?? jest.fn(async () => undefined)}
           onRename={jest.fn(async () => undefined)}
-          onRestart={
-            options.onRestart ??
-            jest.fn(async () => ({
-              kind: "restarted" as const,
-              plan: { kind: "shell" as const },
-            }))
-          }
+          onRestart={jest.fn(async () => ({
+            kind: "restarted" as const,
+            plan: { kind: "shell" as const },
+          }))}
           session={session}
         />
       </ThemeProvider>
     </SafeAreaProvider>,
   );
 }
-
-test("Try again only asks the current transport to attach", async () => {
-  const restart = jest.fn();
-  await renderOverlay({ focused: true, onRestart: restart });
-  const recheck = jest.fn();
-  await act(() =>
-    mockTerminalSurfaceProps.onTransport?.({
-      on: () => () => undefined,
-      hostId: session.host_id,
-      refusedWindow: { checked: session },
-      recheckNotRunning: recheck,
-    }),
-  );
-  await act(() => mockTerminalSurfaceProps.onStateChange?.("not-running"));
-  expect(screen.getByText(/This session is no longer running on/)).toBeTruthy();
-  expect(screen.getByText("Choose Restart from the window menu to start it again.")).toBeTruthy();
-  await fireEvent.press(screen.getByText("Try again"));
-  expect(recheck).toHaveBeenCalledTimes(1);
-  expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
-  await act(() => mockConnectionProps.onRetry?.());
-  expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
-  expect(restart).not.toHaveBeenCalled();
-});
 
 describe("a window that moves to another host while its terminal is open", () => {
   beforeEach(() => {
@@ -381,7 +353,7 @@ describe("Retry and the display", () => {
     name: "dream",
     host_public_key: "dream-public-key",
   };
-  const overlay = (current: HostOut, focused = true, row = session) => (
+  const overlay = (current: HostOut) => (
     <SafeAreaProvider
       initialMetrics={{
         frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -390,7 +362,7 @@ describe("Retry and the display", () => {
     >
       <ThemeProvider>
         <TerminalOverlay
-          focused={focused}
+          focused
           host={current}
           onDismiss={jest.fn()}
           onKill={jest.fn(async () => undefined)}
@@ -399,7 +371,7 @@ describe("Retry and the display", () => {
             kind: "restarted" as const,
             plan: { kind: "shell" as const },
           }))}
-          session={{ ...row, host_id: current.id, host_name: current.name }}
+          session={{ ...session, host_id: current.id, host_name: current.name }}
         />
       </ThemeProvider>
     </SafeAreaProvider>

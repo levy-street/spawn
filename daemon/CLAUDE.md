@@ -394,7 +394,7 @@ updater knew about variants.
   under way for the id. Check only metadata in the discovered directory,
   outside admission. Any endpoint marker, lock file, socket or error gets
   the ordinary close. This check never contacts a worker or changes a session.
-  Devices offer Try again and point to Restart in the window menu. The server
+  Devices keep retrying and point to Restart in the window menu. The server
   can continue listing the session as running.
   Fence every effect by parent trust/binding and worker generation.
   `session_ctl.rs` retains the controlling device's lease until explicit take

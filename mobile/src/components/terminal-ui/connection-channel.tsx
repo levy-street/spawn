@@ -46,7 +46,6 @@ export function connectionChannelView(state: TransportState): ConnectionChannelV
       return { icon: "Lock", tone: "success", lines: ["solid", "solid"] };
     case "reconnecting":
       return { icon: "PlugZap", tone: "warning", lines: ["flowing", "waiting"] };
-    case "not-running":
     case "closed":
       return { icon: "Unplug", tone: "muted", lines: ["waiting", "waiting"] };
     case "failed":

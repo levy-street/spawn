@@ -24,10 +24,9 @@ import type {
   TransportState,
   UploadHandle,
   UploadRequest,
-  WindowRun,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
-import { CONNECT_TIMEOUT_MS, sameWindowRun } from "@/terminal/transport/types";
+import { CONNECT_TIMEOUT_MS } from "@/terminal/transport/types";
 import { terminalMetrics } from "@/theme";
 
 export {
@@ -48,15 +47,15 @@ type ConnectionInfoListener = (info: ConnectionInfo) => void;
 type PairEvent = Extract<WorkerToNativeMessage, { type: "pair-command" | "pair-event" }>;
 const MAX_PENDING_VIEW_EVENTS = 512;
 const MAX_PENDING_VIEW_EVENT_BYTES = 2 * 1024 * 1024;
-function isSessionNotRunning(data: unknown): boolean {
-  if (typeof data !== "string" || data.length > 512) return false;
+function isNotRunningFrame(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 16 * 1024) return false;
   try {
-    const message = JSON.parse(data);
+    const frame = JSON.parse(data);
     return (
-      message?.version === 1 &&
-      message.kind === "event" &&
-      message.event === "attach_refused" &&
-      message.reason === "session_not_running"
+      frame?.version === 1 &&
+      frame.kind === "event" &&
+      frame.event === "attach_refused" &&
+      frame.reason === "session_not_running"
     );
   } catch {
     return false;
@@ -78,18 +77,9 @@ class WebViewSessionTransport implements SessionTransport {
   #state: TransportState = "idle";
   #lease: HostTransportLease | null = null;
   #attachmentId: string | null = null;
+  #reportAttachResult: ((notRunning: boolean) => void) | undefined;
+  #attemptRefused = false;
   #workerStarted = false;
-  #row: WindowRun | null = null;
-  #visible = false;
-  #refreshDetail: (() => Promise<WindowRun | null>) | undefined;
-  #attachedRun: WindowRun | null = null;
-  #refusal: {
-    firstRun: WindowRun | null;
-    checked: WindowRun | null;
-    request?: Promise<void>;
-    nextCheck: number;
-    timer?: ReturnType<typeof setTimeout>;
-  } | null = null;
   #pendingViewEvents: PairEvent[] = [];
   #pendingViewBytes = 0;
   #displayOwner = false;
@@ -123,9 +113,6 @@ class WebViewSessionTransport implements SessionTransport {
   get state(): TransportState {
     return this.#state;
   }
-  get refusedWindow(): { readonly checked: WindowRun | null } | null {
-    return this.#refusal;
-  }
   get daemonState(): TransportState {
     return this.#lease?.shared.transport.state ?? "idle";
   }
@@ -146,26 +133,14 @@ class WebViewSessionTransport implements SessionTransport {
         if (activeDeviceIdentityAccount() !== this.#accountId) return;
         if (message.type === "pair-event" && message.attachmentId === this.#attachmentId) {
           if (
-            this.#state === "connecting" &&
+            this.#state !== "ready" &&
             message.event === "data" &&
             message.binary === false &&
-            isSessionNotRunning(message.data)
+            (message.channel === "pty" || message.channel === "ctl") &&
+            isNotRunningFrame(message.data)
           ) {
-            this.#detach();
-            if (!this.#refusal) {
-              this.#refusal = {
-                firstRun: this.#attachedRun,
-                checked: null,
-                nextCheck: Date.now() + 30_000,
-              };
-              this.#setState("reconnecting");
-              void this.recheckNotRunning();
-            } else {
-              this.#setState(
-                this.#refusal.checked?.status === "running" ? "not-running" : "reconnecting",
-              );
-            }
-            return;
+            this.#attemptRefused = true;
+            this.#reportAttachResult?.(true);
           }
           if (!this.#workerStarted) {
             // Open the channels while the terminal document loads. Receive
@@ -192,72 +167,16 @@ class WebViewSessionTransport implements SessionTransport {
           for (const listener of this.#connectionInfoListeners) listener(message.info);
         }
       }),
-      shared.transport.on("state", () => {
-        if (this.#refusal && this.daemonState === "ready") void this.recheckNotRunning();
-        else this.#syncConnection();
-      }),
+      shared.transport.on("state", () => this.#syncConnection()),
       shared.transport.on("error", (error) => {
         this.#lastError = error;
         this.#emitError(error);
       }),
     );
-    const unsubscribe = shared.transport.onRebound?.(() => this.recheckNotRunning());
-    if (unsubscribe) this.#subscriptions.push(unsubscribe);
-    if (this.#refusal) void this.recheckNotRunning();
-    else this.#syncConnection();
-  }
-  observeWindow(
-    row: WindowRun | null,
-    visible: boolean,
-    refreshDetail?: () => Promise<WindowRun | null>,
-  ): void {
-    const changed = !sameWindowRun(row, this.#row);
-    const shown = visible && !this.#visible;
-    this.#refreshDetail = refreshDetail;
-    this.#row = row;
-    this.#visible = visible;
-    if (!this.#refusal) return;
-    const changedRun = changed && !sameWindowRun(row, this.#refusal.checked);
-    if (changedRun) this.#setState("reconnecting");
-    if (shown || changedRun) void this.recheckNotRunning();
-  }
-  recheckNotRunning(): Promise<void> | undefined {
-    const watch = this.#refusal;
-    if (!watch) return;
-    if (!this.#visible || !this.#lease || !this.#refreshDetail)
-      return watch.request ?? Promise.resolve();
-    // Background retirement clears the native timer, but the window keeps its deadline.
-    if (!watch.timer) {
-      const now = Date.now();
-      if (watch.nextCheck <= now) watch.nextCheck = now + 30_000;
-      watch.timer = setTimeout(() => {
-        delete watch.timer;
-        void this.recheckNotRunning();
-      }, watch.nextCheck - now);
-    }
-    if (watch.request) return watch.request;
-    this.#detach();
-    const request = this.#refreshDetail().then((row) => {
-      if (watch.request !== request) return;
-      delete watch.request;
-      const first = watch.firstRun;
-      watch.firstRun = null;
-      watch.checked = row;
-      if (!row || row.host_id !== this.hostId || !this.#visible) {
-        this.#setState("reconnecting");
-        return;
-      }
-      if (first && sameWindowRun(row, first)) {
-        this.#setState(row.status === "running" ? "not-running" : "reconnecting");
-      } else {
-        this.#syncConnection(row);
-      }
-    });
-    watch.request = request;
-    return request;
+    this.#syncConnection();
   }
   networkChanged(): void {
-    void this.recheckNotRunning();
+    // The app-owned daemon surface handles network changes once for every view.
   }
   async open(): Promise<void> {
     if (this.#state === "ready") return;
@@ -303,11 +222,6 @@ class WebViewSessionTransport implements SessionTransport {
   close(): void {
     if (this.#state === "closed") return;
     this.#workerStarted = false;
-    if (this.#refusal) {
-      clearTimeout(this.#refusal.timer);
-      delete this.#refusal.timer;
-      delete this.#refusal.request;
-    }
     this.#detach();
     for (const unsubscribe of this.#subscriptions.splice(0)) unsubscribe();
     try {
@@ -425,7 +339,7 @@ class WebViewSessionTransport implements SessionTransport {
     }[ev] as Set<never>;
   }
 
-  #syncConnection(checked?: WindowRun): void {
+  #syncConnection(): void {
     if (!this.#lease) return;
     if (activeDeviceIdentityAccount() !== this.#accountId) {
       this.close();
@@ -450,10 +364,11 @@ class WebViewSessionTransport implements SessionTransport {
       } else this.#setState("reconnecting");
       return;
     }
-    if ((this.#refusal && !checked) || this.#attachmentId || this.#retry) return;
-    this.#attachedRun = checked ?? this.#row;
+    if (this.#attachmentId || this.#retry) return;
     const attachment = { attachmentId: newUuid(), sessionId: this.sessionId, viewId: this.#viewId };
     this.#attachmentId = attachment.attachmentId;
+    this.#attemptRefused = false;
+    this.#reportAttachResult = this.options.attachResultListener?.();
     this.#setState("connecting");
     try {
       if (this.#workerStarted) this.#startView();
@@ -499,6 +414,8 @@ class WebViewSessionTransport implements SessionTransport {
     this.#displayOwner = false;
     this.#uploadCoordinator.close();
     if (!id) return;
+    if (!this.#attemptRefused) this.#reportAttachResult?.(false);
+    this.#reportAttachResult = undefined;
     try {
       this.#lease?.shared.bridge.send({
         v: TERMINAL_BRIDGE_VERSION,
@@ -528,8 +445,7 @@ class WebViewSessionTransport implements SessionTransport {
     this.#setState("reconnecting");
     this.#retry = setTimeout(() => {
       this.#retry = null;
-      if (this.#refusal) void this.recheckNotRunning();
-      else this.#syncConnection();
+      this.#syncConnection();
     }, 500);
   }
   #handleWorkerMessage(message: WorkerToNativeMessage): void {
@@ -561,8 +477,7 @@ class WebViewSessionTransport implements SessionTransport {
         ) {
           clearTimeout(this.#deadline ?? undefined);
           this.#deadline = null;
-          clearTimeout(this.#refusal?.timer);
-          this.#refusal = null;
+          this.#reportAttachResult?.(false);
           this.#setState("ready");
           this.#resolveOpen?.();
           this.#settleOpening();

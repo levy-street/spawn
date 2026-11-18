@@ -19,9 +19,12 @@ import {
   useRef,
 } from "react";
 import type { Session } from "@/lib/api";
+import { RemoteDaemonChannel } from "@/lib/daemon-channel";
+import type { DaemonConnection } from "@/lib/daemon-connection";
 import type { DisplayControlState } from "@/lib/ws";
 import type { SessionConnectionInfo } from "./ConnectionChip";
 import type { TerminalHandle, TerminalProps } from "./Terminal";
+import { useSessionSocket } from "./useSessionSocket";
 
 // ---------- a DOM just big enough for React DOM ----------
 
@@ -168,7 +171,6 @@ mock.module("./Terminal", () => {
             sendInput: (bytes: Uint8Array | string) =>
               typed.push(typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes)),
             focus: () => {},
-            recheckNotRunning: () => undefined,
           }) as unknown as TerminalHandle,
         [],
       );
@@ -514,4 +516,115 @@ describe("a terminal that missed the move's data frame", () => {
       await pane.unmount();
     }
   });
+});
+
+test("an attach reply belongs to the exact attempt and run that received it", async () => {
+  let session = row(DREAM);
+  let refused = false;
+  let sync = () => {};
+  let failCreation = false;
+  const pairs: RemoteDaemonChannel[] = [];
+  const connection: DaemonConnection = {
+    getSnapshot: () => ({
+      state: "ready",
+      generation: null,
+      capabilities: [],
+      refusal: null,
+      trust: null,
+    }),
+    subscribe: (listener) => {
+      sync = listener;
+      return () => {};
+    },
+    createChannel: (label) => {
+      if (failCreation) throw new Error("closed");
+      const channel = new RemoteDaemonChannel(label, () => {});
+      pairs.push(channel);
+      return channel;
+    },
+    retry: () => {},
+  };
+  function View() {
+    const socket = useSessionSocket({
+      sessionId: session.id,
+      sessionStatus: session,
+      connection,
+      onData: () => {},
+    });
+    refused = socket.sessionNotRunning;
+    return null;
+  }
+  const root = m.createRoot(fakeDocument.createElement("div") as unknown as HTMLElement);
+  const render = () => settle(() => root.render(m.createElement(View)));
+  const ctl = () => pairs.at(-1)!;
+  const frame = {
+    version: 1,
+    kind: "event",
+    event: "attach_refused",
+    reason: "session_not_running",
+  };
+  const send = (data: unknown) =>
+    settle(() => {
+      ctl().opened();
+      ctl().receive(JSON.stringify(data));
+    });
+  try {
+    await render();
+    for (const change of [
+      { version: "1" },
+      { kind: "response" },
+      { event: "other" },
+      { reason: "unknown" },
+    ]) {
+      await send({ ...frame, ...change });
+      expect(refused).toBe(false);
+    }
+    for (const outcome of ["close", "error", "unknown", "create failed"]) {
+      await send(frame);
+      await settle(() => ctl().retired());
+      expect(refused).toBe(true);
+      const stale = ctl();
+      failCreation = outcome === "create failed";
+      await settle(sync);
+      failCreation = false;
+      if (outcome === "error") {
+        await settle(() =>
+          ctl().onerror?.call(
+            ctl() as unknown as RTCDataChannel,
+            new Event("error") as RTCErrorEvent,
+          ),
+        );
+      } else if (outcome !== "create failed") {
+        if (outcome === "unknown") await send({ ...frame, reason: "unknown" });
+        await settle(() => ctl().retired());
+      }
+      expect(refused).toBe(false);
+      await settle(sync);
+      await settle(() =>
+        stale.onmessage?.call(
+          stale as unknown as RTCDataChannel,
+          new MessageEvent("message", { data: JSON.stringify(frame) }),
+        ),
+      );
+      expect(refused).toBe(false);
+    }
+    for (const change of [
+      { started_at: new Date(0).toISOString() },
+      { host_id: MAC },
+      { id: MAC },
+    ]) {
+      await send(frame);
+      expect(refused).toBe(true);
+      const old = ctl();
+      session = { ...session, ...change };
+      await render();
+      expect(refused).toBe(false);
+      await settle(() => old.receive(JSON.stringify(frame)));
+      expect(refused).toBe(false);
+      await settle(() => ctl().retired());
+      await settle(sync);
+    }
+  } finally {
+    await settle(() => root.unmount());
+  }
 });

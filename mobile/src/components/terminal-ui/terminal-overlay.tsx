@@ -1,6 +1,6 @@
 import * as Clipboard from "expo-clipboard";
 import * as Linking from "expo-linking";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
@@ -43,7 +43,6 @@ import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
 import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
-import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -57,7 +56,6 @@ import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui"
 import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
 import type { AgentDef } from "@/data/types/domain";
-import { useAppActive } from "@/lib/app-active";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { encodeKey } from "@/terminal/key-encoder";
@@ -71,10 +69,8 @@ import type {
   SessionTransport,
   TransportError,
   TransportState,
-  WindowRun,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
-import { sameWindowRun } from "@/terminal/transport/types";
 import { layer, useTheme } from "@/theme";
 import { bottomNavHeight } from "@/theme/sizing";
 
@@ -84,9 +80,6 @@ export interface TerminalOverlayProps {
   session: SessionOut;
   host: HostOut;
   focused: boolean;
-  detailLoaded?: boolean;
-  windowTransport?: { current: SessionTransport | null };
-  refreshDetail?: () => Promise<WindowRun | null>;
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
   /** Restart the window as what it was opened as: a fresh shell, with the
@@ -139,18 +132,10 @@ export function TerminalOverlay({
   restartDetail,
   agents = [],
   onKill,
-  detailLoaded = false,
-  refreshDetail,
-  windowTransport,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
-  const appActive = useAppActive();
-  const visible = focused && appActive;
-  const windowRef = useRef({ session, visible, refreshDetail });
-  windowRef.current = { session, visible, refreshDetail };
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
-  const localTransport = useRef<SessionTransport | null>(null);
-  const transportRef = windowTransport ?? localTransport;
+  const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
   const pendingLaunchUnsubscribeRef = useRef<(() => void) | null>(null);
   // The window's foreground as its host last reported it, read when Codex
@@ -165,16 +150,17 @@ export function TerminalOverlay({
   const fontSize = sessionUi?.fontSize ?? DEFAULT_SESSION_UI.fontSize;
   const lastKnownTitle = sessionUi?.lastKnownTitle ?? null;
   const [surfaceGeneration, setSurfaceGeneration] = useState(0);
-  const [transportState, setConnectionState] = useState<TransportState>("idle");
-  const checked = transportRef.current?.refusedWindow?.checked;
-  const confirmed =
-    detailLoaded &&
-    checked &&
-    sameWindowRun(checked, session) &&
-    session.host_id === host.id &&
-    transportRef.current?.hostId === host.id;
-  const connectionState =
-    transportState === "not-running" && !confirmed ? "reconnecting" : transportState;
+  const run = useMemo(
+    () => ({
+      session: session.id,
+      host: host.id,
+      rowHost: session.host_id,
+      start: session.started_at,
+    }),
+    [session.id, host.id, session.host_id, session.started_at],
+  );
+  const [refusedRun, setRefusedRun] = useState<typeof run | null>(null);
+  const [connectionState, setConnectionState] = useState<TransportState>("idle");
   const [connectionError, setConnectionError] = useState<TransportError | null>(null);
   const [diagnostic, setDiagnostic] = useState<WorkerDiagnostic | null>(null);
   const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
@@ -325,8 +311,6 @@ export function TerminalOverlay({
       scrollUnsubscribeRef.current?.();
       pendingLaunchUnsubscribeRef.current?.();
       transportRef.current = transport;
-      const window = windowRef.current;
-      transport.observeWindow?.(window.session, window.visible, window.refreshDetail);
       scrollUnsubscribeRef.current = transport.on("scroll", (scroll) => {
         updateFollow({ type: "scroll", scroll });
         if (scroll.newOutputWhileAway) updateFollow({ type: "output-while-away" });
@@ -345,28 +329,16 @@ export function TerminalOverlay({
         },
       });
     },
-    [
-      armLaunchFocus,
-      host.host_public_key,
-      session.status,
-      transfers.setNotice,
-      updateFollow,
-      transportRef,
-    ],
+    [armLaunchFocus, host.host_public_key, session.status, transfers.setNotice, updateFollow],
   );
-
-  useLayoutEffect(() => {
-    transportRef.current?.observeWindow?.(session, visible, refreshDetail);
-  }, [session, visible, refreshDetail, transportRef]);
 
   const handleConnectionState = (next: TransportState): void => {
     const previous = previousConnectionState.current;
     previousConnectionState.current = next;
     setConnectionState(next);
-    if (next === "ready" || next === "not-running" || transportRef.current?.refusedWindow) {
-      setIncarnation((current) => (current.claimOwed ? { ...current, claimOwed: false } : current));
-    }
     if (next === "ready") {
+      // The surface took the display on this ready if the claim was owed.
+      setIncarnation((current) => (current.claimOwed ? { ...current, claimOwed: false } : current));
       setHasEverBeenReady(true);
       setConnectionError(null);
       if (previous !== "ready") haptics.success();
@@ -391,7 +363,7 @@ export function TerminalOverlay({
     setConnectionState("idle");
     setConnectionError(null);
     setSurfaceGeneration((generation) => generation + 1);
-  }, [host.id, transportRef]);
+  }, [host.id]);
 
   /** A retry this screen asked for itself — a restart — is an opening: its
    *  fresh surface takes the display, whichever host the window is on. */
@@ -425,8 +397,8 @@ export function TerminalOverlay({
     // Handled: drop the latch first so the watch stops and this cannot loop on
     // a connection that fails again for some other reason.
     setAwaitingApproval(false);
-    if (!transportRef.current?.recheckNotRunning?.()) retry();
-  }, [awaitingApproval, hostApproval, retry, transportRef]);
+    retry();
+  }, [awaitingApproval, hostApproval, retry]);
 
   // The ceremony presents itself: a trust failure is not something Retry can
   // fix, so waiting for the operator to find the right button is a dead end.
@@ -598,6 +570,7 @@ export function TerminalOverlay({
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
           <View style={styles.surface}>
             <TerminalSurface
+              onAttachResult={(notRunning) => setRefusedRun(notRunning ? run : null)}
               claimDisplay={incarnation.claimOwed}
               fontSize={fontSize}
               hostId={incarnation.hostId}
@@ -633,39 +606,24 @@ export function TerminalOverlay({
           </View>
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
-        {connectionState === "not-running" ? (
-          <View
-            style={[
-              StyleSheet.absoluteFill,
-              styles.unavailable,
-              {
-                gap: theme.space(2),
-                padding: theme.space(6),
-                backgroundColor: theme.colors.terminalBg,
-              },
-            ]}
-          >
-            <Text variant="label">{`This session is no longer running on ${session.host_name ?? host.name}.`}</Text>
-            <Text color="mutedForeground">
-              Choose Restart from the window menu to start it again.
-            </Text>
-            <Button onPress={() => transportRef.current?.recheckNotRunning?.()}>Try again</Button>
-          </View>
-        ) : (
-          <ConnectionStateOverlay
-            awaitingApproval={awaitingApproval}
-            error={connectionError}
-            hasEverBeenReady={hasEverBeenReady}
-            sharedConnectionReady={transportRef.current?.daemonState === "ready"}
-            sharedConnectionUnavailable={
-              transportRef.current?.daemonState !== undefined &&
-              transportRef.current.daemonState !== "ready"
-            }
-            onDeviceTrust={() => setApprovalVisible(true)}
-            onRetry={() => transportRef.current?.recheckNotRunning?.() ?? retry()}
-            state={hostKey ? connectionState : "failed"}
-          />
-        )}
+        <ConnectionStateOverlay
+          notRunningNotice={
+            refusedRun === run && session.status === "running"
+              ? `This session is no longer running on ${host.name ?? session.host_name ?? "this host"}.`
+              : null
+          }
+          awaitingApproval={awaitingApproval}
+          error={connectionError}
+          hasEverBeenReady={hasEverBeenReady}
+          sharedConnectionReady={transportRef.current?.daemonState === "ready"}
+          sharedConnectionUnavailable={
+            transportRef.current?.daemonState !== undefined &&
+            transportRef.current.daemonState !== "ready"
+          }
+          onDeviceTrust={() => setApprovalVisible(true)}
+          onRetry={retry}
+          state={hostKey ? connectionState : "failed"}
+        />
         {shouldShowJumpToLatest(followState) ? (
           <View
             pointerEvents="box-none"

@@ -58,13 +58,6 @@ export function connectionCopy(state: TransportState): ConnectionCopy {
         variant: "warning-soft",
         busy: true,
       };
-    case "not-running":
-      return {
-        title: "Session stopped",
-        detail: "This session is no longer running on this host.",
-        variant: "outline",
-        busy: false,
-      };
     case "closed":
       return {
         title: "Connection closed",
@@ -101,6 +94,7 @@ function CompactStateGlyph({
 }
 
 export interface ConnectionStateOverlayProps {
+  notRunningNotice?: string | null;
   state: TransportState;
   error?: TransportError | null;
   hasEverBeenReady: boolean;
@@ -127,6 +121,7 @@ export function ConnectionStateOverlay({
   hasEverBeenReady,
   sharedConnectionUnavailable = false,
   sharedConnectionReady = false,
+  notRunningNotice,
   onRetry,
   onDeviceTrust,
   awaitingApproval = false,
@@ -189,18 +184,25 @@ export function ConnectionStateOverlay({
         {compact ? <CompactStateGlyph busy={copy.busy} state={state} /> : null}
         <View style={[styles.copy, { alignItems: compact ? "flex-start" : "center" }]}>
           <Text variant="label">
-            {paused ? "Connection paused" : awaitingApproval ? "Waiting for approval" : copy.title}
+            {notRunningNotice ??
+              (paused
+                ? "Connection paused"
+                : awaitingApproval
+                  ? "Waiting for approval"
+                  : copy.title)}
           </Text>
           <Text
             color="mutedForeground"
             style={compact ? undefined : styles.centeredCopy}
             variant="caption"
           >
-            {paused
-              ? "Your terminal output is still available to copy."
-              : awaitingApproval
-                ? "This host has not approved this device yet. It reconnects on its own the moment it does."
-                : (error?.message ?? copy.detail)}
+            {notRunningNotice
+              ? "Choose Restart from the window menu to start it again."
+              : paused
+                ? "Your terminal output is still available to copy."
+                : awaitingApproval
+                  ? "This host has not approved this device yet. It reconnects on its own the moment it does."
+                  : (error?.message ?? copy.detail)}
           </Text>
         </View>
       </View>

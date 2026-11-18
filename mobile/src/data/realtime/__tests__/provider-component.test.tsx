@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { Text as NativeText } from "react-native";
@@ -56,9 +56,7 @@ jest.mock("@/theme", () => {
 });
 
 function Wrapper({ children }: PropsWithChildren): React.JSX.Element {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } },
-  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
@@ -69,26 +67,6 @@ describe("RealtimeProvider socket auth", () => {
     mockStateListener = undefined;
     jest.clearAllMocks();
     useConnectionStore.getState().reset();
-  });
-
-  test("alerts recovery leaves an unaffected session detail alone", async () => {
-    const read = jest.fn<Promise<string>, []>().mockResolvedValueOnce("1").mockResolvedValue("2");
-    function WindowDetail() {
-      const { data } = useQuery({ queryKey: ["session", "window"], queryFn: read });
-      return <NativeText>{data}</NativeText>;
-    }
-    const screen = await render(
-      <RealtimeProvider>
-        <WindowDetail />
-      </RealtimeProvider>,
-      { wrapper: Wrapper },
-    );
-    await waitFor(() => expect(screen.getByText("1")).toBeOnTheScreen());
-    await act(() => mockStateListener?.("open"));
-    await act(() => mockStateListener?.("failed"));
-    await act(() => mockStateListener?.("open"));
-    expect(read).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("1")).toBeOnTheScreen();
   });
 
   test("retires without a token, connects after sign-in, and exposes persistent retry", async () => {

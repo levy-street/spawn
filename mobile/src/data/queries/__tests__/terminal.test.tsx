@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react-native";
+import { act, renderHook } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession } from "@/data/api/endpoints/sessions";
@@ -23,7 +23,6 @@ beforeEach(() => {
   jest.clearAllMocks();
   client = new QueryClient({
     defaultOptions: {
-      mutations: { gcTime: 0 },
       queries: { retry: false, staleTime: 10_000, gcTime: Number.POSITIVE_INFINITY },
     },
   });
@@ -40,9 +39,8 @@ test("first open has session and host immediately, with no serial detail request
   expect(client.getQueryData(qk.host(host.id))).toBeUndefined();
   const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
   expect(result.current).toMatchObject({ session, host, isLoading: false, error: null });
-  expect(result.current.detailLoaded).toBe(false);
-  expect(getSession).toHaveBeenCalledTimes(0);
-  expect(getHost).toHaveBeenCalledTimes(0);
+  expect(getSession).not.toHaveBeenCalled();
+  expect(getHost).not.toHaveBeenCalled();
   expect(client.getQueryState(qk.session(session.id))?.dataUpdatedAt).toBe(updatedAt);
 });
 
@@ -64,30 +62,4 @@ test("invalidated and removed account data cannot seed a terminal", async () => 
   const next = await renderHook(() => useTerminalData(session.id), { wrapper });
   expect(next.result.current.session).toBeUndefined();
   expect(next.result.current.host).toBeUndefined();
-});
-
-test.each([{ status: "starting" as const }, { started_at: new Date(0).toISOString() }])(
-  "a same-host list update adds no detail request to an unaffected window",
-  async (change) => {
-    const replacement = { ...session, ...change };
-    client.setQueryData(qk.session(session.id), session, { updatedAt: Date.now() - 1000 });
-    client.setQueryData(qk.sessions(), [replacement]);
-    jest.mocked(getSession).mockResolvedValue(replacement);
-    const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
-    expect(result.current.session).toEqual(session);
-    expect(getSession).toHaveBeenCalledTimes(0);
-  },
-);
-
-test("a failed detail refresh suppresses the notice until a successful detail GET", async () => {
-  jest.mocked(getSession).mockResolvedValue(session);
-  jest.mocked(getHost).mockResolvedValue(host);
-  const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
-  await waitFor(() => expect(result.current.host).toEqual(host));
-  jest.mocked(getSession).mockRejectedValueOnce(new Error("temporarily unavailable"));
-  await act(() => result.current.refreshDetail());
-  await waitFor(() => expect(result.current.detailLoaded).toBe(false));
-  expect(result.current).toMatchObject({ session, host, error: null });
-  await act(() => result.current.refreshDetail());
-  await waitFor(() => expect(result.current.detailLoaded).toBe(true));
 });

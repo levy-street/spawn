@@ -11,7 +11,6 @@ import type { SignedRtcRefusalReason } from "./signed-rtc-trust";
 export interface DaemonSnapshot {
   state: HostControlState;
   generation: string | null;
-  rebound?: number;
   capabilities: readonly string[];
   refusal: SignedRtcRefusalReason | null;
   trust: "verified" | "first_contact" | "raw" | null;
@@ -535,7 +534,6 @@ export class SharedDaemonConnection implements DaemonConnection {
       snapshot: {
         state: root.getState(),
         generation: root.getConnectionGeneration(),
-        rebound: root.rebound,
         capabilities: [...root.getCapabilities()],
         refusal: root.getSignedRtcRefusal(),
         trust: root.getSignalingTrust(),

@@ -78,9 +78,8 @@ on each channel before closing, with `version: 1`, `kind: "event"`,
 close also occurs before discovery finishes, when admission refuses, when the
 filesystem check is uncertain, on timeout, or when the channel closes first.
 Older devices ignore PTY text and unknown control events and retry on close.
-Other reasons and closes without a reason keep that retry behavior. The notice applies to a
-running row on the answering host. Try again opens fresh channels, as does a
-visible notice after 30 seconds. Restart belongs to the window menu. This
+Both apps keep retrying on close. For a running row, the waiting overlay
+explains the last refusal and points to Restart in the window menu. This
 exchange neither contacts a worker nor records a session change on the server.
 
 `spawn.host.ctl` advertises what a daemon can do in its `hello`. A new

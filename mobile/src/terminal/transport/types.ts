@@ -1,11 +1,9 @@
-import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { DeviceHostTrust, DeviceHostTrustResult } from "@/data/trust/device-trust";
 import type { TerminalTheme } from "@/theme";
 
 export type TransportState =
   | "idle"
-  | "not-running"
   | "signalling"
   | "connecting"
   | "ready"
@@ -123,6 +121,8 @@ export interface SignalChannelLike {
 }
 
 export interface SessionTransportOptions {
+  /** Capture the current run's notice callback when a channel pair is opened. */
+  attachResultListener?: () => ((notRunning: boolean) => void) | undefined;
   sessionId: string;
   hostIdentityPublicKey: string;
   initialSize: { cols: number; rows: number };
@@ -135,21 +135,7 @@ export interface SessionTransportOptions {
   connectTimeoutMs?: number;
 }
 
-export type WindowRun = Pick<SessionOut, "host_id" | "started_at" | "status">;
-
-export function sameWindowRun(a: WindowRun | null, b: WindowRun | null): boolean {
-  return a?.host_id === b?.host_id && a?.status === b?.status && a?.started_at === b?.started_at;
-}
-
 export interface SessionTransport {
-  observeWindow?(
-    row: WindowRun | null,
-    visible: boolean,
-    refreshDetail?: () => Promise<WindowRun | null>,
-  ): void;
-  /** Present while this window is checking a refusal. A failed GET clears the checked row. */
-  readonly refusedWindow?: { readonly checked: WindowRun | null } | null;
-  recheckNotRunning?(): Promise<void> | undefined;
   readonly sessionId: string;
   /** The host this view attaches to the window on, fixed for its life. */
   readonly hostId: string;
@@ -345,7 +331,6 @@ export interface HostTransportOptions {
 }
 
 export interface HostTransport {
-  onRebound?(listener: () => void): () => void;
   readonly hostId: string;
   readonly lastError?: TransportError | null;
   readonly state: TransportState;

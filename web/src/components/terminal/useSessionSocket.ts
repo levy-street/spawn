@@ -1,8 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { getAlertSocketState, subscribeToAlertSocketState } from "@/lib/alert-socket";
-import type { Session } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DaemonChannel } from "@/lib/daemon-channel";
 import type { DaemonConnection } from "@/lib/daemon-connection";
 import {
@@ -31,7 +29,6 @@ import {
   slicePtyChunkAfterAnchor,
   writeSessionPtyInput,
 } from "@/lib/session-ctl";
-import { sameSessionRun } from "@/lib/sessions";
 import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -46,12 +43,12 @@ import type { DisplayControlState } from "@/lib/ws";
 export interface UseSessionSocketOptions {
   connection?: DaemonConnection | null;
   sessionId: string;
-  active?: boolean;
-  hostId: string | null;
-  refreshDetail: () => Promise<Session | null>;
-  canShowNotRunning?: boolean;
-  onNotRunning?: () => void;
-  sessionStatus?: Session;
+  sessionStatus?: {
+    status: string;
+    exit_code: number | null;
+    host_id: string;
+    started_at: string;
+  } | null;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
@@ -110,8 +107,7 @@ export type SocketState =
   | "closed"
   | "error"
   | "unauthorized"
-  | "disabled"
-  | "not-running";
+  | "disabled";
 
 /** How the live connection's signaling was authenticated. */
 export type SignalingTrustLevel = "verified" | "first_contact" | "raw";
@@ -148,15 +144,15 @@ const UPLOAD_READY_WAIT_MS = 20_000;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const MAX_PENDING_INPUT_AGE_MS = 30_000;
 
-function isSessionNotRunning(data: unknown): boolean {
-  if (typeof data !== "string" || data.length > 512) return false;
+function isNotRunningFrame(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 16 * 1024) return false;
   try {
-    const message = JSON.parse(data);
+    const frame = JSON.parse(data);
     return (
-      message?.version === 1 &&
-      message.kind === "event" &&
-      message.event === "attach_refused" &&
-      message.reason === "session_not_running"
+      frame?.version === 1 &&
+      frame.kind === "event" &&
+      frame.event === "attach_refused" &&
+      frame.reason === "session_not_running"
     );
   } catch {
     return false;
@@ -170,13 +166,8 @@ function newRtcSessionId(): string {
 export function useSessionSocket({
   connection = null,
   sessionId,
-  sessionStatus,
+  sessionStatus = null,
   enabled = true,
-  active = true,
-  hostId,
-  refreshDetail,
-  canShowNotRunning = false,
-  onNotRunning,
   initialSize = null,
   onData,
   onHistory,
@@ -186,6 +177,15 @@ export function useSessionSocket({
   onSnapshot,
   onSnapshotError,
 }: UseSessionSocketOptions) {
+  const run = useMemo(
+    () => ({ sessionId, host: sessionStatus?.host_id, start: sessionStatus?.started_at }),
+    [sessionId, sessionStatus?.host_id, sessionStatus?.started_at],
+  );
+  const currentRun = useRef(run);
+  currentRun.current = run;
+  const [refusedRun, setRefusedRun] = useState<typeof run | null>(null);
+  const sessionNotRunning = refusedRun === run;
+
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
   const [v3, setV3] = useState(false);
@@ -249,7 +249,6 @@ export function useSessionSocket({
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     sessionId,
-    onNotRunning,
     onData,
     onHistory,
     onDisplayControl,
@@ -261,7 +260,6 @@ export function useSessionSocket({
   initialSizeRef.current = initialSize;
   handlersRef.current = {
     sessionId,
-    onNotRunning,
     onData,
     onHistory,
     onDisplayControl,
@@ -313,64 +311,6 @@ export function useSessionSocket({
       lastExit.current = null;
     }
   }, [sessionId, sessionStatus?.status, sessionStatus?.exit_code]);
-  // Keep the refusal with the window even if the provider replaces its host connection.
-  const refusal = useRef<{
-    sessionId: string;
-    timer: ReturnType<typeof setInterval>;
-    firstRun: Session | undefined;
-    checked: Session | null;
-    request?: Promise<void>;
-  } | null>(null);
-  const attachment = useRef<{ close(): void; open(run: Session): void } | null>(null);
-  const currentView = useRef({ active, sessionStatus, hostId, refreshDetail });
-  const clearRefusal = useCallback(() => {
-    clearInterval(refusal.current?.timer);
-    refusal.current = null;
-  }, []);
-  useEffect(
-    () => () => {
-      if (refusal.current?.sessionId === sessionId) clearRefusal();
-    },
-    [sessionId, clearRefusal],
-  );
-  const recheckNotRunning = useCallback(() => {
-    const window = refusal.current;
-    if (!window) return;
-    if (window.request) return window.request;
-    const visible = () => currentView.current.active && document.visibilityState === "visible";
-    if (!visible()) return Promise.resolve();
-    attachment.current?.close();
-    window.request = currentView.current.refreshDetail().then((row) => {
-      if (refusal.current !== window) return;
-      window.request = undefined;
-      window.checked = row;
-      const first = window.firstRun;
-      window.firstRun = undefined;
-      if (!row || row.host_id !== currentView.current.hostId || !visible()) {
-        setState("connecting");
-      } else if (first && sameSessionRun(first, row)) {
-        setState(row.status === "running" ? "not-running" : "connecting");
-      } else {
-        setState("connecting");
-        attachment.current?.open(row);
-      }
-    });
-    return window.request;
-  }, []);
-  useLayoutEffect(() => {
-    const previous = currentView.current;
-    currentView.current = { active, sessionStatus, hostId, refreshDetail };
-    const watch = refusal.current;
-    if (!watch) return;
-    const changed =
-      sessionStatus &&
-      previous.sessionStatus &&
-      !sameSessionRun(previous.sessionStatus, sessionStatus) &&
-      !(watch.checked && sameSessionRun(watch.checked, sessionStatus));
-    if (changed) setState("connecting");
-    if (changed || (active && !previous.active)) void recheckNotRunning();
-  }, [active, sessionStatus, hostId, refreshDetail, recheckNotRunning]);
-
   useEffect(() => {
     const sessionGeneration = ++sessionGenerationRef.current;
     activeSessionIdRef.current = enabled && connection ? sessionId : null;
@@ -384,9 +324,7 @@ export function useSessionSocket({
       return;
     }
     let cancelled = false;
-    let hostReady = false;
-    let rebound = connection.getSnapshot().rebound;
-    let hostGeneration = connection.getSnapshot().generation;
+    let refusedGeneration: number | undefined;
     let rtcRetryAttempts = 0;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -408,6 +346,7 @@ export function useSessionSocket({
         (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
       )
         return;
+      if (rtc.rtcGeneration !== refusedGeneration) setRefusedRun(null);
       clearRtcConnectTimer();
       rtcRef.current = {
         sessionId: null,
@@ -448,17 +387,17 @@ export function useSessionSocket({
       setState("connecting");
       rtcRetryTimer = setTimeout(() => {
         rtcRetryTimer = null;
-        if (refusal.current) void recheckNotRunning();
-        else startRtc();
+        startRtc();
       }, delay);
     };
-    const startRtc = (run = currentView.current.sessionStatus) => {
+    const startRtc = () => {
       if (
         !isActiveSessionGeneration() ||
         rtcRef.current.ptyDc ||
         connection.getSnapshot().state !== "ready"
       )
         return;
+      const attemptedRun = currentRun.current;
       const rtcGeneration = ++rtcGenerationRef.current;
       const rtcSessionId = newRtcSessionId();
       const suffix = `${sessionId}/${viewId.current}/${rtcSessionId}`;
@@ -473,6 +412,7 @@ export function useSessionSocket({
           throw error;
         }
       } catch {
+        setRefusedRun(null);
         scheduleRtcRetry();
         return;
       }
@@ -887,24 +827,12 @@ export function useSessionSocket({
       ptyDc.bufferedAmountLowThreshold = 64 * 1024;
       ptyDc.onbufferedamountlow = flushPendingInput;
 
-      const acceptRefusal = (data: unknown) => {
-        if (serverReady || !isSessionNotRunning(data)) return false;
-        cleanupRtc(true, false, rtcGeneration);
-        const watch = refusal.current;
-        if (!watch) {
-          currentHandlers()?.onNotRunning?.();
-          refusal.current = {
-            sessionId,
-            firstRun: run,
-            checked: null,
-            timer: setInterval(recheckNotRunning, 30_000),
-          };
-          setState("connecting");
-          void recheckNotRunning();
-        } else {
-          setState(watch.checked?.status === "running" ? "not-running" : "connecting");
+      // The daemon also closes the channels. Only that ordinary close drives retry.
+      const observeReply = (data: unknown) => {
+        if (!serverReady && isNotRunningFrame(data)) {
+          refusedGeneration = rtcGeneration;
+          setRefusedRun(attemptedRun);
         }
-        return true;
       };
 
       const markReady = () => {
@@ -921,8 +849,8 @@ export function useSessionSocket({
         }
         rtcRef.current = { ...current, open: true };
         clearRtcConnectTimer();
+        setRefusedRun(null);
         rtcRetryAttempts = 0;
-        clearRefusal();
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
         settleUploadReadiness(true);
@@ -1161,7 +1089,7 @@ export function useSessionSocket({
       ptyDc.onmessage = (event) => {
         if (!isCurrentRtcGeneration()) return;
         const data = event.data;
-        if (acceptRefusal(data)) return;
+        observeReply(data);
         if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
         void ptyMessages
           .enqueue(
@@ -1199,7 +1127,7 @@ export function useSessionSocket({
         ctlDc.onmessage = (event) => {
           if (!isCurrentRtcGeneration()) return;
           const data = event.data;
-          if (acceptRefusal(data)) return;
+          observeReply(data);
           if (
             typeof data !== "string" &&
             !(data instanceof ArrayBuffer) &&
@@ -1285,11 +1213,6 @@ export function useSessionSocket({
     const sync = () => {
       if (!isActiveSessionGeneration()) return;
       const snapshot = connection.getSnapshot();
-      const recovered =
-        !hostReady || snapshot.generation !== hostGeneration || snapshot.rebound !== rebound;
-      hostReady = snapshot.state === "ready";
-      rebound = snapshot.rebound;
-      hostGeneration = snapshot.generation;
       setSignedRtcRefusal(snapshot.refusal);
       setSignalingTrust(snapshot.trust);
       setConnInfo(snapshot.info ?? EMPTY_CONN_INFO);
@@ -1300,10 +1223,6 @@ export function useSessionSocket({
         setState(snapshot.state === "open" ? "connecting" : snapshot.state);
         return;
       }
-      if (refusal.current) {
-        if (recovered) void recheckNotRunning();
-        return;
-      }
       if (rtcRef.current.open) {
         setDcOpen(true);
         setState("open");
@@ -1312,20 +1231,11 @@ export function useSessionSocket({
         startRtc();
       }
     };
-    attachment.current = {
-      close() {
-        if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-        rtcRetryTimer = null;
-        cleanupRtc();
-      },
-      open: startRtc,
-    };
     const unsubscribe = connection.subscribe(sync);
     sync();
     return () => {
       cancelled = true;
       unsubscribe();
-      attachment.current = null;
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
       clearRtcConnectTimer();
       cleanupRtc(false);
@@ -1340,23 +1250,7 @@ export function useSessionSocket({
     settleUploadReadiness,
     updateQueuedInputState,
     armPendingInputExpiry,
-    clearRefusal,
-    recheckNotRunning,
   ]);
-  useEffect(() => {
-    const unsubscribe = subscribeToAlertSocketState(() => {
-      if (getAlertSocketState() === "open") void recheckNotRunning();
-    });
-    window.addEventListener("online", recheckNotRunning);
-    window.addEventListener("focus", recheckNotRunning);
-    document.addEventListener("visibilitychange", recheckNotRunning);
-    return () => {
-      unsubscribe();
-      window.removeEventListener("online", recheckNotRunning);
-      window.removeEventListener("focus", recheckNotRunning);
-      document.removeEventListener("visibilitychange", recheckNotRunning);
-    };
-  }, [recheckNotRunning]);
 
   const sendBinary = useCallback(
     (bytes: Uint8Array | string) => {
@@ -1446,36 +1340,32 @@ export function useSessionSocket({
     [sessionId, waitForUploadReadiness],
   );
 
-  const checked = refusal.current?.checked;
-  const confirmed =
-    canShowNotRunning && checked && sessionStatus && sameSessionRun(checked, sessionStatus);
-  const visibleState = state === "not-running" && !confirmed ? "connecting" : state;
   return useMemo(
     () => ({
-      state: visibleState,
+      state,
       v3,
       dcOpen,
       queuedInputCount,
+      sessionNotRunning,
       connInfo,
       signedRtcRefusal,
       signalingTrust,
       sendBinary,
       sendJson,
       uploadFile,
-      recheckNotRunning,
     }),
     [
-      visibleState,
+      state,
       v3,
       dcOpen,
       queuedInputCount,
+      sessionNotRunning,
       connInfo,
       signedRtcRefusal,
       signalingTrust,
       sendBinary,
       sendJson,
       uploadFile,
-      recheckNotRunning,
     ],
   );
 }

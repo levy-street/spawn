@@ -59,13 +59,15 @@ export interface TerminalSurfaceHandle {
   takeControl(): void;
 }
 
-export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bridge" | "theme"> {
+export interface TerminalSurfaceProps
+  extends Omit<SessionTransportOptions, "bridge" | "theme" | "attachResultListener"> {
   style?: StyleProp<ViewStyle>;
   /** Whether this surface's first ready counts as opening the session and
    *  takes its display lease. True for a terminal someone opened; false for
    *  one mounted because its window moved to another host — a reconnect,
    *  which never takes control. Read at mount. */
   claimDisplay?: boolean;
+  onAttachResult?(notRunning: boolean): void;
   onTransport?(transport: SessionTransport): void;
   onStateChange?(state: TransportState): void;
   onError?(error: TransportError): void;
@@ -109,6 +111,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       style,
       claimDisplay = true,
       onTransport,
+      onAttachResult,
       onStateChange,
       onError,
       onDiagnostic,
@@ -134,6 +137,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
     const selectionWaiters = useRef(new Map<string, SelectionWaiter>());
     const callbacks = useRef({
       onTransport,
+      onAttachResult,
       onStateChange,
       onError,
       onDiagnostic,
@@ -148,6 +152,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
     });
     callbacks.current = {
       onTransport,
+      onAttachResult,
       onStateChange,
       onError,
       onDiagnostic,
@@ -166,6 +171,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
         createSessionTransport({
           sessionId,
           hostIdentityPublicKey,
+          attachResultListener: () => callbacks.current.onAttachResult,
           initialSize: { cols: initialSize.cols, rows: initialSize.rows },
           theme: initialTheme.current,
           bridge,
@@ -228,10 +234,6 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       let displayClaimOwed = claimsOnOpen.current;
       const unsubscribers = [
         transport.on("state", (state) => {
-          if (state === "not-running" || transport.refusedWindow) {
-            claimsOnOpen.current = false;
-            displayClaimOwed = false;
-          }
           if (state === "ready" && displayClaimOwed) {
             displayClaimOwed = false;
             transport.takeControl();

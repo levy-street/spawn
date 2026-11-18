@@ -1,9 +1,8 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
-import { ApiError } from "@/data/api/client";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { getHost } from "@/data/api/endpoints/hosts";
 import {
@@ -18,30 +17,24 @@ import { cachedListItem } from "@/data/cached-list-item";
 import { restartConversationHooks } from "@/data/queries/conversation";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
-import { useConnectionStore } from "@/data/stores/connection";
 import type { AgentDef } from "@/data/types/domain";
-import { type SessionTransport, sameWindowRun } from "@/terminal/transport/types";
 
 /** Definitions change when someone edits them in Settings, not per keystroke. */
 const AGENTS_STALE_MS = 60_000;
 
 export interface TerminalData {
   session: SessionOut | undefined;
-  detailLoaded: boolean;
   host: HostOut | undefined;
   /** Every agent definition, for naming what a restart of this window brings
    *  back. Empty until loaded; the screen never waits on it. */
   agents: readonly AgentDef[];
   isLoading: boolean;
   error: Error | null;
-  windowTransport: { current: SessionTransport | null };
-  refreshDetail: () => Promise<SessionOut | null>;
   refetch: () => Promise<void>;
 }
 
 export function useTerminalData(sessionId: string): TerminalData {
   const queryClient = useQueryClient();
-  const windowTransport = useRef<SessionTransport | null>(null);
   const sessionQuery = useQuery({
     queryKey: qk.session(sessionId),
     queryFn: () => getSession(sessionId),
@@ -49,32 +42,23 @@ export function useTerminalData(sessionId: string): TerminalData {
     ...cachedListItem<SessionOut>(queryClient, qk.sessions(), sessionId),
   });
   const hostId = sessionQuery.data?.host_id ?? "";
-  // A newer list can reveal a move or restart missed on the alert socket.
-  // Refetch the detail because the list itself may have been in flight
-  // while the window was changing.
+  // Nothing polls this row while the terminal is open, but the session list is
+  // polled wherever windows are listed. When the list has heard of a move the
+  // row has not — its data frame lost to a dropped alert socket — the row is
+  // refetched rather than trusted for ever. Only refetched: a list response
+  // that left the server before the move can land after it, and must never
+  // send the terminal back to the host the window left.
   const listQuery = useQuery({
     queryKey: qk.sessions(),
     queryFn: () => listSessions(),
     enabled: false,
   });
-  const listed = listQuery.data?.find((item) => item.id === sessionId);
-  const rowChanged = listed && sessionQuery.data && !sameWindowRun(listed, sessionQuery.data);
+  const listedHostId = listQuery.data?.find((item) => item.id === sessionId)?.host_id ?? null;
   const listIsNewer = listQuery.dataUpdatedAt > sessionQuery.dataUpdatedAt;
   useEffect(() => {
-    if (!listIsNewer || !rowChanged) return;
-    if (windowTransport.current?.recheckNotRunning?.()) return;
-    if (listed?.host_id !== hostId)
-      void queryClient.invalidateQueries(
-        { queryKey: qk.session(sessionId), exact: true },
-        { cancelRefetch: false },
-      );
-  }, [listIsNewer, rowChanged, listed?.host_id, hostId, queryClient, sessionId]);
-  useEffect(() => {
-    return useConnectionStore.subscribe((state, previous) => {
-      if (state.alertSocket === "open" && previous.alertSocket !== "open")
-        void windowTransport.current?.recheckNotRunning?.();
-    });
-  }, []);
+    if (!listIsNewer || listedHostId === null || hostId === "" || listedHostId === hostId) return;
+    void queryClient.invalidateQueries({ queryKey: qk.session(sessionId), exact: true });
+  }, [hostId, listIsNewer, listedHostId, queryClient, sessionId]);
   const hostQuery = useQuery({
     queryKey: qk.host(hostId),
     queryFn: () => getHost(hostId),
@@ -93,29 +77,17 @@ export function useTerminalData(sessionId: string): TerminalData {
     staleTime: AGENTS_STALE_MS,
   });
 
-  const detailError = sessionQuery.error;
-  const unavailable =
-    !sessionQuery.data ||
-    hostQuery.data?.id !== hostId ||
-    (detailError instanceof ApiError && [401, 403, 404, 410].includes(detailError.status));
-
   return {
     session: sessionQuery.data,
-    detailLoaded: sessionQuery.isFetched && sessionQuery.isSuccess && !(listIsNewer && rowChanged),
-    windowTransport,
     host: hostQuery.data,
     agents: agentsQuery.data ?? [],
     isLoading: sessionQuery.isLoading || (hostId.length > 0 && hostQuery.isLoading),
     error:
-      unavailable && detailError instanceof Error
-        ? detailError
+      sessionQuery.error instanceof Error
+        ? sessionQuery.error
         : hostQuery.error instanceof Error
           ? hostQuery.error
           : null,
-    refreshDetail: async () => {
-      const result = await sessionQuery.refetch({ cancelRefetch: false });
-      return result.isSuccess ? result.data : null;
-    },
     refetch: async () => {
       const sessionResult = await sessionQuery.refetch();
       if (sessionResult.data?.host_id) await hostQuery.refetch();

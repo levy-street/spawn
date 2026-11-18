@@ -1,5 +1,16 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
 
+declare global {
+  interface Window {
+    attachProbe: {
+      trace: { event: string; at: number }[];
+      receive(channel: string, data: string): void;
+      close(channel: string): void;
+      acceptNext(): void;
+    };
+  }
+}
+
 type Capture = string | Buffer;
 
 export async function installSessionRtcMock(
@@ -11,8 +22,6 @@ export async function installSessionRtcMock(
     control?: { owner: boolean; cols: number; rows: number; viewers: number };
     openChannels?: boolean;
     sendReady?: boolean;
-    /** Empty string closes without an event, as older daemons do. */
-    attachRefusal?: string;
     autoSnapshot?: boolean;
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
@@ -54,7 +63,6 @@ export async function installSessionRtcMock(
       control,
       openChannels,
       sendReady,
-      attachRefusal,
       autoSnapshot,
       uploadFinalAction,
       stallUploadBackpressure,
@@ -68,7 +76,6 @@ export async function installSessionRtcMock(
         control,
         openChannels,
         sendReady,
-        attachRefusal,
         autoSnapshot,
         uploadFinalAction,
         stallUploadBackpressure,
@@ -189,6 +196,7 @@ export async function installSessionRtcMock(
 
         constructor(label: string, init?: RTCDataChannelInit) {
           this.label = label.split("/")[0];
+          window.attachProbe.trace.push({ event: `attach ${this.label}`, at: Date.now() });
           this.historyIndex = state.ptyChannels.length;
           this.ordered = init?.ordered ?? true;
           this.maxPacketLifeTime = init?.maxPacketLifeTime ?? null;
@@ -374,6 +382,7 @@ export async function installSessionRtcMock(
 
         close() {
           if (this.readyState === "closed") return;
+          window.attachProbe.trace.push({ event: `close ${this.label}`, at: Date.now() });
           this.readyState = "closed";
           this.onclose?.();
         }
@@ -381,21 +390,6 @@ export async function installSessionRtcMock(
         open() {
           this.readyState = "open";
           this.onopen?.();
-          if (state.attachRefusal === "hold") return;
-          if (state.attachRefusal !== undefined) {
-            if (state.attachRefusal) {
-              this.receive(
-                JSON.stringify({
-                  version: 1,
-                  kind: "event",
-                  event: "attach_refused",
-                  reason: state.attachRefusal,
-                }),
-              );
-            }
-            this.close();
-            return;
-          }
           if (this.label === "spawn.ctl") {
             if (state.sendReady) {
               this.receive(
@@ -442,6 +436,14 @@ export async function installSessionRtcMock(
           state.connections++;
         },
         openChannels: state.openChannels,
+      };
+      window.attachProbe = {
+        trace: [],
+        receive: (channel, data) => state.channels.get(channel)!.receive(data),
+        close: (channel) => state.channels.get(channel)!.close(),
+        acceptNext: () => {
+          state.sendReady = true;
+        },
       };
       class FakePeerConnection {
         localDescription: RTCSessionDescriptionInit | null = null;
@@ -523,9 +525,6 @@ export async function installSessionRtcMock(
         window as unknown as {
           __spawnRtcTest: {
             ptyReady: () => boolean;
-            setAttachRefusal(reason?: string): void;
-            attachmentCount(): number;
-            deliverLateRefusal(index: number): void;
             sendPty: (text: string, connectionIndex?: number) => boolean;
             replyReplay: (text: string) => void;
             setControl: (next: typeof control) => void;
@@ -544,22 +543,6 @@ export async function installSessionRtcMock(
           };
         }
       ).__spawnRtcTest = {
-        setAttachRefusal(reason) {
-          state.attachRefusal = reason;
-        },
-        deliverLateRefusal(index) {
-          state.ptyChannels[index].receive(
-            JSON.stringify({
-              version: 1,
-              kind: "event",
-              event: "attach_refused",
-              reason: "session_not_running",
-            }),
-          );
-        },
-        attachmentCount() {
-          return state.ptyChannels.length;
-        },
         ptyReady() {
           return (
             state.activePtyChannel?.readyState === "open" &&
@@ -670,7 +653,6 @@ export async function installSessionRtcMock(
       control: options.control ?? { owner: true, cols: 100, rows: 30, viewers: 1 },
       openChannels: options.openChannels ?? true,
       sendReady: options.sendReady ?? true,
-      attachRefusal: options.attachRefusal,
       autoSnapshot: options.autoSnapshot ?? false,
       uploadFinalAction: options.uploadFinalAction ?? "complete",
       stallUploadBackpressure: options.stallUploadBackpressure ?? false,

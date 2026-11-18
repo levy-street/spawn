@@ -7,7 +7,6 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -20,7 +19,6 @@ import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { AgentNotice } from "@/lib/agent-notice";
 import { type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
-import { sameSessionRun } from "@/lib/sessions";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -51,7 +49,7 @@ const EMPTY_SESSION_LIVE: SessionLive = {
 /** Stable actions — this context value never changes, so a placeholder's
  *  `attach` ref callback (which depends on it) never re-fires spuriously. */
 type Actions = {
-  claim: (sessionId: string, container: HTMLElement, token: symbol, row: Session | null) => void;
+  claim: (sessionId: string, container: HTMLElement, token: symbol) => void;
   release: (sessionId: string, token: symbol) => void;
   getHandle: (sessionId: string) => TerminalHandle | null;
 };
@@ -76,13 +74,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   const entriesRef = useRef<Map<string, PoolEntry>>(new Map());
   const parkRef = useRef<HTMLDivElement | null>(null);
   const [warmIds, setWarmIds] = useState<string[]>([]);
-  const [claims, setClaims] = useState<Record<string, { visible: boolean; row: Session | null }>>(
-    {},
-  );
-  const claimed = useMemo(
-    () => Object.fromEntries(Object.entries(claims).map(([id, claim]) => [id, claim.visible])),
-    [claims],
-  );
+  const [claimed, setClaimed] = useState<Record<string, boolean>>({});
   const [live, setLive] = useState<Record<string, SessionLive>>({});
   // Monotonic clock without Date.now in render; bumped per claim for LRU order.
   const clockRef = useRef(0);
@@ -97,7 +89,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     entriesRef.current.delete(sessionId);
     entry.host.parentElement?.removeChild(entry.host);
     setWarmIds((ids) => ids.filter((id) => id !== sessionId));
-    setClaims((m) => {
+    setClaimed((m) => {
       if (!(sessionId in m)) return m;
       const { [sessionId]: _drop, ...rest } = m;
       return rest;
@@ -124,7 +116,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   }, [evict]);
 
   const claim = useCallback(
-    (sessionId: string, container: HTMLElement, token: symbol, row: Session | null) => {
+    (sessionId: string, container: HTMLElement, token: symbol) => {
       let entry = entriesRef.current.get(sessionId);
       if (!entry) {
         const host = document.createElement("div");
@@ -136,11 +128,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       entry.token = token;
       entry.lastAt = nextClock();
       if (entry.host.parentElement !== container) container.appendChild(entry.host);
-      setClaims((m) =>
-        m[sessionId]?.visible && m[sessionId].row === row
-          ? m
-          : { ...m, [sessionId]: { visible: true, row } },
-      );
+      setClaimed((m) => (m[sessionId] ? m : { ...m, [sessionId]: true }));
       enforceLimit();
     },
     [enforceLimit, nextClock],
@@ -152,9 +140,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     entry.token = null;
     const park = parkRef.current;
     if (park && entry.host.parentElement !== park) park.appendChild(entry.host);
-    setClaims((m) =>
-      m[sessionId]?.visible ? { ...m, [sessionId]: { ...m[sessionId], visible: false } } : m,
-    );
+    setClaimed((m) => (m[sessionId] ? { ...m, [sessionId]: false } : m));
   }, []);
 
   const getHandle = useCallback(
@@ -225,7 +211,6 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               key={id}
               sessionId={id}
               active={!!claimed[id]}
-              displayedRow={claims[id]?.row ?? null}
               host={entry.host}
               handleRef={entry.handleRef}
               onInfo={onInfo}
@@ -243,15 +228,15 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
 /**
  * Where a warm terminal's window runs, as this tab knows it.
  *
- * The terminal reads its host and status from the window's detail row.
- * A newer list can reveal a move or restart missed on the alert socket.
- * Refetch the detail because the list itself may have been in flight
- * while the window was changing.
+ * Read from the window's own row (`["session", id]`), the one the terminal
+ * also reads its status from. Nothing polls that row, though, while the
+ * session list is polled wherever windows are shown — so when the list has
+ * heard of a move the row has not (its data frame lost to a dropped alert
+ * socket, say), the row is refetched rather than trusted for ever. Only
+ * refetched: a list response that left the server before the move can arrive
+ * after it, and must never send a terminal back to the host it left.
  */
-function useIncarnationHost(
-  sessionId: string,
-  handleRef: { current: TerminalHandle | null },
-): string | null {
+function useIncarnationHost(sessionId: string): string | null {
   const queryClient = useQueryClient();
   const row = useQuery({
     queryKey: ["session", sessionId],
@@ -267,26 +252,20 @@ function useIncarnationHost(
     enabled: false,
   });
   const hostId = row.data?.host_id ?? null;
-  const listed = list.data?.find((item) => item.id === sessionId);
-  const rowChanged = listed && row.data && !sameSessionRun(row.data, listed);
-  const newerList = list.dataUpdatedAt > row.dataUpdatedAt ? list.dataUpdatedAt : 0;
-  const listedHostId = listed?.host_id;
+  const listedHostId = list.data?.find((item) => item.id === sessionId)?.host_id ?? null;
+  const listIsNewer = list.dataUpdatedAt > row.dataUpdatedAt;
   useEffect(() => {
-    if (!newerList || !rowChanged) return;
-    if (handleRef.current?.recheckNotRunning()) return;
-    if (listedHostId !== hostId)
-      void queryClient.invalidateQueries(
-        { queryKey: ["session", sessionId], exact: true },
-        { cancelRefetch: false },
-      );
-  }, [newerList, rowChanged, handleRef, listedHostId, hostId, queryClient, sessionId]);
+    if (!listIsNewer || listedHostId === null || hostId === null || listedHostId === hostId) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: ["session", sessionId], exact: true });
+  }, [hostId, listIsNewer, listedHostId, queryClient, sessionId]);
   return hostId;
 }
 
 function PooledTerminal({
   sessionId,
   active,
-  displayedRow,
   host,
   handleRef,
   onInfo,
@@ -296,7 +275,6 @@ function PooledTerminal({
 }: {
   sessionId: string;
   active: boolean;
-  displayedRow: Session | null;
   host: HTMLDivElement;
   handleRef: { current: TerminalHandle | null };
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
@@ -304,7 +282,7 @@ function PooledTerminal({
   onAgentNotice: (sessionId: string, notice: AgentNotice | null) => void;
   onIncarnationEnd: (sessionId: string) => void;
 }) {
-  const hostId = useIncarnationHost(sessionId, handleRef);
+  const hostId = useIncarnationHost(sessionId);
   // The incarnation this pool entry shows. Learning the first host is not a
   // move — the terminal mounted before the row loaded keeps going — but each
   // change from one known host to another is: a new generation, a new
@@ -347,7 +325,6 @@ function PooledTerminal({
         mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
         imagePasteMode="bracketed-path"
         active={active}
-        displayedRow={displayedRow}
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
         onAgentNotice={(notice) => onAgentNotice(sessionId, notice)}
@@ -386,29 +363,25 @@ export function useTerminalHandles(): (sessionId: string) => TerminalHandle | nu
 
 /** Claim the shared warm terminal for `sessionId` into a placeholder. Attach the
  *  returned `attach` ref to the div where the terminal body should render. */
-export function useLiveTerminal(sessionId: string | null, row: Session | null = null) {
+export function useLiveTerminal(sessionId: string | null) {
   const actions = useContext(ActionsCtx);
   if (!actions) throw new Error("useLiveTerminal must be used within LiveTerminalProvider");
   const tokenRef = useRef<symbol | null>(null);
   if (!tokenRef.current) tokenRef.current = Symbol("live-terminal");
   const containerRef = useRef<HTMLElement | null>(null);
 
-  const rowRef = useRef(row);
-  rowRef.current = row;
   const attach = useCallback(
     (el: HTMLElement | null) => {
       containerRef.current = el;
-      if (el && sessionId) actions.claim(sessionId, el, tokenRef.current as symbol, rowRef.current);
+      if (el && sessionId) actions.claim(sessionId, el, tokenRef.current as symbol);
     },
     [sessionId, actions],
   );
 
-  useLayoutEffect(() => {
-    if (sessionId && containerRef.current) {
-      actions.claim(sessionId, containerRef.current, tokenRef.current as symbol, row);
-    }
-  }, [sessionId, actions, row]);
   useEffect(() => {
+    if (sessionId && containerRef.current) {
+      actions.claim(sessionId, containerRef.current, tokenRef.current as symbol);
+    }
     return () => {
       if (sessionId) actions.release(sessionId, tokenRef.current as symbol);
     };
