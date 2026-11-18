@@ -208,6 +208,13 @@ off.** The local command records a reason and an operator label. The host
 decides whether it can send a bundle. Storage requires a usable private
 directory outside the checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
 
+In Settings ▸ Account on the web and phone, the switch appears when the server
+offers log storage. A device with a registered identity can sign a change.
+The apps attach available approval records. SPAWN D sends the choice to machines
+while connected or when they reconnect. Each machine decides whether the signer
+is approved. If it declines a collection because it did not take the setting,
+the list says so.
+
 On a ready server, an owner's app can read the stored choice, the signing
 device and time, and each host's last declared capability and last seen time.
 The server reports when sharing is off because the signer was removed.

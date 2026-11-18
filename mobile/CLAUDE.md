@@ -184,6 +184,15 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   until measured background retirement; releasing that source must not resume the
   old upload. A slow OS transition cannot accidentally complete the test upload.
 
+## Account settings
+
+Diagnostic logs appear before account deletion when the support log route answers.
+Opening Account, returning to it, or receiving a `support-log` data event there
+refreshes the setting and collection history. A device with a registered identity can sign a change.
+The app attaches available approvals and reads the setting before signing and after saving.
+Each machine decides whether the signing device is approved. If it declines a log
+request because it did not take the setting, the collection list says so.
+
 ## Before calling a change done
 
 ```bash

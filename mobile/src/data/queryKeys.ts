@@ -26,6 +26,7 @@ export const qk = {
 
   agents: () => ["agents"] as const,
   skills: () => ["skills"] as const,
+  supportLog: () => ["support-log"] as const,
   profile: () => ["profile"] as const,
 
   adminMail: () => ["admin", "mail"] as const,

@@ -35,6 +35,7 @@ const RESOURCE_KEYS: Record<string, (id: string | null) => string[][]> = {
   sessions: (id) => (id ? [["sessions"], ["session", id]] : [["sessions"], ["session"]]),
   hosts: () => [["hosts"], ["host"], ["host-agents"]],
   agents: () => [["agents"], ["skills"]],
+  "support-log": () => [["support-log"]],
   profile: () => [["me"]],
 };
 

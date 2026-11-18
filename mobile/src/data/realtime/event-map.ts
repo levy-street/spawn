@@ -54,6 +54,8 @@ function dataEffects(event: DataEvent): CacheEffect[] {
         { kind: "invalidate", key: qk.agents() },
         { kind: "invalidate", key: qk.skills() },
       ];
+    case "support-log":
+      return [{ kind: "invalidate", key: qk.supportLog() }];
     case "profile":
       return [
         { kind: "invalidate", key: qk.profile() },
