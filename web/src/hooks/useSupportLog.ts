@@ -1,27 +1,16 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { confirm } from "@/components/ui/confirm";
-import { ApiError } from "@/lib/api";
-import {
-  putSupportLog,
-  readSupportLog,
-  type SupportLogState,
-  supportLogRefusal,
-} from "@/lib/support-log";
-import { checkedConsentTime } from "@/lib/support-log-consent";
+import { putSupportLog, readSupportLog, supportLogRefusal } from "@/lib/support-log";
 import copy from "@/lib/support-log-copy.json";
 import { supportLogDevice } from "@/lib/support-log-device";
 
 export function useSupportLog(accountId: string) {
   const client = useQueryClient();
   const key = ["support-log", accountId];
-  const {
-    data: state,
-    dataUpdatedAt,
-    refetch,
-  } = useQuery({
+  const { data: state, refetch } = useQuery({
     queryKey: key,
-    queryFn: () => readSupportLog().catch(() => null),
+    queryFn: ({ signal }) => readSupportLog(signal).catch(() => null),
     retry: false,
     gcTime: 0,
     networkMode: "always",
@@ -29,38 +18,30 @@ export function useSupportLog(accountId: string) {
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
-  const [approved, setApproved] = useState<boolean | "unavailable" | null>(null);
+  const [approved, setApproved] = useState<boolean | null>(null);
+  const [message, setMessage] = useState("");
+  const available = !!state;
+  const panel = useRef<AbortController | null>(null);
   useEffect(() => {
-    let current = true;
-    setApproved(null);
-    if (state && dataUpdatedAt) {
-      void supportLogDevice(
-        client,
-        accountId,
-        state.hosts.map((host) => host.id),
-      )
-        .then((signer) => {
-          if (current) setApproved(!!signer);
-        })
-        .catch(() => {
-          if (current) setApproved("unavailable");
-        });
-    }
+    if (!available) return;
+    const controller = new AbortController();
+    panel.current = controller;
+    const { signal } = controller;
+    void supportLogDevice(client, accountId, signal, false)
+      .then((signer) => {
+        if (!signal.aborted) setApproved(signer !== null);
+      })
+      .catch(() => {
+        if (!signal.aborted) setApproved(false);
+      });
     return () => {
-      current = false;
+      controller.abort();
+      panel.current = null;
     };
-  }, [client, accountId, state, dataUpdatedAt]);
+  }, [client, accountId, available]);
 
   const mutationKey = ["support-log-consent", accountId];
   const busy = useIsMutating({ mutationKey }) > 0;
-  const [message, setMessage] = useState("");
-  const mounted = useRef(false);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
   useEffect(() => {
     const focus = () => {
       if (!document.hidden) void refetch({ cancelRefetch: false });
@@ -73,7 +54,8 @@ export function useSupportLog(accountId: string) {
     retry: false,
     networkMode: "always",
     mutationFn: async (enabled: boolean) => {
-      if (!state) return;
+      const signal = panel.current?.signal;
+      if (!signal || signal.aborted) return;
       if (
         enabled &&
         !(await confirm({
@@ -84,39 +66,29 @@ export function useSupportLog(accountId: string) {
         }))
       )
         return;
-      if (!mounted.current || !client.getQueryData(key)) return;
-      const stamp = checkedConsentTime(state.next_issued_at_ms);
-      const sign = await supportLogDevice(
-        client,
-        accountId,
-        state.hosts.map((host) => host.id),
-      );
-      if (!mounted.current) return;
-      if (!sign) {
-        setMessage("");
-        setApproved(false);
-        return;
-      }
-      const statement = await sign(enabled, stamp);
-      if (!mounted.current) return;
-      let updated: SupportLogState | null;
+      if (signal.aborted) return;
       try {
-        updated = await putSupportLog(statement);
-        if (mounted.current) setMessage(copy.sent);
-      } catch (error) {
-        if (!mounted.current) return;
-        setMessage(supportLogRefusal(error));
-        if (!(error instanceof ApiError && error.status === 409)) return;
-        // Keep the displayed choice and the stale message if the one reread fails.
-        updated = await readSupportLog().catch(() => null);
+        const sign = await supportLogDevice(client, accountId, signal, true).catch(() => null);
+        if (signal.aborted) return;
+        if (!sign) {
+          setMessage("");
+          setApproved(false);
+          return;
+        }
+        const fresh = await readSupportLog(signal);
+        if (signal.aborted) return;
+        const statement = await sign(enabled, fresh);
+        if (signal.aborted) return;
+        try {
+          await putSupportLog(statement, signal);
+          if (!signal.aborted) setMessage(copy.sent);
+        } catch (error) {
+          if (!signal.aborted) setMessage(supportLogRefusal(error));
+        }
+        if (!signal.aborted) await refetch();
+      } catch {
+        if (!signal.aborted) setMessage(copy.failure);
       }
-      if (updated && client.getQueryState(key)) {
-        await client.cancelQueries({ queryKey: key, exact: true });
-        client.setQueryData(key, updated);
-      }
-    },
-    onError: () => {
-      if (mounted.current) setMessage(copy.failure);
     },
   });
   function change(enabled: boolean) {
@@ -136,6 +108,6 @@ export function useSupportLog(accountId: string) {
     approved,
     change,
     busy,
-    message: message || (approved === "unavailable" ? copy.failure : ""),
+    message,
   };
 }

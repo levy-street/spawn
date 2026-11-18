@@ -1,7 +1,8 @@
 import { z } from "zod";
-import { API_URL, ApiError, api } from "@/lib/api";
+import { API_URL, ApiError } from "@/lib/api";
 import type { SignedSupportLogConsent } from "@/lib/support-log-consent";
 import copy from "@/lib/support-log-copy.json";
+import { CLIENT_INSTANCE_ID } from "./client-instance";
 
 const date = z.iso.datetime({ offset: true });
 const nullableDate = date.nullable();
@@ -55,22 +56,31 @@ const accountState = z.object({
 });
 export type SupportLogState = z.infer<typeof accountState>;
 
-export async function readSupportLog(): Promise<SupportLogState> {
+export async function readSupportLog(signal: AbortSignal): Promise<SupportLogState> {
+  // Let a panel closed in the same turn cancel discovery before any network I/O.
+  await Promise.resolve();
+  signal.throwIfAborted();
   const response = await fetch(`${API_URL}/api/support-log`, {
     credentials: "include",
     cache: "no-store",
+    signal,
   });
   if (response.status !== 200) throw new Error("Support log unavailable");
   return accountState.parse(await response.json());
 }
 
-export async function putSupportLog(statement: SignedSupportLogConsent): Promise<SupportLogState> {
-  return accountState.parse(
-    await api("/api/support-log/consent", {
-      method: "PUT",
-      body: JSON.stringify(statement),
-    }),
-  );
+export async function putSupportLog(statement: SignedSupportLogConsent, signal: AbortSignal) {
+  const response = await fetch(`${API_URL}/api/support-log/consent`, {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", "X-Spawn-Client": CLIENT_INSTANCE_ID },
+    body: JSON.stringify(statement),
+    signal,
+  });
+  if (!response.ok) {
+    const detail = response.status === 429 ? (await response.json()).detail : undefined;
+    throw new ApiError(response.status, "support_log", "Could not save consent", detail);
+  }
 }
 
 export function supportLogRefusal(error: unknown): string {

@@ -1,19 +1,13 @@
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { expect, type Page, test, type WebSocketRoute } from "@playwright/test";
 import copy from "../../../proto/support-log-copy.json" with { type: "json" };
+import { encodeAcctEndorsementTranscript } from "../../src/lib/acct-endorsement-transcript";
 import type { SupportLogState } from "../../src/lib/support-log";
 import {
   encodeSupportLogConsent,
   type SignedSupportLogConsent,
 } from "../../src/lib/support-log-consent";
-import {
-  type AppMockOptions,
-  BROWSER_DEVICE_ID,
-  CREATED_AT,
-  HOST_ID,
-  mockApp,
-  USER_ID,
-} from "./app-mocks";
+import { BROWSER_DEVICE_ID, CREATED_AT, HOST_ID, mockApp, USER_ID } from "./app-mocks";
 
 const now = Date.parse(CREATED_AT);
 function state(sharing: SupportLogState["sharing"] = "off"): SupportLogState {
@@ -35,8 +29,30 @@ function state(sharing: SupportLogState["sharing"] = "off"): SupportLogState {
   };
 }
 const switchFor = (page: Page) => page.getByRole("switch", { name: copy.switchLabel });
-async function setup(page: Page, approved = true, options: AppMockOptions = {}) {
-  await mockApp(page, { hostPins: { [HOST_ID]: approved ? [BROWSER_DEVICE_ID] : [] }, ...options });
+function peer() {
+  const pair = generateKeyPairSync("ed25519");
+  return {
+    id: randomUUID(),
+    key: pair.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url"),
+    privateKey: pair.privateKey,
+  };
+}
+function approval(from: ReturnType<typeof peer>, to: { id: string; key: string }) {
+  return {
+    endorser_device_id: from.id,
+    endorser_public_key: from.key,
+    endorsed_device_id: to.id,
+    endorsed_public_key: to.key,
+    signature: sign(
+      null,
+      encodeAcctEndorsementTranscript(USER_ID, from.key, to.key, to.id),
+      from.privateKey,
+    ).toString("base64url"),
+    created_at: CREATED_AT,
+  };
+}
+async function setup(page: Page, approved = true, links = 1) {
+  await mockApp(page, { hosts: [] });
   await page.clock.install({ time: now });
   const sockets: WebSocketRoute[] = [];
   await page.routeWebSocket(/\/ws\/alerts/, (ws) => {
@@ -44,9 +60,63 @@ async function setup(page: Page, approved = true, options: AppMockOptions = {}) 
   });
   const register = page.waitForResponse((r) => r.url().endsWith("/api/browser-devices/register"));
   await page.goto("/hosts");
-  await register;
-  return sockets;
+  const self = { id: BROWSER_DEVICE_ID, key: (await (await register).json()).public_key as string };
+  const peers = Array.from({ length: links }, peer);
+  const root = peers[0]!;
+  const path = peers.map((from, i) => approval(from, peers[i + 1] ?? self));
+  const edges = [
+    ...Array<ReturnType<typeof approval>>(65).fill(approval(peer(), self)),
+    ...[...path].reverse(),
+  ];
+  let approvalReads = 0;
+  await page.route("**/api/trust/account-endorsements", (r) => {
+    approvalReads++;
+    return r.fulfill({ json: edges });
+  });
+  if (approved) {
+    await page.evaluate(
+      ({ accountId, rootPublicKey }) =>
+        new Promise<void>((resolve, reject) => {
+          const open = indexedDB.open("spawn-root-knowledge", 1);
+          open.onupgradeneeded = () =>
+            open.result.createObjectStore("root-keys", { keyPath: "recordId" });
+          open.onerror = () => reject(open.error);
+          open.onsuccess = () => {
+            const db = open.result;
+            const tx = db.transaction("root-keys", "readwrite");
+            tx.objectStore("root-keys").put({
+              recordId: JSON.stringify([accountId, location.origin]),
+              accountId,
+              origin: location.origin,
+              rootPublicKey,
+              source: "bundle",
+              version: 1,
+              learnedAtMs: Date.now(),
+            });
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.onerror = () => reject(tx.error);
+          };
+        }),
+      { accountId: USER_ID, rootPublicKey: root.key },
+    );
+  }
+  return { sockets, edges, path, approvalReads: () => approvalReads };
 }
+async function consentSigns(page: Page) {
+  return page.evaluateHandle(() => {
+    const calls = { consent: 0 };
+    const sign = crypto.subtle.sign.bind(crypto.subtle);
+    crypto.subtle.sign = (algorithm, key, data) => {
+      if (data.byteLength === 102) calls.consent++;
+      return sign(algorithm, key, data);
+    };
+    return calls;
+  });
+}
+
 async function openAccount(page: Page) {
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await expect(page.getByRole("heading", { name: "Account", exact: true })).toBeVisible();
@@ -92,7 +162,7 @@ for (const failure of ["404", "network", "bad shape", "201"]) {
 test("only visible Account reads on show, window focus and another client's event", async ({
   page,
 }) => {
-  const sockets = await setup(page);
+  const { sockets } = await setup(page);
   let reads = 0;
   await page.route("**/api/support-log", (r) => {
     reads++;
@@ -262,35 +332,19 @@ test("one confirmed on, immediate off, and the server's returned history", async
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const approvers = Array.from({ length: 66 }, () => ({
-    id: randomUUID(),
-    public_key: generateKeyPairSync("ed25519")
-      .publicKey.export({ format: "der", type: "spki" })
-      .subarray(-32)
-      .toString("base64url"),
-    key_algorithm: "ed25519",
-    revoked_at: null,
-    created_at: CREATED_AT,
-  }));
-  await setup(page, false, {
-    extraBrowserDevices: approvers,
-    hostPins: { [HOST_ID]: approvers.slice(1).map((d) => d.id) },
-    accountEndorsements: approvers.map((d) => ({
-      endorser_device_id: d.id,
-      endorsed_device_id: BROWSER_DEVICE_ID,
-    })),
-  });
+  const { path, approvalReads } = await setup(page, true, 8);
+  let current = state();
   await page.route("**/api/support-log", (r) =>
-    r.fulfill({ json: { ...state(), account_id: randomUUID() } }),
+    r.fulfill({ json: { ...current, account_id: randomUUID() } }),
   );
   await page.route("**/api/support-log/consent", async (r) => {
     expect(r.request().method()).toBe("PUT");
     const body = r.request().postDataJSON() as SignedSupportLogConsent;
     sent.push(body);
     await gate;
-    const next = state(body.enabled ? "on" : "off_signer_removed");
-    next.next_issued_at_ms = now + 18;
-    await r.fulfill({ json: next });
+    current = state(body.enabled ? "on" : "off_signer_removed");
+    current.next_issued_at_ms = now + 18;
+    await r.fulfill({ json: {} });
   });
   await openAccount(page);
   await expect(page.getByText(copy.empty)).toBeVisible();
@@ -300,6 +354,7 @@ test("one confirmed on, immediate off, and the server's returned history", async
   await expect(dialog).toContainText(copy.description);
   await dialog.getByRole("button", { name: copy.cancel }).click();
   expect(sent).toHaveLength(0);
+  expect(approvalReads()).toBe(0);
   await toggle.click();
   await dialog.getByRole("button", { name: copy.turnOn }).click();
   await expect.poll(() => sent.length).toBe(1);
@@ -323,13 +378,15 @@ test("one confirmed on, immediate off, and the server's returned history", async
       account_id: USER_ID,
       signer_device_id: BROWSER_DEVICE_ID,
       issued_at_ms: now + 17 + i,
-      carried_endorsements: approvers.slice(1, 65).map((d) => ({
-        account_id: USER_ID,
-        endorser_public_key: d.public_key,
-        endorsed_device_id: BROWSER_DEVICE_ID,
-        endorsed_public_key: statement.signer_public_key,
-        signature: "A".repeat(86),
-      })),
+      carried_endorsements: path.map(
+        ({ endorser_public_key, endorsed_public_key, endorsed_device_id, signature }) => ({
+          account_id: USER_ID,
+          endorser_public_key,
+          endorsed_public_key,
+          endorsed_device_id,
+          signature,
+        }),
+      ),
     });
     const key = await crypto.subtle.importKey(
       "raw",
@@ -355,7 +412,7 @@ for (const [status, message] of [
   [429, copy.wait.replace("{seconds}", "19")],
   [500, copy.failure],
 ] as const) {
-  test(`a ${status} leaves the switch alone and only stale reads again`, async ({ page }) => {
+  test(`a ${status} leaves the switch alone and reads the latest state`, async ({ page }) => {
     await setup(page);
     let reads = 0,
       puts = 0;
@@ -372,12 +429,14 @@ for (const [status, message] of [
     await expect(page.getByText(message)).toBeVisible();
     await expect(switchFor(page)).toBeEnabled();
     await expect(switchFor(page)).toBeChecked();
-    expect(reads).toBe(status === 409 ? 2 : 1);
+    expect(reads).toBe(3);
     expect(puts).toBe(1);
   });
 }
 
 for (const stamp of [
+  now,
+  now - 1,
   now - 86_400_001,
   now + 90_000_000,
   Number.MAX_SAFE_INTEGER + 1,
@@ -395,18 +454,185 @@ for (const stamp of [
     });
     await openAccount(page);
     await expect(switchFor(page)).toBeEnabled();
-    const signs = await page.evaluateHandle(() => {
-      const calls = { consent: 0 };
-      const sign = crypto.subtle.sign.bind(crypto.subtle);
-      crypto.subtle.sign = (algorithm, key, data) => {
-        if (data.byteLength === 102) calls.consent++;
-        return sign(algorithm, key, data);
-      };
-      return calls;
-    });
+    const signs = await consentSigns(page);
     await switchFor(page).click();
     await expect(page.getByText(copy.failure)).toBeVisible();
     expect(puts).toBe(0);
     expect(await signs.jsonValue()).toEqual({ consent: 0 });
   });
 }
+
+for (const why of ["invalid signature", "broken path", "nine links"]) {
+  test(`${why} disables the switch and sends nothing`, async ({ page }) => {
+    const { edges, path } = await setup(page, true, why === "nine links" ? 9 : 2);
+    if (why === "broken path") edges.splice(edges.indexOf(path[0]!), 1);
+    if (why === "invalid signature") path[0]!.signature = "A".repeat(86);
+    const signs = await consentSigns(page);
+    let puts = 0;
+    await page.route("**/api/support-log", (r) => r.fulfill({ json: state("on") }));
+    await page.route("**/api/support-log/consent", (r) => {
+      puts++;
+      return r.abort();
+    });
+    await openAccount(page);
+    await switchFor(page).click();
+    await expect(page.getByText(copy.cannotSign)).toBeVisible();
+    await expect(switchFor(page)).toBeDisabled();
+    expect(await signs.jsonValue()).toEqual({ consent: 0 });
+    expect(puts).toBe(0);
+  });
+}
+
+test("confirmation uses a fresh time and reopening cannot replay it", async ({ page }) => {
+  await setup(page);
+  let reads = 0;
+  let stamp = now + 1;
+  const sent: SignedSupportLogConsent[] = [];
+  const signs = await consentSigns(page);
+  await page.route("**/api/support-log", (r) => {
+    reads++;
+    return r.fulfill({ json: { ...state(), next_issued_at_ms: stamp } });
+  });
+  await page.route("**/api/support-log/consent", (r) => {
+    sent.push(r.request().postDataJSON());
+    return r.fulfill({ status: 204 });
+  });
+  await openAccount(page);
+  await switchFor(page).click();
+  const dialog = page.getByRole("dialog", { name: copy.confirmTitle });
+  await expect(dialog).toBeVisible();
+  stamp++;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => reads).toBe(2);
+  stamp++;
+  await dialog.getByRole("button", { name: copy.turnOn }).click();
+  await expect(page.getByText(copy.sent)).toBeVisible();
+  expect(sent[0]?.issued_at_ms).toBe(stamp);
+  await page.getByRole("button", { name: "Appearance", exact: true }).click();
+  await page.getByRole("button", { name: "Account", exact: true }).click();
+  await switchFor(page).click();
+  await dialog.getByRole("button", { name: copy.turnOn }).click();
+  await expect(page.getByText(copy.failure)).toBeVisible();
+  expect(await signs.jsonValue()).toEqual({ consent: 1 });
+  expect(sent).toHaveLength(1);
+});
+
+for (const status of [200, 409]) {
+  test(`a late ${status} leaves another device's withdrawal on screen`, async ({ page }) => {
+    const { approvalReads } = await setup(page);
+    let current = state();
+    let reads = 0,
+      puts = 0;
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    await page.route("**/api/support-log", (r) => {
+      reads++;
+      return r.fulfill({ json: current });
+    });
+    await page.route("**/api/support-log/consent", async (r) => {
+      puts++;
+      await pending;
+      await r.fulfill({ status, json: state("on") });
+    });
+    await openAccount(page);
+    await expect(switchFor(page)).toBeEnabled();
+    expect(reads).toBe(1);
+    expect(approvalReads()).toBe(0);
+    await switchFor(page).click();
+    await page
+      .getByRole("dialog", { name: copy.confirmTitle })
+      .getByRole("button", { name: copy.turnOn })
+      .click();
+    await expect.poll(() => puts).toBe(1);
+    current = state("off_signer_removed");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(page.getByText(copy.offSignerRemoved)).toBeVisible();
+    finish();
+    await expect(page.getByText(status === 409 ? copy.stale : copy.sent)).toBeVisible();
+    await expect(switchFor(page)).toBeEnabled();
+    await expect(switchFor(page)).not.toBeChecked();
+    expect(reads).toBe(4);
+    expect(approvalReads()).toBe(1);
+  });
+}
+
+test("a throwing log row leaves account deletion usable", async ({ page }) => {
+  await setup(page, false);
+  const data = state();
+  const rowTime = new Date(now + 27).toISOString();
+  data.collections = [
+    {
+      id: randomUUID(),
+      host_id: null,
+      host_name: "",
+      reason: "",
+      requested_at: rowTime,
+      completed_at: null,
+      size_bytes: null,
+      expires_at: null,
+      deleted_at: null,
+      state: "requested",
+    },
+  ];
+  await page.route("**/api/support-log", (r) => r.fulfill({ json: data }));
+  await page.evaluate((stamp) => {
+    const format = Date.prototype.toLocaleString;
+    Date.prototype.toLocaleString = function (...args: Parameters<typeof format>) {
+      if (this.getTime() === stamp) throw new Error("Broken log row");
+      return format.apply(this, args);
+    };
+  }, Date.parse(rowTime));
+  const thrown = page.waitForEvent("console", {
+    predicate: (m) => m.text().includes("Broken log row"),
+  });
+  await openAccount(page);
+  await thrown;
+  await expect(page.getByRole("region", { name: copy.title })).toHaveCount(0);
+  await page.getByRole("button", { name: "Delete account…" }).click();
+  await expect(page.getByTestId("delete-account-form")).toBeVisible();
+});
+
+test("closing Account aborts its pending read before signing", async ({ page }) => {
+  await setup(page);
+  let reads = 0,
+    puts = 0;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/support-log", async (r) => {
+    if (++reads === 2) await pending;
+    await r.fulfill({ json: state() });
+  });
+  await page.route("**/api/support-log/consent", (r) => {
+    puts++;
+    return r.abort();
+  });
+  const requestSignals = await page.evaluateHandle(() => {
+    const signals: AbortSignal[] = [];
+    window.fetch = new Proxy(window.fetch, {
+      apply(request, receiver, args: [RequestInfo | URL, RequestInit?]) {
+        const [url, init] = args;
+        if (url === "/api/support-log" && init?.signal) signals.push(init.signal);
+        return Reflect.apply(request, receiver, args);
+      },
+    });
+    return signals;
+  });
+  const signs = await consentSigns(page);
+  await openAccount(page);
+  await switchFor(page).click();
+  await page
+    .getByRole("dialog", { name: copy.confirmTitle })
+    .getByRole("button", { name: copy.turnOn })
+    .click();
+  await expect.poll(() => reads).toBe(2);
+  await page.getByRole("button", { name: "Appearance", exact: true }).click();
+  await expect.poll(() => requestSignals.evaluate((signals) => signals.at(-1)?.aborted)).toBe(true);
+  release();
+  expect(await signs.jsonValue()).toEqual({ consent: 0 });
+  expect(puts).toBe(0);
+  expect(reads).toBe(2);
+});

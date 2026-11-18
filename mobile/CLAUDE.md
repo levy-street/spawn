@@ -188,7 +188,8 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
 
 Diagnostic logs appear before account deletion when the support log route answers.
 Opening Account, returning to it, or receiving a `support-log` data event there
-refreshes the setting and collection history. A saved change supplies both in its response.
+refreshes the setting and collection history. Changing the setting checks approvals
+on demand and reads the setting again before signing and after saving.
 
 ## Before calling a change done
 

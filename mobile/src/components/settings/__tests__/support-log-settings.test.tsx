@@ -2,20 +2,25 @@ import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { NavigationContext } from "@react-navigation/native";
 import { act, fireEvent, waitFor, within } from "@testing-library/react-native";
 import type { ContextType } from "react";
-import { AppState, View } from "react-native";
+import { AppState, Platform, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { confirm } from "@/components/ui/confirm";
 import { authToken } from "@/data/api/auth-token";
 import type { SupportLogState } from "@/data/api/endpoints/support-log";
+import * as supportApi from "@/data/api/endpoints/support-log";
+import type { AccountEndorsementRecord } from "@/data/api/schemas/trust";
 import { qk } from "@/data/queryKeys";
 import { effectsForFrame } from "@/data/realtime/event-map";
 import { decodeHex, encodeBase64Url } from "@/lib/crypto/bytes";
+import * as ed25519 from "@/lib/crypto/ed25519";
+import { deriveEd25519PublicKey } from "@/lib/crypto/ed25519";
 import {
   clearDeviceIdentityAccount,
   deviceIdentity,
   setDeviceIdentityAccount,
 } from "@/lib/crypto/identity";
 import type { SignedSupportLogConsent } from "@/lib/crypto/support-log-consent";
+import { signAccountEndorsementV1 } from "@/lib/crypto/transcripts";
 import { secureStorage } from "@/lib/secure-storage";
 import vectors from "../../../../../proto/support-log-consent-v1-vectors.json";
 import { createTestQueryClient, renderWithProviders } from "../../../../tests/render";
@@ -27,19 +32,12 @@ const mockAccount = randomUUID();
 const device = randomUUID();
 const host = randomUUID();
 const now = vectors.positive[0]?.consent.issued_at_ms ?? 0;
-const stamp = now + 27;
+let stamp = now + 27;
 const iso = new Date(now).toISOString();
 const key = vectors.positive[0]?.consent.signer_public_key ?? "";
 const seed = vectors.positive[0]?.signing_seed_hex ?? "";
 
 jest.mock("@/data/api/config", () => ({ getBaseUrl: async () => "" }));
-jest.mock("@/data/api/auth-token", () => ({
-  authToken: {
-    snapshot: async () => ({ token: null }),
-    captureFromResponse: async () => null,
-    clearIfCurrent: jest.fn(async () => true),
-  },
-}));
 jest.mock("@/components/ui/confirm", () => ({
   ...jest.requireActual("@/components/ui/confirm"),
   confirm: jest.fn(async () => true),
@@ -70,7 +68,43 @@ function state(sharing: SupportLogState["sharing"] = "off"): SupportLogState {
 }
 
 function response(status: number, body: unknown) {
-  return { status, ok: status >= 200 && status < 300, json: async () => body } as Response;
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers(),
+    json: async () => body,
+  } as Response;
+}
+
+const self = { id: device, publicKey: key, seed: decodeHex(seed) };
+function peer() {
+  const secret = new Uint8Array(
+    generateKeyPairSync("ed25519")
+      .privateKey.export({ format: "der", type: "pkcs8" })
+      .subarray(-32),
+  );
+  return {
+    id: randomUUID(),
+    publicKey: encodeBase64Url(deriveEd25519PublicKey(secret)),
+    seed: secret,
+  };
+}
+
+function approval(from: typeof self, to: typeof self): AccountEndorsementRecord {
+  const transcript = {
+    accountId: mockAccount,
+    endorserPublicKey: from.publicKey,
+    endorsedPublicKey: to.publicKey,
+    endorsedDeviceId: to.id,
+  };
+  return {
+    endorser_device_id: from.id,
+    endorsed_device_id: to.id,
+    endorser_public_key: from.publicKey,
+    endorsed_public_key: to.publicKey,
+    signature: encodeBase64Url(signAccountEndorsementV1(from.seed, transcript)),
+    created_at: iso,
+  };
 }
 
 function fixture(initial = state()) {
@@ -84,22 +118,15 @@ function fixture(initial = state()) {
   };
   const client = createTestQueryClient();
   client.setQueryData(qk.browserDeviceRegistration(mockAccount), local);
+  client.setQueryData(qk.me(), { user: { id: mockAccount } });
+  const approver = peer();
   const wire = {
     get: jest.fn<Promise<Response>, []>(async () => response(200, initial)),
     put: jest.fn<Promise<Response>, [SignedSupportLogConsent]>(async () =>
       response(200, state("on")),
     ),
-    devices: [local],
-    rosterStatus: 200,
-    edges: [] as {
-      endorser_device_id: string;
-      endorsed_device_id: string;
-      endorser_public_key: string;
-      endorsed_public_key: string;
-      signature: string;
-      created_at: string;
-    }[],
-    pins: [device] as string[],
+    approvalStatus: 200,
+    edges: [approval(self, approver), approval(approver, self)],
   };
   const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
     switch (path) {
@@ -108,12 +135,8 @@ function fixture(initial = state()) {
       case "/api/support-log/consent":
         expect(init?.method).toBe("PUT");
         return wire.put(JSON.parse(String(init?.body)));
-      case "/api/browser-devices":
-        return response(wire.rosterStatus, wire.devices);
       case "/api/trust/account-endorsements":
-        return response(200, wire.edges);
-      case `/api/trust/hosts/${host}/pins`:
-        return response(200, wire.pins);
+        return response(wire.approvalStatus, wire.edges);
       default:
         throw new Error("Unexpected request");
     }
@@ -123,11 +146,22 @@ function fixture(initial = state()) {
   return { wire, fetch, show, client };
 }
 
-beforeEach(() => {
+const storage = new Map<string, string>();
+beforeEach(async () => {
+  stamp += 10;
+  storage.clear();
   jest.useFakeTimers({ now });
   jest.clearAllMocks();
   setDeviceIdentityAccount(mockAccount);
-  jest.spyOn(secureStorage, "get").mockResolvedValue(
+  jest.spyOn(secureStorage, "get").mockImplementation(async (k) => storage.get(k) ?? null);
+  jest.spyOn(secureStorage, "set").mockImplementation(async (k, v) => {
+    storage.set(k, v);
+  });
+  jest.spyOn(secureStorage, "delete").mockImplementation(async (k) => {
+    storage.delete(k);
+  });
+  storage.set(
+    `spawn.identity.ed25519.v1.${mockAccount}`,
     JSON.stringify({
       version: 1,
       accountId: mockAccount,
@@ -135,6 +169,7 @@ beforeEach(() => {
       secretKey: encodeBase64Url(decodeHex(seed)),
     }),
   );
+  await authToken.set(randomUUID());
   AppState.currentState = "active";
 });
 afterEach(() => {
@@ -148,6 +183,19 @@ async function tick(ms = 1) {
   });
 }
 
+function accountPanel() {
+  return (
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 400, height: 800 },
+        insets: { top: 0, right: 0, left: 0, bottom: 0 },
+      }}
+    >
+      <AccountPanel />
+    </SafeAreaProvider>
+  );
+}
+
 for (const failure of ["404", "401", "bad shape", "network", "201"]) {
   test(`${failure} adds only the Account discovery read and preserves its structure`, async () => {
     const { wire, fetch, client } = fixture();
@@ -159,22 +207,12 @@ for (const failure of ["404", "401", "bad shape", "network", "201"]) {
           failure === "bad shape" ? { ...state(), collections: [{}] } : state(),
         ),
       );
-    const account = (
-      <SafeAreaProvider
-        initialMetrics={{
-          frame: { x: 0, y: 0, width: 400, height: 800 },
-          insets: { top: 0, right: 0, left: 0, bottom: 0 },
-        }}
-      >
-        <AccountPanel />
-      </SafeAreaProvider>
-    );
     const screen = await renderWithProviders(<View />, { queryClient: client });
     expect(fetch).not.toHaveBeenCalled();
-    await screen.rerender(account);
+    await screen.rerender(accountPanel());
     await tick(180_000);
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(authToken.clearIfCurrent).not.toHaveBeenCalled();
+
     const panel = within(screen.getByTestId("account-panel"));
     expect(panel.queryByText(copy.title)).toBeNull();
     expect(
@@ -185,16 +223,6 @@ for (const failure of ["404", "401", "bad shape", "network", "201"]) {
     expect(panel.queryByRole("switch")).toBeNull();
   });
 }
-
-test("a refused approval lookup cannot clear the phone session", async () => {
-  const { wire, show } = fixture();
-  wire.rosterStatus = 401;
-  const screen = await show();
-  await tick();
-  expect(screen.getByRole("switch")).toBeDisabled();
-  expect(wire.put).not.toHaveBeenCalled();
-  expect(authToken.clearIfCurrent).not.toHaveBeenCalled();
-});
 
 test("shows removed signer, host update and all collection outcomes in response order", async () => {
   const data = state("off_signer_removed");
@@ -269,28 +297,15 @@ test("shows removed signer, host update and all collection outcomes in response 
 });
 
 test("one confirmed on and immediate off use the server's state and signing time", async () => {
-  const { wire, show } = fixture();
-  const approvers = Array.from({ length: 66 }, () => ({
-    id: randomUUID(),
-    public_key: generateKeyPairSync("ed25519")
-      .publicKey.export({ format: "der", type: "spki" })
-      .subarray(-32)
-      .toString("base64url"),
-    key_algorithm: "ed25519",
-    revoked_at: null,
-    created_at: iso,
-    label: null,
-  }));
-  wire.devices.push(...approvers);
-  wire.pins = approvers.slice(1).map((d) => d.id);
-  wire.edges = approvers.map((d) => ({
-    endorser_device_id: d.id,
-    endorsed_device_id: device,
-    endorser_public_key: d.public_key,
-    endorsed_public_key: key,
-    signature: "A".repeat(86),
-    created_at: iso,
-  }));
+  const { wire, show, fetch } = fixture();
+  const approver = peer();
+  const middle = peer();
+  const path = [approval(approver, middle), approval(middle, self)];
+  wire.edges = [
+    approval(self, approver),
+    ...Array<AccountEndorsementRecord>(65).fill(approval(middle, approver)),
+    ...[...path].reverse(),
+  ];
   wire.get.mockResolvedValue(response(200, { ...state(), account_id: randomUUID() }));
   let finish!: (reply: Response) => void;
   wire.put.mockImplementationOnce(
@@ -302,6 +317,7 @@ test("one confirmed on and immediate off use the server's state and signing time
   const screen = await show();
   const toggle = () => screen.getByRole("switch", { name: copy.switchLabel });
   await waitFor(() => expect(toggle()).toBeEnabled());
+  expect(fetch).toHaveBeenCalledTimes(1);
   expect(screen.getByText(copy.empty)).toBeOnTheScreen();
   jest.mocked(confirm).mockResolvedValueOnce(false);
   await fireEvent.press(toggle());
@@ -325,25 +341,38 @@ test("one confirmed on and immediate off use the server's state and signing time
     signer_device_id: device,
     signer_public_key: key,
     issued_at_ms: stamp,
-    carried_endorsements: approvers.slice(1, 65).map((d) => ({
-      account_id: mockAccount,
-      endorser_public_key: d.public_key,
-      endorsed_public_key: key,
-      endorsed_device_id: device,
-      signature: "A".repeat(86),
-    })),
+    carried_endorsements: path.map(
+      ({ endorser_public_key, endorsed_public_key, endorsed_device_id, signature }) => ({
+        account_id: mockAccount,
+        endorser_public_key,
+        endorsed_public_key,
+        endorsed_device_id,
+        signature,
+      }),
+    ),
   });
-  finish(response(200, { ...state("on"), next_issued_at_ms: stamp + 1 }));
+  wire.get.mockResolvedValue(response(200, { ...state("on"), next_issued_at_ms: stamp + 1 }));
+  finish(response(200, state())); // A delayed PUT body must not replace the GET.
   await waitFor(() => expect(toggle()).toBeChecked());
   expect(screen.getByText(copy.sent)).toBeOnTheScreen();
-  wire.put.mockResolvedValueOnce(response(200, state("off_signer_removed")));
+  expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+    "/api/support-log",
+    "/api/trust/account-endorsements",
+    "/api/support-log",
+    "/api/support-log/consent",
+    "/api/support-log",
+  ]);
+  wire.put.mockImplementationOnce(async () => {
+    wire.get.mockResolvedValue(response(200, state("off_signer_removed")));
+    return response(200, state("on"));
+  });
   await waitFor(() => expect(toggle()).toBeEnabled());
   await fireEvent.press(toggle());
   await waitFor(() => expect(screen.getByText(copy.offSignerRemoved)).toBeOnTheScreen());
   expect(confirm).toHaveBeenCalledTimes(2);
   expect(wire.put).toHaveBeenCalledTimes(2);
   expect(wire.put.mock.calls[1]?.[0]).toMatchObject({ enabled: false, issued_at_ms: stamp + 1 });
-  expect(wire.get).toHaveBeenCalledTimes(1);
+  expect(wire.get).toHaveBeenCalledTimes(5);
 });
 
 test.each([
@@ -360,11 +389,13 @@ test.each([
   await fireEvent.press(toggle());
   await waitFor(() => expect(screen.getByText(message)).toBeOnTheScreen());
   expect(toggle()).toBeChecked();
-  expect(wire.get).toHaveBeenCalledTimes(status === 409 ? 2 : 1);
+  expect(wire.get).toHaveBeenCalledTimes(3);
   expect(wire.put).toHaveBeenCalledTimes(1);
 });
 
 test.each([
+  now,
+  now - 1,
   now - 86_400_001,
   now + 90_000_000,
   Number.MAX_SAFE_INTEGER + 1,
@@ -380,23 +411,40 @@ test.each([
   expect(wire.put).not.toHaveBeenCalled();
 });
 
-test.each(["no key", "no approval"])("a phone with %s cannot sign", async (why) => {
-  const { wire, show } = fixture();
-  if (why === "no key") jest.mocked(secureStorage.get).mockResolvedValue(null);
-  else wire.pins = [];
-  const screen = await show();
-  await tick();
-  expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen();
-  expect(screen.getByRole("switch")).toBeDisabled();
-  await fireEvent.press(screen.getByRole("switch"));
-  expect(wire.put).not.toHaveBeenCalled();
-  expect(confirm).not.toHaveBeenCalled();
-});
+test.each(["no key", "invalid signature", "unverified peer", "broken path", "nine links"])(
+  "%s disables the switch and sends nothing",
+  async (why) => {
+    const { wire, show, fetch, client } = fixture();
+    const first = peer();
+    const anchors = [first, ...Array.from({ length: why === "nine links" ? 8 : 1 }, peer)];
+    wire.edges = [
+      approval(self, first),
+      ...anchors.map((from, i) => approval(from, anchors[i + 1] ?? self)),
+    ];
+    if (why === "no key") storage.delete(`spawn.identity.ed25519.v1.${mockAccount}`);
+    if (why === "invalid signature" && wire.edges[1]) wire.edges[1].signature = "A".repeat(86);
+    if (why === "unverified peer") wire.edges.shift();
+    if (why === "broken path") wire.edges.splice(1, 1);
+    client.setQueryData(qk.trustAccountEndorsements(), wire.edges);
+    const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
+    const screen = await show();
+    await waitFor(() => expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen());
+    expect(screen.getByRole("switch")).toBeDisabled();
+    await fireEvent.press(screen.getByRole("switch"));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sign).not.toHaveBeenCalled();
+    expect(wire.put).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+  },
+);
 
 test("focus, panel show and data events refresh while visible with no polling", async () => {
+  jest.replaceProperty(Platform, "OS", "android");
+  let windowFocus = () => {};
   let notify = () => {};
   jest.spyOn(AppState, "addEventListener").mockImplementation((_type, listener) => {
-    notify = () => listener(AppState.currentState);
+    if (_type === "focus") windowFocus = () => listener(AppState.currentState);
+    if (_type === "change") notify = () => listener(AppState.currentState);
     return { remove: jest.fn() };
   });
   let focused = true;
@@ -456,4 +504,128 @@ test("focus, panel show and data events refresh while visible with no polling", 
   });
   await tick();
   expect(wire.get).toHaveBeenCalledTimes(4);
+  await act(windowFocus);
+  await tick();
+  expect(wire.get).toHaveBeenCalledTimes(5);
+});
+
+test("a refresh during confirmation and a replay after reopening", async () => {
+  const { wire, show, client } = fixture();
+  client.setQueryData(qk.trustAccountEndorsements(), wire.edges);
+  let answer!: (yes: boolean) => void;
+  jest.mocked(confirm).mockReturnValueOnce(
+    new Promise((resolve) => {
+      answer = resolve;
+    }),
+  );
+  const crypto = jest.spyOn(ed25519, "signPureEd25519");
+  const signatures = () => crypto.mock.calls.filter(([, message]) => message.length === 102);
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  await fireEvent.press(screen.getByRole("switch"));
+  wire.get.mockResolvedValue(response(200, { ...state(), next_issued_at_ms: stamp + 1 }));
+  await act(() => client.invalidateQueries({ queryKey: qk.supportLog() }));
+  wire.get.mockResolvedValue(response(200, { ...state(), next_issued_at_ms: stamp + 2 }));
+  await act(() => answer(true));
+  await waitFor(() => expect(screen.getByText(copy.sent)).toBeOnTheScreen());
+  expect(wire.put.mock.calls[0]?.[0].issued_at_ms).toBe(stamp + 2);
+  expect(signatures()).toHaveLength(1);
+  await screen.unmount();
+  const reopened = await show();
+  await waitFor(() => expect(reopened.getByRole("switch")).toBeEnabled());
+  await fireEvent.press(reopened.getByRole("switch"));
+  await waitFor(() => expect(reopened.getByText(copy.failure)).toBeOnTheScreen());
+  expect(wire.put).toHaveBeenCalledTimes(1);
+  expect(signatures()).toHaveLength(1);
+});
+
+test.each([200, 409])("a late %i cannot overwrite another device's withdrawal", async (status) => {
+  const { wire, client, show, fetch } = fixture();
+  client.setQueryData(qk.trustAccountEndorsements(), wire.edges);
+  let finish!: (reply: Response) => void;
+  wire.put.mockReturnValueOnce(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await fireEvent.press(screen.getByRole("switch"));
+  await waitFor(() => expect(wire.put).toHaveBeenCalledTimes(1));
+  wire.get.mockResolvedValue(response(200, state("off_signer_removed")));
+  await act(() => client.invalidateQueries({ queryKey: qk.supportLog() }));
+  await waitFor(() => expect(screen.getByText(copy.offSignerRemoved)).toBeOnTheScreen());
+  await act(() => finish(response(status, state("on"))));
+  await waitFor(() =>
+    expect(screen.getByText(status === 409 ? copy.stale : copy.sent)).toBeOnTheScreen(),
+  );
+  expect(screen.getByRole("switch")).not.toBeChecked();
+  expect(wire.get).toHaveBeenCalledTimes(4);
+  expect(fetch).toHaveBeenCalledTimes(5);
+});
+
+test("closing Account ignores a late approval before signing", async () => {
+  const { fetch, show, wire } = fixture(state("on"));
+  const impl = fetch.getMockImplementation();
+  if (!impl) throw new Error("Missing test transport");
+  const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
+  let settle!: (r: Response) => void;
+  fetch.mockImplementation((input, init) => {
+    if (input !== "/api/trust/account-endorsements") return impl(input, init);
+    return new Promise((resolve) => {
+      settle = resolve;
+    });
+  });
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await fireEvent.press(screen.getByRole("switch"));
+  await waitFor(() => expect(settle).toBeDefined());
+  await screen.unmount();
+  await act(() => settle(response(200, wire.edges)));
+  expect(sign).not.toHaveBeenCalled();
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(wire.put).not.toHaveBeenCalled();
+});
+
+test("a throwing log row leaves the account deletion form usable", async () => {
+  const data = state();
+  data.collections = [
+    {
+      id: randomUUID(),
+      host_id: null,
+      host_name: "",
+      reason: "",
+      requested_at: iso,
+      completed_at: null,
+      size_bytes: null,
+      expires_at: null,
+      deleted_at: null,
+      state: "requested",
+    },
+  ];
+  const { client, wire } = fixture(data);
+  jest.spyOn(supportApi, "collectionLine").mockImplementation(() => {
+    throw new Error("Broken row");
+  });
+  jest.spyOn(console, "error").mockImplementation(() => {});
+  const screen = await renderWithProviders(accountPanel(), { queryClient: client });
+  await tick();
+  expect(wire.get).toHaveBeenCalledTimes(1);
+  expect(supportApi.collectionLine).toHaveBeenCalled();
+  expect(screen.queryByText(copy.title)).toBeNull();
+  await fireEvent.press(screen.getByText("Delete account…"));
+  expect(screen.getByText("Type your email to confirm")).toBeOnTheScreen();
+});
+
+test("a refused approval lookup disables the switch", async () => {
+  const { wire, show } = fixture(state("on"));
+  wire.approvalStatus = 401;
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  await fireEvent.press(screen.getByRole("switch"));
+  await waitFor(() => expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen());
+  expect(screen.getByRole("switch")).toBeDisabled();
+  expect(wire.put).not.toHaveBeenCalled();
 });

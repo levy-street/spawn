@@ -1,6 +1,6 @@
 "use client";
 
-import { useSyncExternalStore } from "react";
+import { Component, type PropsWithChildren, useSyncExternalStore } from "react";
 import { SwitchRow } from "@/components/ui/switch";
 import { useSupportLog } from "@/hooks/useSupportLog";
 import { collectionLine } from "@/lib/support-log";
@@ -11,7 +11,25 @@ function subscribeVisibility(listener: () => void) {
   return () => document.removeEventListener("visibilitychange", listener);
 }
 
+class SupportLogBoundary extends Component<PropsWithChildren> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
 export function SupportLogSettings({ accountId }: { accountId: string }) {
+  return (
+    <SupportLogBoundary>
+      <SupportLogPanel accountId={accountId} />
+    </SupportLogBoundary>
+  );
+}
+
+function SupportLogPanel({ accountId }: { accountId: string }) {
   const visible = useSyncExternalStore(
     subscribeVisibility,
     () => !document.hidden,

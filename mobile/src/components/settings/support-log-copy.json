@@ -1,11 +1,11 @@
 {
   "title": "Diagnostic logs",
   "switchLabel": "Let SPAWN D support collect diagnostic logs",
-  "description": "While this is on, SPAWN D support can ask one of your machines for its recent SPAWN D log when something goes wrong. The log can contain session IDs, folder paths, IP addresses and error messages. It never has what you type, what your terminals show, or what is in your files. Each log is kept on the SPAWN D server for 7 days, then deleted. Turning this off stops new collections and deletes any logs already collected.",
+  "description": "While this is on, SPAWN D support can ask one of your machines for its recent SPAWN D log when something goes wrong. The log can contain session IDs, local paths and file errors that may include an IP address. It never has what you type, what your terminals show, or what is in your files. Each log is kept on the SPAWN D server for 7 days, then deleted. Turning this off stops new collections and deletes any logs already collected.",
   "confirmTitle": "Let SPAWN D support collect diagnostic logs?",
   "turnOn": "Turn on",
   "cancel": "Cancel",
-  "sent": "Sent to SPAWN D for delivery to your machines.",
+  "sent": "SPAWN D saved your choice. Each machine checks it while connected or when it next connects.",
   "offSignerRemoved": "This is off because the device that turned it on was removed from your account. Turn it on again from this device.",
   "cannotSign": "Approve this device first. Your machines only take this setting from an approved device.",
   "needsUpdate": "{machine} needs a SPAWN D update before its log can be collected.",

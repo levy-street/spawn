@@ -1,5 +1,11 @@
 import { NavigationContext } from "@react-navigation/native";
-import { useCallback, useContext, useSyncExternalStore } from "react";
+import {
+  Component,
+  type PropsWithChildren,
+  useCallback,
+  useContext,
+  useSyncExternalStore,
+} from "react";
 import { AppState, View } from "react-native";
 import { SettingsToggleRow } from "@/components/settings/settings-row";
 import { SettingsSection } from "@/components/settings/settings-section";
@@ -13,7 +19,25 @@ function subscribeApp(listener: () => void) {
   return () => subscription.remove();
 }
 
+class SupportLogBoundary extends Component<PropsWithChildren> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
 export function SupportLogSettings({ accountId }: { accountId: string }) {
+  return (
+    <SupportLogBoundary>
+      <SupportLogPanel accountId={accountId} />
+    </SupportLogBoundary>
+  );
+}
+
+function SupportLogPanel({ accountId }: { accountId: string }) {
   // The tab navigator can keep Account mounted behind another screen.
   const navigation = useContext(NavigationContext);
   const subscribe = useCallback(

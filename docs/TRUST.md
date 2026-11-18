@@ -210,8 +210,7 @@ directory outside the checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
 
 In Settings ▸ Account on the web and phone, an approved device can turn
 diagnostic log sharing on or off. The switch appears when the server offers
-log storage. “Sent to SPAWN D for delivery to your machines” means the server
-saved the choice. It sends the choice to connected machines and again when
+log storage. SPAWN D saves the choice and sends it to connected machines and again when
 they reconnect. Each machine checks the choice and applies it itself.
 
 On a ready server, an owner's app can read the stored choice, the signing

@@ -1,36 +1,7 @@
 import { z } from "zod";
 import copy from "@/components/settings/support-log-copy.json";
 import { ApiError, api } from "@/data/api/client";
-import { pathPart } from "@/data/api/endpoints/helpers";
-import { BrowserDeviceOutSchema } from "@/data/api/schemas/devices";
-import { AccountEndorsementRecordSchema, HostPinsOutSchema } from "@/data/api/schemas/trust";
 import type { SignedSupportLogConsent } from "@/lib/crypto/support-log-consent";
-
-// Optional Account reads must not sign out the rest of the app on a 401.
-function keepSession(response: Response) {
-  if (response.status === 401) throw new Error("Support log unavailable");
-}
-
-export async function readSupportLogTrust(hostIds: string[]) {
-  return Promise.all([
-    api("/api/browser-devices", {
-      schema: z.array(BrowserDeviceOutSchema),
-      onResponse: keepSession,
-    }),
-    api("/api/trust/account-endorsements", {
-      schema: z.array(AccountEndorsementRecordSchema),
-      onResponse: keepSession,
-    }),
-    Promise.all(
-      hostIds.map((id) =>
-        api(`/api/trust/hosts/${pathPart(id)}/pins`, {
-          schema: HostPinsOutSchema,
-          onResponse: keepSession,
-        }),
-      ),
-    ),
-  ]);
-}
 
 const date = z.iso.datetime({ offset: true });
 const nullableDate = date.nullable();
@@ -84,24 +55,24 @@ const accountState = z.object({
 });
 export type SupportLogState = z.infer<typeof accountState>;
 
-export async function readSupportLog(): Promise<SupportLogState> {
+export async function readSupportLog(signal: AbortSignal): Promise<SupportLogState> {
   return accountState.parse(
     await api("/api/support-log", {
+      signal,
       onResponse: (response) => {
-        if (response.status !== 200) throw new Error("Support log unavailable");
+        if (response.ok && response.status !== 200) throw new Error("Support log unavailable");
       },
     }),
   );
 }
 
-export async function putSupportLog(statement: SignedSupportLogConsent): Promise<SupportLogState> {
-  return accountState.parse(
-    await api("/api/support-log/consent", {
-      method: "PUT",
-      body: JSON.stringify(statement),
-      onResponse: keepSession,
-    }),
-  );
+export async function putSupportLog(statement: SignedSupportLogConsent, signal: AbortSignal) {
+  await api("/api/support-log/consent", {
+    method: "PUT",
+    body: JSON.stringify(statement),
+    responseType: "response",
+    signal,
+  });
 }
 
 export function supportLogRefusal(error: unknown): string {
