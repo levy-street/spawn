@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ pub struct LastError {
     pub kind: String,
     pub detail: String,
     pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,9 +89,14 @@ pub fn active_connected(sessions: usize, rtc_peers: RtcPeerGauge) {
     }
 }
 
-pub fn active_disconnected(kind: &str, detail: &str, sessions: usize) {
+pub fn active_disconnected(
+    kind: &str,
+    detail: &str,
+    sessions: usize,
+    retry_after: Option<Duration>,
+) {
     if let Some(store) = ACTIVE_STATE.get() {
-        store.disconnected(kind, detail, sessions);
+        store.disconnected(kind, detail, sessions, retry_after, SystemTime::now());
     }
 }
 
@@ -120,19 +127,18 @@ pub fn connection_error_class(class: &str) -> (&'static str, &'static str) {
 }
 
 impl StateStore {
-    #[allow(dead_code)]
-    pub fn new(config_dir: &Path, server: &str) -> Self {
-        Self::new_with_breakaway(config_dir, server, None)
-    }
-
     pub fn new_with_breakaway(
         config_dir: &Path,
         server: &str,
         task_breakaway_denied: Option<bool>,
     ) -> Self {
+        Self::at_path(state_path(config_dir), server, task_breakaway_denied)
+    }
+
+    fn at_path(path: PathBuf, server: &str, task_breakaway_denied: Option<bool>) -> Self {
         let provenance = crate::install::provenance();
         Self {
-            path: state_path(config_dir),
+            path,
             state: Mutex::new(StateFile {
                 pid: std::process::id(),
                 process_started_100ns: current_process_started_100ns(),
@@ -178,14 +184,24 @@ impl StateStore {
         }
     }
 
-    pub fn disconnected(&self, kind: &str, detail: &str, sessions: usize) {
+    fn disconnected(
+        &self,
+        kind: &str,
+        detail: &str,
+        sessions: usize,
+        retry_after: Option<Duration>,
+        now: SystemTime,
+    ) {
         let mut state = self.state.lock().expect("state heartbeat lock");
+        let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         state.connected = false;
         state.connected_at = None;
         state.last_error = Some(LastError {
             kind: kind.to_owned(),
             detail: detail.to_owned(),
-            at: now_rfc3339(),
+            at: unix_seconds_rfc3339(seconds),
+            next_attempt_at: retry_after
+                .map(|delay| unix_seconds_rfc3339(seconds + delay.as_secs())),
         });
         state.sessions = sessions;
         state.support_runtime = crate::support::runtime_status();
@@ -591,19 +607,52 @@ mod tests {
     #[test]
     fn state_json_has_the_stable_contract_shape_and_writes_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
-        store.disconnected("auth", "token_revoked", 2);
-        let state = read(dir.path()).unwrap().unwrap();
+        let store = StateStore::at_path(dir.path().join("state.json"), "", None);
+        store.disconnected("auth", "token_invalid", 2, None, UNIX_EPOCH);
+        let state = read_path(&store.path).unwrap().unwrap();
         let value = serde_json::to_value(&state).unwrap();
         assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["connected"], false);
         assert_eq!(value["last_error"]["kind"], "auth");
+        assert!(value["last_error"].get("next_attempt_at").is_none());
         assert_eq!(value["sessions"], 2);
         assert!(value["last_error"]["at"].as_str().unwrap().ends_with('Z'));
         assert!(!dir
             .path()
             .join(format!("state.json.tmp.{}", std::process::id()))
             .exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn heartbeat_path_uses_local_instance_state() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            state_path(dir.path()),
+            crate::service::instance_state_path(dir.path())
+                .unwrap()
+                .join("state.json")
+        );
+    }
+
+    #[test]
+    fn revoked_login_heartbeat_keeps_the_scheduled_retry_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at_path(dir.path().join("state.json"), "", None);
+        let now = UNIX_EPOCH + Duration::from_secs(23 * 3600 + 45 * 60);
+        store.disconnected(
+            "auth",
+            "token_revoked",
+            0,
+            Some(Duration::from_secs(1800)),
+            now,
+        );
+        store.heartbeat(0, None);
+        let error = read_path(&store.path).unwrap().unwrap().last_error.unwrap();
+        assert_eq!(
+            error.next_attempt_at.as_deref(),
+            Some("1970-01-02T00:15:00Z")
+        );
     }
 
     #[test]
@@ -641,9 +690,9 @@ mod tests {
     #[test]
     fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
         let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        let store = StateStore::at_path(dir.path().join("state.json"), "", None);
         store.heartbeat(0, None);
-        let state = read(dir.path()).unwrap().unwrap();
+        let state = read_path(&store.path).unwrap().unwrap();
         assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
         assert!(state
             .exe
@@ -651,7 +700,7 @@ mod tests {
             .is_some_and(|exe| std::path::Path::new(exe).is_absolute()));
         assert!(!state.worker_mismatch);
         store.worker_mismatch(true);
-        let state = read(dir.path()).unwrap().unwrap();
+        let state = read_path(&store.path).unwrap().unwrap();
         assert!(state.worker_mismatch);
         assert_eq!(
             serde_json::to_value(&state).unwrap()["worker_mismatch"],

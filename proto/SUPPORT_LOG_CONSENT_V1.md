@@ -63,19 +63,22 @@ statement exists, cleanup does not create a lock file.
 ## Delivery, ordering, and restart
 
 - `register` adds `supports_support_log:true` (capability, not availability).
-- `registered.support_log_consent` absent keeps local state; `null` disables
-  sharing; a statement is verified before persistence.
-- `{"type":"host.support_log_consent","consent":…}` carries the same statement
-  or null.
+- The daemon accepts a statement or null in `registered.support_log_consent`
+  or in a later `{"type":"host.support_log_consent","consent":…}` frame.
+  An absent field in `registered` keeps local consent at any frame size.
+  Null disables sharing. The daemon verifies a statement before persistence.
+  The server sends ordinary trust data in `registered`, then delivers the
+  statement or null in the separate frame before any collection request.
 - `{"type":"support_log.collect","request_id":"<uuid>","since_seconds":N}`
   requests collection. UUID parsing and signed-integer parsing happen before
   dispatch. N is clamped to 60–259200. Malformed support extensions deny support only; malformed ordinary frames
   retain the ordinary parser result. Registration parses its ordinary fields independently, including for a
   wrong type, unknown consent field or over-cap carried list. The ordinary parse
-  runs first, with master's field types and JSON features. Only `registered` and
-  `host.support_log_consent` get a second extension parse, into absent/null/valid/
-  invalid. Duplicate support fields and frames over 64 KiB are invalid support;
-  the ordinary parser keeps its existing WebSocket bound and duplicate semantics.
+  runs first, with master's field types and JSON features. The extension parser
+  accepts at most 64 KiB. Duplicate support fields, oversized registrations
+  carrying the support field, and oversized `host.support_log_consent` frames
+  are invalid support. The ordinary parser keeps its existing WebSocket bound
+  and duplicate semantics.
 
 One optional sequential actor owns sharing across control reconnects. Its queue
 exists immediately; startup opens no support storage. Dispatch for trust/consent
@@ -132,7 +135,7 @@ comparison of the carried approvals: a refreshed approval path is persisted.
 Successful persistence survives restart; terminal process denial and the admission
 bucket do not. Removing the statement also removes its timestamp/revocation floor;
 failed removal can leave an old on. An honest server must redeliver current consent
-in `registered` before collection. A dishonest server can withhold withdrawal or
+before collection. A dishonest server can withhold withdrawal or
 replay an old valid on after state loss. There is no host acknowledgement that it
 applied a turn-off; apps must not claim one. Capability, silence and collection
 receipts do not provide that confirmation.
@@ -282,8 +285,9 @@ Before the server half or either app ships:
 - Durable owner withdrawal is a signed `enabled:false` statement, not null.
   Null is reversible by redelivery of the identical valid enabled statement.
   Distinguish withdrawal requested from confirmation that a host applied it.
-- Persist and redeliver the current statement in `registered` before any
-  collection, including after restart. Capability is not current availability.
+- Persist and redeliver the current statement before any collection, including
+  after restart. The server uses `host.support_log_consent` after registration.
+  Capability is not current availability.
 - Attribute the statement to the verified device and use
   `max(now, current issued_at_ms + 1)`. Handle overflow, clock disagreement and
   the host's 24-hour future bound without showing false success. Off wins ties.

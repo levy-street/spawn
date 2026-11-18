@@ -438,7 +438,35 @@ enum ServeOutcome {
 
 struct SessionEnd {
     result: Result<()>,
-    stable: bool,
+    registered_for: Option<Duration>,
+}
+
+#[derive(Default)]
+struct RevokedLoginBackoff {
+    credential_generation: u64,
+    refusals: usize,
+}
+
+impl RevokedLoginBackoff {
+    fn after_session(
+        &mut self,
+        generation: u64,
+        registered_for: Option<Duration>,
+        refusal: Option<ws::AuthRefusal>,
+    ) -> Option<Duration> {
+        // The credential monitor already interrupts the sleep on a new generation.
+        if generation != self.credential_generation || registered_for.is_some() {
+            self.credential_generation = generation;
+            self.refusals = 0;
+        }
+        if refusal != Some(ws::AuthRefusal::Revoked) {
+            return None;
+        }
+        const MINUTES: [u64; 4] = [1, 5, 30, 60];
+        let delay = Duration::from_secs(MINUTES[self.refusals] * 60);
+        self.refusals = (self.refusals + 1).min(MINUTES.len() - 1);
+        Some(delay)
+    }
 }
 
 enum ActiveSessionEvent {
@@ -720,6 +748,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut supersession_count = 0_u8;
     let mut supersession_logged = false;
     let mut unauthorized_logged = false;
+    let mut revoked_login = RevokedLoginBackoff::default();
 
     'supervisor: loop {
         // A session close or backoff timer can become ready in the same
@@ -773,7 +802,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 }
             }
         }?;
-        let res = match outcome {
+        let ended = match outcome {
             ServeOutcome::CredentialsChanged(next) => {
                 tracing::info!(
                     generation = next.generation,
@@ -784,24 +813,36 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 continue;
             }
             ServeOutcome::SessionEnded(ended) => {
-                if ended.stable {
+                if ended
+                    .registered_for
+                    .is_some_and(|age| age >= Duration::from_secs(60))
+                {
                     attempt = 0;
                     unauthorized_logged = false;
                 } else {
                     attempt = attempt.saturating_add(1);
                 }
-                ended.result
+                ended
             }
         };
+        let res = ended.result;
+        let refusal = res.as_ref().err().and_then(ws::auth_refusal);
+        let revoked_delay =
+            revoked_login.after_session(live_credentials.generation, ended.registered_for, refusal);
         if let Err(error) = &res {
             let class = ws::failure_class(error);
             let (kind, default_detail) = crate::state::connection_error_class(class);
-            let detail = ws::auth_refusal(error)
+            let detail = refusal
                 .map(ws::AuthRefusal::as_str)
                 .unwrap_or(default_detail);
-            crate::state::active_disconnected(kind, detail, registry.ids().len());
+            crate::state::active_disconnected(kind, detail, registry.ids().len(), revoked_delay);
         } else {
-            crate::state::active_disconnected("protocol", "socket_closed", registry.ids().len());
+            crate::state::active_disconnected(
+                "protocol",
+                "socket_closed",
+                registry.ids().len(),
+                None,
+            );
         }
         let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
         let reconnect_now = res.as_ref().err().and_then(ws::close_disposition)
@@ -857,7 +898,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                         unauthorized_logged = true;
                         tracing::error!(class = "unauthorized", "token expired — run spawnd login");
                     }
-                    Duration::from_secs(60)
+                    revoked_delay.unwrap_or(Duration::from_secs(60))
                 }
                 Some(ws::CloseDisposition::Superseded) => {
                     let now = Instant::now();
@@ -1054,7 +1095,7 @@ async fn serve_one_connection_with_loader(
                 Ok(stream) => ConnectOutcome::Connected(stream),
                 Err(error) => return Ok(ServeOutcome::SessionEnded(SessionEnd {
                     result: Err(error),
-                    stable: false,
+                    registered_for: None,
                 })),
             },
             reloaded = &mut reload_fut => ConnectOutcome::Reloaded(reloaded.map(Box::new)),
@@ -1322,11 +1363,14 @@ async fn serve_one_connection_with_loader(
     drop(heartbeat_task);
     match dispatch_result {
         ActiveSessionEvent::SessionEnded(result) => {
-            let stable = registered_at
+            let registered_for = registered_at
                 .lock()
                 .expect("registered timestamp lock")
-                .is_some_and(|registered| registered.elapsed() >= Duration::from_secs(60));
-            Ok(ServeOutcome::SessionEnded(SessionEnd { result, stable }))
+                .map(|registered| registered.elapsed());
+            Ok(ServeOutcome::SessionEnded(SessionEnd {
+                result,
+                registered_for,
+            }))
         }
         ActiveSessionEvent::CredentialReload(result) => {
             Ok(ServeOutcome::CredentialsChanged(result?))
@@ -4598,6 +4642,30 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    #[test]
+    fn revoked_login_backoff_tracks_registration_and_credential_generation() {
+        use ws::AuthRefusal::{Expired, Revoked};
+        let mut backoff = RevokedLoginBackoff::default();
+        for (generation, registered_for, refusal, expected_seconds) in [
+            (1, None, Some(Revoked), Some(60)),
+            (1, None, Some(Revoked), Some(300)),
+            (1, None, Some(Revoked), Some(1800)),
+            (1, None, Some(Revoked), Some(3600)),
+            (1, None, Some(Expired), None),
+            (1, None, Some(Revoked), Some(3600)),
+            (1, Some(Duration::ZERO), None, None),
+            (1, None, Some(Revoked), Some(60)),
+            (1, None, Some(Revoked), Some(300)),
+            (2, None, Some(Revoked), Some(60)),
+            (2, Some(Duration::from_secs(1)), Some(Revoked), Some(60)),
+        ] {
+            assert_eq!(
+                backoff.after_session(generation, registered_for, refusal),
+                expected_seconds.map(Duration::from_secs),
+            );
+        }
+    }
 
     /// A program that hangs past a capture's timeout is stopped with
     /// everything it started: its process group goes whole.

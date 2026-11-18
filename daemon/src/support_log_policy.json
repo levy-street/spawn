@@ -704,21 +704,21 @@
     },
     {
       "file": "src/run.rs",
-      "line": 4278,
+      "line": 4322,
       "field": "shell",
       "source": "tracing::warn!(\n                shell = %shell.display(),\n                mode,\n                \"the user's shell did not say its PATH in time and was stopped; what it would have added is not used\"\n            )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4525,
+      "line": 4569,
       "field": "path",
       "source": "tracing::info!(path = %path.display(), \"created the user's Codex home\")",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4527,
+      "line": 4571,
       "field": "path",
       "source": "tracing::warn!(\n            path = %path.display(),\n            %error,\n            \"could not create the user's Codex home; this window's Codex keeps its own\"\n        )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
