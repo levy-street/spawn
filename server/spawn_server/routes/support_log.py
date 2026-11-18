@@ -1,11 +1,11 @@
-"""Daemon-only bounded uploads. Nothing in this change dispatches a request."""
+"""Daemon-only bounded uploads for dispatched collections."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import re
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -13,9 +13,9 @@ from starlette.requests import ClientDisconnect
 
 from .. import auth
 from ..db import get_sessionmaker
-from ..models import SupportLogCollection, _utcnow
+from ..models import _utcnow
 from ..support_consent import ConsentError, canonical_uuid, is_sharing_on, strict_json
-from ..support_log import DECLINE_CODES, get_collection, transition
+from ..support_log import DECLINE_CODES, body_readers, get_collection, transition
 from ..support_log_files import finish_job, get_store
 
 router = APIRouter(prefix="/api/support-log", tags=["support-log"])
@@ -25,7 +25,7 @@ MAX_BODY_READS = 4
 RECEIVE_SECONDS = 60
 NOT_FOUND = "Not Found"
 _inflight: set[str] = set()
-_reading: set[str] = set()
+_reading = body_readers
 
 
 @contextmanager
@@ -151,25 +151,23 @@ async def publish(store, record, body, metadata):
 @router.post("/uploads/{request_id}", status_code=204)
 async def upload(request_id: str, request: Request):
     store = get_store(request.app)
-    if store is None:
+    pump = getattr(request.app.state, "support_log_pump", None)
+    if store is None or pump is None:
         raise HTTPException(404, NOT_FOUND)
-    # Explicit dependency scope ends before a body read, including auth's SELECT.
     async with get_sessionmaker()() as session:
         host = await auth.daemon_principal(request.headers.get("authorization"), session)
-        try:
-            canonical_uuid(request_id)
-        except ConsentError:
-            raise HTTPException(404, NOT_FOUND) from None
-        record = await session.get(SupportLogCollection, request_id)
-        if (
-            record is None
-            or record.host_id != host.id
-            or record.owner_user_id != host.owner_user_id
-        ):
+        host_id, owner = host.id, host.owner_user_id
+    try:
+        canonical_uuid(request_id)
+    except ConsentError:
+        raise HTTPException(404, NOT_FOUND) from None
+    with ExitStack() as slots:
+        record = await pump.collection_for_upload(request_id)
+        if record is None or record.host_id != host_id or record.owner_user_id != owner:
             raise HTTPException(404, NOT_FOUND)
         if record.state != "dispatched":
             raise HTTPException(409, "support request closed")
-    with upload_slots(record.id):
+        slots.enter_context(upload_slots(record.id))
         if not await is_sharing_on(record.owner_user_id):
             await transition(record.id, "dispatched", "cancelled")
             raise HTTPException(409, "support sharing is off")

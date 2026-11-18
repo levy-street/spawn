@@ -8,7 +8,9 @@ This keeps the sanity suite fast and dependency-free.
 from __future__ import annotations
 
 import os
+import sys
 
+import pytest
 import pytest_asyncio
 
 # Configure environment BEFORE app modules are imported.
@@ -38,6 +40,11 @@ from spawn_server.ws.broker import get_broker  # noqa: E402
 
 # Force the cached settings to re-read env on each session.
 get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def sansio_launch(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [sys.argv[0], "--ws", "websockets-sansio"])
 
 
 @pytest_asyncio.fixture

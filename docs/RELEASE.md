@@ -1651,17 +1651,26 @@ Migrations run before the new server starts, so a release is safe only when the
 old code tolerates the new schema. Add columns and backfill in one release,
 then start depending on them in the next.
 
-The support log storage migration (0072) adds two tables and the unused,
+The support log storage migration (0072) adds two tables and the
 default-false `hosts.support_log_capable` column. Old server code tolerates all
-three additions. `SPAWN_SUPPORT_LOG_DIR` is the one storage setting: leave it
-unset to keep the feature off (404 uploads, no support file access or sweep).
-If enabled later, it must name an absolute private directory outside the
-checkout and database backups. The directory must be on the server's local
-disk because each startup waits for a worker thread to prepare it with mode
-0700 and check locking and writing. A failure logs one error and keeps storage
-off for that lifespan. There is still no request sender or app sharing switch
-in this change, so setting the directory alone cannot cause collection. Read
-the support log section of `docs/TRUST.md` before enabling this storage.
+three additions. Leave `SPAWN_SUPPORT_LOG_DIR` unset to keep support logs off.
+To switch them on, create an empty private directory (mode 0700) on local
+disk outside the checkout and database backups. Set `SPAWN_SUPPORT_LOG_DIR` to
+its absolute path, add `--ws websockets-sansio` to the server launch command,
+and restart the server. This backend can answer a daemon Ping while an
+application write is paused without closing the connection.
+Startup checks the launch flag before a worker checks the directory's locking
+and writing. A failure logs one error and keeps storage
+off for that lifespan. The apps still need to sign the owner's statement before
+collection is possible. Read the support log section of `docs/TRUST.md` before
+enabling this storage.
+
+With the server's settings, run `python -m spawn_server.support_log_cli accounts`
+from the server directory to see accounts with sharing on. Use `collect` with
+the account, host, reason and operator label to queue one request. Use `status`
+to read its outcome and `show` to read a collected bundle on the server.
+The command works through the database. The server process handles delivery.
+`server/CLAUDE.md` lists the flags, pacing limits and exit codes.
 
 For a Windows launch or any release that changes the native Windows handoff,
 ship in this order:

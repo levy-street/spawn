@@ -41,7 +41,7 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Browser devices and trust | Settings → Access | `/api/browser-devices/*`, `/api/trust/{bundle,passkeys,endorsements,hosts/.../pins}` | `browserDevices.*`, `trust.*` | signed signaling and daemon-local browser pins |
 | Host capacity | sidebar Hosts strip, `/hosts`, profile dialog | on `GET /api/hosts`: static spec (`cpu_cores`, `cpu_physical_cores`, `cpu_model`, `memory_bytes`, `gpu`) plus `cpu_bucket`/`mem_bucket` in `0..=5` and `capacity_at`; buckets are withheld for an offline host | `summarizeFleet`, `useHostCapacity` (every 3 s, only for a host card on screen in a tab in front) | spec on `register`; buckets on `host.heartbeat`; **exact** figures only over `spawn.host.ctl` `host.metrics`, never server-visible. `SPAWND_NO_TELEMETRY=1` disables all three |
 | Profile and activity history | account menu → Profile | `GET /api/profile` → identity, `totals`, `agents`, sparse `days`, `hosts`, `history_days`, `today` | `profile.get`, `calendar` | none — read from `legion_days`, an append-only per-owner-per-day counter table written beside the existing lifecycle writes |
-| Support log storage | no app surface yet | `POST /api/support-log/uploads/{request_id}`; daemon bearer token, dispatched record bound to that host; 404 while storage is off | none; no download route | bounded NDJSON bundle or typed JSON refusal; no server sender exists yet |
+| Support log storage | no app surface yet | `POST /api/support-log/uploads/{request_id}`; daemon bearer token, dispatched record bound to that host; 404 while storage is off | none; no download route | local operator request with a recorded reason, then a bounded NDJSON bundle or typed JSON refusal |
 | Terminal input/output | workspace/session terminal | none | `useSessionSocket`, `LiveTerminalProvider` | ordered reliable `spawn.pty` DataChannel direct to the endpoint |
 | Alerts on agent completion | Settings → Notifications, pane menu → Mute alerts | none; delivered over `/ws/alerts` (owner-scoped, subprotocol `spawn.alerts.v1`) | `subscribeToAlerts`, `useSessionAlerts`, `notify-prefs` | transitions are detected beside the lifecycle writes in `ws/daemon.py`; the daemon gains no new frame |
 | Replay, resize, display ownership, upload | workspace/session terminal | none | `spawn.ctl` client | ordered reliable locked `spawn.ctl` v1 DataChannel direct to the endpoint |
@@ -95,13 +95,20 @@ The daemon control frames implemented in `daemon/src/proto.rs` are:
 | Direction | Frames |
 | --- | --- |
 | daemon → server | `register` (`existing_sessions`, optional `spec`, `supports_support_log:true`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
-| server → daemon | `registered` (optional `support_log_consent`; absent preserves, null disables), `host.support_log_consent`, `support_log.collect`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
+| server → daemon | `registered` (ordinary trust data), `host.support_log_consent`, `support_log.collect`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
 
-The support websocket additions remain daemon-only: current server registration
-reads known properties from a JSON object and ignores the capability. The server
-has storage functions and a daemon upload route, off unless
-`SPAWN_SUPPORT_LOG_DIR` is set. There is no sender or app signing switch, so
-nothing can create a dispatched collection and the route can only refuse.
+With storage ready, the pump alone sends support frames to hosts declaring
+`supports_support_log: true`. After ordinary `registered`, it sends the
+account's current signed statement or null in `host.support_log_consent`,
+normally within about ten seconds of a change. Only a current on sent to
+that connection permits dispatch. The daemon accepts separate delivery. The
+wire document describes delivery inside `registered` and should be aligned
+when the daemon next changes. A collect can race the ordinary signer-removal
+push. The daemon checks trust at request start and one bundle can be in flight.
+The upload route checks sharing at arrival. Account deletion commits before
+removing bundles, with the orphan sweep handling leftovers.
+Only the local operator command can request collection. Sharing stays off
+until an app can sign the owner's statement.
 `support_log.collect` carries a UUID `request_id` and integer `since_seconds`, clamped to 60–259200. Responses
 use a bounded HTTPS POST to the configured origin and path prefix, with bearer
 daemon token, locally proven account/device consent and current actor generation.
@@ -164,7 +171,7 @@ comparison of the carried approvals: a refreshed approval path is persisted.
 Successful persistence survives restart; terminal process denial and the admission
 bucket do not. Removing the statement also removes its timestamp/revocation floor;
 failed removal can leave an old on. An honest server must redeliver current consent
-in `registered` before collection. A dishonest server can withhold withdrawal or
+after registration and before collection. A dishonest server can withhold withdrawal or
 replay an old valid on after state loss. There is no host acknowledgement that it
 applied a turn-off; apps must not claim one. Capability, silence and collection
 receipts do not provide that confirmation.

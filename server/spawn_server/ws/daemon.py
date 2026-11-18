@@ -320,6 +320,8 @@ async def _prepare_host_activation(
         # daemon clears a stale mismatch rather than inheriting it.
         "worker_mismatch": registration.get("worker_mismatch") is True,
     }
+    if "supports_support_log" in registration:
+        values["support_log_capable"] = registration["supports_support_log"]
     if current.daemon_connection_id is not None and current.daemon_connection_id != connection_id:
         values["last_disconnect_at"] = _utcnow()
         values["last_disconnect_reason"] = "superseded"
@@ -2315,6 +2317,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     conn.supports_device_connections = (
                         obj.get("supports_device_connections") is True
                     )
+                    app = websocket.scope.get("app")
+                    pump = getattr(app.state, "support_log_pump", None) if app else None
+                    if pump is None:
+                        obj.pop("supports_support_log", None)
+                    else:
+                        conn.supports_support_log = obj.get("supports_support_log") is True
+                        obj["supports_support_log"] = conn.supports_support_log
                     live_bindings = _validated_live_bindings(obj.get("live_bindings"))
                     # Reserve a durable generation without touching the active
                     # database or Redis owner. Only the later CAS promotion is
@@ -2453,6 +2462,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if conn.keeps_peers_across_reconnect:
                             await _reconcile_live_bindings(conn, live_bindings)
                         await _auto_update_after_registration(conn)
+                        if conn.supports_support_log:
+                            conn.support_registration_complete = True
+                            pump.wake.set()
                     if not registration_accepted:
                         async with _bounded_host_ownership_session() as session:
                             await _mark_host_offline_if_owner(session, host.id, conn.id, generation)

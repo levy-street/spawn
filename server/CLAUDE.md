@@ -25,7 +25,9 @@ spawn_server/
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   support_consent.py       signed statement encoding, validation and current storage
-  support_log.py           collection records and conditional state transitions
+  support_log.py           request admission, pacing and conditional state transitions
+  support_log_dispatch.py  the server process's collection pump and statement delivery
+  support_log_cli.py       the operator command, run locally with the server settings
   support_log_types.py     exact unsigned timestamps on SQLite and PostgreSQL
   support_log_files.py     private atomic disk writes and file presence checks
   support_log_retention.py bounded sweeps, withdrawal and account deletion cleanup
@@ -78,20 +80,122 @@ authorization and durable-state requirements for their replacement.
   `supports_device_connections`; an old daemon must produce an explicit update
   refusal. Session channel attachment never becomes a server signaling route.
 
-## Support log storage
+## Support log delivery and storage
+
+Only an operator on the server can request a collection. The command inserts a
+database record. The app signing switch and owner history are still to come.
+
+When storage is ready, registration records the literal JSON boolean
+`supports_support_log: true` in the existing host activation write. Every host
+receives the ordinary `registered` frame with its full trust data. Registration
+wakes the pump after a capable host finishes connecting.
+
+The pump is the only sender of support statements and collection requests. It
+runs at startup and waits about ten seconds between passes unless woken sooner.
+A pass over many hosts with stalled sockets takes longer. Shutdown waits for
+the send or database operation in progress. First the pump sends the current
+statement in a separate `host.support_log_consent` frame to each capable host
+that needs it. A signed off is sent intact. Missing consent or an on whose signer
+has left the account is sent as null. A host can skip intermediate changes.
+The daemon accepts this frame after `registered`. The wire document describes
+delivery inside `registered` and should be aligned when the daemon next changes.
+The pump skips connections whose send lock is held or has waiters. Each
+support send has a 250 ms deadline on that lock. A timeout makes the pump
+resend the current statement on a later pass. An ordinary frame can lose up
+to 250 ms of its two-second deadline waiting for a support send to release the
+lock. The installed sans-I/O backend can leave both frames buffered in the
+transport after their sends return.
+
+Next the pump cancels open requests for accounts whose sharing is off. It then
+checks pending requests against the enabled statement sent on this connection.
+
+The released daemon denies sharing until its process restarts if an ordinary
+`registered` frame exceeds 65,536 UTF-8 bytes, even with consent omitted, and
+tries once to erase its stored statement. The server leaves a 1,024-byte margin.
+Above 64,512 bytes it logs once and withholds both support frames for the whole
+connection. Lifting the daemon limit requires a daemon change. A consent frame
+over 64,512 bytes is also withheld until the current statement fits. The local
+operator command sees the last declared capability in the database. It cannot
+see a connection's frame size, so a request can wait until it expires.
+
+Removing the signer still sends the ordinary trust update. A collect claimed
+just before removal can be sent just after the removal commits. At request start
+the daemon checks its stored on statement and whether it still admits the
+signer. One bundle can already be in flight. The server rejects uploads if
+sharing is off at arrival and checks sharing again before storing a bundle.
+
+If the trust update reaches the released daemon before a statement signed by
+the removed device, the daemon refuses that statement. Sharing stays off until
+SPAWN D restarts on that machine, even if the owner turns sharing on again.
+The same can happen on a fresh connection if the stored turn-off was signed
+by a device that has since been removed.
+
+A host can have one open request and must wait five minutes between dispatches.
+An account can request up to ten collections in a rolling 24 hours. The same
+limit on dispatch times covers requests delayed while a host was offline.
+The server allows two dispatched records across all accounts. A body still
+being read occupies a slot even after its record closes. The pump reads pages
+of 32 in request-time and ID order, yields between candidates and stops
+claiming once full or stopping. Admission and
+dispatch check the records table, including attempts that failed or were
+declined. Dispatch verifies the socket owner and the enabled statement last
+sent there, commits the conditional transition, then sends `support_log.collect`
+with the request ID and a window of 60 to 259200 seconds. A failed send stays
+dispatched until retention closes it. The server sends each request at most once.
+The server process is the only writer of statements. The app route runs in
+that process. While a statement commit is in progress, the pump returns an
+unsent claim to requested for a later pass. If the pump sees a completed
+statement change between claim and handoff, it cancels the request.
+The operator can request again under the usual
+pacing limits. A collect already handed to the socket cannot be recalled.
+The daemon and upload route still apply the checks above.
+
+Run `python -m spawn_server.support_log_cli` from the server directory with
+the server's settings. All commands accept `--json` for one output object.
+
+| Command | Result |
+| --- | --- |
+| `accounts` | Accounts with sharing on and their hosts' last seen time and last capability declaration |
+| `collect --account <id-or-email> --host <id-or-name> --reason <text> [--by <label>] [--hours N] [--wait SECONDS]` | Creates one request. The reason is 1 to 200 characters. Supply a label through `--by` or `SPAWN_SUPPORT_LOG_BY`. Hours must be positive and at most 72, with a default of 24. The wait is 0 to 86400 seconds. Waiting polls the database and returns the last state when the deadline passes. |
+| `status <id>` | Current state and any typed refusal |
+| `list [--account <id-or-email>] [--days N]` | Requests in the chosen period, seven days by default |
+| `show <id> [--raw]` | Read the unexpired collected bundle locally. Raw output refuses a terminal. |
+| `purge` | Run one bounded retention pass |
+
+The operator can read the whole bundle as the machine reported it. The server
+checks its form and cannot guarantee what the events contain. Under the store
+lock, `show` verifies a regular file, size, SHA-256 and JSON object framing
+before printing. Default output prints one object per line with terminal
+controls escaped. `show --raw` refuses a terminal and otherwise writes the stored bytes unchanged. Metadata commands omit tokens, keys and signatures. An account-scoped
+lookup exposes no other account's data.
+
+Exit codes are 0 for success, 2 for usage, 3 for sharing off, 4 for a host
+outside the account or unknown there, 5 for missing capability, 6 for an open
+request, 7 for pacing, 8 for unavailable storage and 9 for a missing account,
+record or readable collection result. Use the host ID when names repeat.
 
 `POST /api/support-log/uploads/{request_id}` accepts only a daemon token bound
-to a dispatched collection. No code creates or dispatches a collection yet;
-the functions are reserved for later work. There is no app or download route,
-no operator command and no new websocket behavior. `hosts.support_log_capable`
-is reserved for that later dispatch change.
+to a dispatched collection.
 
 `SPAWN_SUPPORT_LOG_DIR` is unset by default. Unset means 404 without reading
-the body, no support file access and no sweep task. Use an absolute private
-directory outside the repository checkout. It must be on the server's local
-disk because startup waits for a worker thread to prepare it with mode 0700
-and check locking and writing. Each lifespan registers the upload route and
-starts sweeps only after its check succeeds. A failure logs one error and
+the body, no support file access and no sweep task. To switch on, create an
+empty private directory on local disk outside the checkout and database backups,
+set `SPAWN_SUPPORT_LOG_DIR` to its absolute path, add `--ws websockets-sansio` to the
+server launch command, and restart. This backend writes an automatic Pong
+without competing with a paused application write for a drain waiter.
+Startup checks the launch arguments before a worker prepares the directory
+with mode 0700 and checks locking and writing. Under the directory lock, the server marks a
+new or empty directory with the extended attribute `user.spawnd.support-log-store`,
+version `v1`. A populated unmarked directory, including a legacy store, is
+left alone. Keep it for manual recovery and configure a fresh empty directory.
+The filesystem must support user extended attributes and named pipes. A ready
+server holds the read end of `.server-ready` open. The CLI opens an existing
+private marked directory and checks readiness by opening the write end of
+the pipe without blocking or sending data. Before inserting
+a request, `collect` locks and verifies the directory and runs the startup write probe.
+Each lifespan starts dispatch, installs the
+upload route and starts retention only after that check succeeds. With storage
+off, registration sends its ordinary frame and performs its ordinary SQL. A failure logs one error and
 keeps storage off for that lifespan.
 Keeping bundles outside the checkout prevents a deploy or source backup from
 copying plain diagnostic logs. They are separate from database backups.
@@ -105,7 +209,9 @@ reports a missing collected file explicitly; it never substitutes an empty log.
 Retention starts in the background at startup and repeats every 15 minutes.
 Each pass handles at most 100 entries in each category: expired bundles,
 old requested records, old dispatched records, year-old records and directory
-entries. Directory scanning resumes across passes. Bundles expire after seven
+entries. The orphan sweep verifies the store identity under lock and considers
+only canonical `<uuid>.ndjson` and `.upload-<uuid>.tmp` names. Directory
+scanning resumes across passes. Bundles expire after seven
 days; orphans get ten minutes of grace. Open requests expire after 24 hours or
 fail five minutes after dispatch. Collection records last at most 365 days,
 subject to the bounded sweep backlog. Signed statements have no expiry.
@@ -115,9 +221,16 @@ roster reference, so pruning a removed device preserves the signed artifact.
 Unsigned millisecond timestamps use 20-digit decimal text: SQLite integers
 cannot represent all of u64. This preserves ordering without rounding.
 Removing a signer makes every sharing check false without rewriting the statement.
-After storing a signed off statement, a future app route must call
-`sharing_turned_off` to cancel open requests and delete collected files.
-Account deletion already removes those files after its database commit.
+The app route should pass the ready store to `store_statement`. A signed off
+cancels open requests and marks collected records deleted in the same commit.
+File cleanup then uses only those record IDs. Account deletion reads its file
+IDs and commits both ordinary deletes. After the response, a background task
+tries the verified directory lock once and has two seconds to remove the
+files. Each store admits one filesystem cleanup job at a time. Deletions
+during that job leave their files to the orphan sweep after its grace period.
+Shutdown stops new cleanup and waits up to two seconds for active cleanup
+before closing the store. A stuck daemon thread owns its directory descriptor
+and allows the process to exit. If it resumes, it stops before the next file.
 
 HTTP metadata uses unsigned event counts and signed 64-bit time ranges; the
 first NDJSON object is the header and is excluded from the event count. The

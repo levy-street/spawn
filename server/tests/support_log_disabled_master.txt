@@ -1,0 +1,121 @@
+[register, heartbeat and disconnect]
+accept spawn.control.v3
+PRAGMA foreign_keys=ON
+PRAGMA busy_timeout=15000
+PRAGMA journal_mode=WAL
+PRAGMA synchronous=NORMAL
+SELECT hosts.id AS hosts_id, hosts.owner_user_id AS hosts_owner_user_id, hosts.name AS hosts_name, hosts.os AS hosts_os, hosts.arch AS hosts_arch, hosts.version AS hosts_version, hosts.daemon_tree AS hosts_daemon_tree, hosts.self_update AS hosts_self_update, hosts.self_update_blocked AS hosts_self_update_blocked, hosts.worker_mismatch AS hosts_worker_mismatch, hosts.update_state AS hosts_update_state, hosts.update_tree AS hosts_update_tree, hosts.update_error AS hosts_update_error, hosts.update_requested_at AS hosts_update_requested_at, hosts.support_log_capable AS hosts_support_log_capable, hosts.supports_account_chains AS hosts_supports_account_chains, hosts.host_key_algorithm AS hosts_host_key_algorithm, hosts.host_public_key AS hosts_host_public_key, hosts.status AS hosts_status, hosts.daemon_connection_id AS hosts_daemon_connection_id, hosts.daemon_generation AS hosts_daemon_generation, hosts.daemon_generation_counter AS hosts_daemon_generation_counter, hosts.daemon_pending_connection_id AS hosts_daemon_pending_connection_id, hosts.daemon_pending_generation AS hosts_daemon_pending_generation, hosts.last_seen_at AS hosts_last_seen_at, hosts.last_disconnect_at AS hosts_last_disconnect_at, hosts.last_disconnect_reason AS hosts_last_disconnect_reason, hosts.cpu_cores AS hosts_cpu_cores, hosts.cpu_physical_cores AS hosts_cpu_physical_cores, hosts.cpu_model AS hosts_cpu_model, hosts.memory_bytes AS hosts_memory_bytes, hosts.gpu AS hosts_gpu, hosts.cpu_bucket AS hosts_cpu_bucket, hosts.mem_bucket AS hosts_mem_bucket, hosts.capacity_at AS hosts_capacity_at, hosts.created_at AS hosts_created_at 
+FROM hosts 
+WHERE hosts.id = '<host>'
+2 x driver rollback
+websocket.receive {"type": "register", "existing_sessions": ["<worker>"], "supports_support_log": true}
+BEGIN 
+UPDATE hosts SET daemon_generation_counter=(hosts.daemon_generation_counter + 1), daemon_pending_connection_id='<connection>', daemon_pending_generation=(hosts.daemon_generation_counter + 1) WHERE hosts.id = '<host>' AND hosts.daemon_generation_counter < 9007199254740991 RETURNING daemon_pending_generation
+driver commit
+COMMIT
+driver rollback
+SELECT hosts.daemon_connection_id, hosts.daemon_generation, hosts.daemon_pending_connection_id, hosts.daemon_pending_generation 
+FROM hosts 
+WHERE hosts.id = '<host>'
+2 x driver rollback
+SELECT hosts.id AS hosts_id, hosts.owner_user_id AS hosts_owner_user_id, hosts.name AS hosts_name, hosts.os AS hosts_os, hosts.arch AS hosts_arch, hosts.version AS hosts_version, hosts.daemon_tree AS hosts_daemon_tree, hosts.self_update AS hosts_self_update, hosts.self_update_blocked AS hosts_self_update_blocked, hosts.worker_mismatch AS hosts_worker_mismatch, hosts.update_state AS hosts_update_state, hosts.update_tree AS hosts_update_tree, hosts.update_error AS hosts_update_error, hosts.update_requested_at AS hosts_update_requested_at, hosts.support_log_capable AS hosts_support_log_capable, hosts.supports_account_chains AS hosts_supports_account_chains, hosts.host_key_algorithm AS hosts_host_key_algorithm, hosts.host_public_key AS hosts_host_public_key, hosts.status AS hosts_status, hosts.daemon_connection_id AS hosts_daemon_connection_id, hosts.daemon_generation AS hosts_daemon_generation, hosts.daemon_generation_counter AS hosts_daemon_generation_counter, hosts.daemon_pending_connection_id AS hosts_daemon_pending_connection_id, hosts.daemon_pending_generation AS hosts_daemon_pending_generation, hosts.last_seen_at AS hosts_last_seen_at, hosts.last_disconnect_at AS hosts_last_disconnect_at, hosts.last_disconnect_reason AS hosts_last_disconnect_reason, hosts.cpu_cores AS hosts_cpu_cores, hosts.cpu_physical_cores AS hosts_cpu_physical_cores, hosts.cpu_model AS hosts_cpu_model, hosts.memory_bytes AS hosts_memory_bytes, hosts.gpu AS hosts_gpu, hosts.cpu_bucket AS hosts_cpu_bucket, hosts.mem_bucket AS hosts_mem_bucket, hosts.capacity_at AS hosts_capacity_at, hosts.created_at AS hosts_created_at 
+FROM hosts 
+WHERE hosts.id = '<host>'
+BEGIN 
+UPDATE hosts SET daemon_tree=NULL, self_update=0, self_update_blocked=NULL, worker_mismatch=0, status='online', daemon_connection_id='<connection>', daemon_generation=1, daemon_pending_connection_id=NULL, daemon_pending_generation=NULL, last_seen_at='<daemon-time-1>' WHERE hosts.id = '<host>' AND hosts.daemon_pending_connection_id = '<connection>' AND hosts.daemon_pending_generation = 1
+driver commit
+COMMIT
+driver rollback
+SELECT hosts.id AS hosts_id, hosts.owner_user_id AS hosts_owner_user_id, hosts.name AS hosts_name, hosts.os AS hosts_os, hosts.arch AS hosts_arch, hosts.version AS hosts_version, hosts.daemon_tree AS hosts_daemon_tree, hosts.self_update AS hosts_self_update, hosts.self_update_blocked AS hosts_self_update_blocked, hosts.worker_mismatch AS hosts_worker_mismatch, hosts.update_state AS hosts_update_state, hosts.update_tree AS hosts_update_tree, hosts.update_error AS hosts_update_error, hosts.update_requested_at AS hosts_update_requested_at, hosts.support_log_capable AS hosts_support_log_capable, hosts.supports_account_chains AS hosts_supports_account_chains, hosts.host_key_algorithm AS hosts_host_key_algorithm, hosts.host_public_key AS hosts_host_public_key, hosts.status AS hosts_status, hosts.daemon_connection_id AS hosts_daemon_connection_id, hosts.daemon_generation AS hosts_daemon_generation, hosts.daemon_generation_counter AS hosts_daemon_generation_counter, hosts.daemon_pending_connection_id AS hosts_daemon_pending_connection_id, hosts.daemon_pending_generation AS hosts_daemon_pending_generation, hosts.last_seen_at AS hosts_last_seen_at, hosts.last_disconnect_at AS hosts_last_disconnect_at, hosts.last_disconnect_reason AS hosts_last_disconnect_reason, hosts.cpu_cores AS hosts_cpu_cores, hosts.cpu_physical_cores AS hosts_cpu_physical_cores, hosts.cpu_model AS hosts_cpu_model, hosts.memory_bytes AS hosts_memory_bytes, hosts.gpu AS hosts_gpu, hosts.cpu_bucket AS hosts_cpu_bucket, hosts.mem_bucket AS hosts_mem_bucket, hosts.capacity_at AS hosts_capacity_at, hosts.created_at AS hosts_created_at 
+FROM hosts 
+WHERE hosts.id = '<host>'
+2 x driver rollback
+SELECT hosts.id 
+FROM hosts 
+WHERE hosts.id = '<host>' AND hosts.daemon_connection_id = '<connection>' AND hosts.daemon_generation = 1
+SELECT sessions.id AS sessions_id, sessions.owner_user_id AS sessions_owner_user_id, sessions.host_id AS sessions_host_id, sessions.cwd AS sessions_cwd, sessions.name AS sessions_name, sessions.status AS sessions_status, sessions.started_at AS sessions_started_at, sessions.exited_at AS sessions_exited_at, sessions.last_output_at AS sessions_last_output_at, sessions.last_input_at AS sessions_last_input_at, sessions.exit_code AS sessions_exit_code, sessions.foreground_command AS sessions_foreground_command, sessions.agent_id AS sessions_agent_id, sessions.agent_session_id AS sessions_agent_session_id 
+FROM sessions 
+WHERE sessions.id = '<worker>'
+2 x driver rollback
+SELECT host_browser_pins.browser_device_id, host_browser_pins.endorser_device_id, browser_devices.revoked_at AS endorsed_revoked_at, browser_devices.is_root AS endorsed_is_root, browser_devices_1.id AS endorser_id, browser_devices_1.revoked_at AS endorser_revoked_at 
+FROM host_browser_pins JOIN browser_devices ON browser_devices.id = host_browser_pins.browser_device_id LEFT OUTER JOIN browser_devices AS browser_devices_1 ON browser_devices_1.id = host_browser_pins.endorser_device_id 
+WHERE host_browser_pins.host_id = '<host>'
+2 x driver rollback
+SELECT host_browser_pins.browser_device_id, host_browser_pins.endorser_device_id, browser_devices.revoked_at AS endorsed_revoked_at, browser_devices.is_root AS endorsed_is_root, browser_devices_1.id AS endorser_id, browser_devices_1.revoked_at AS endorser_revoked_at 
+FROM host_browser_pins JOIN browser_devices ON browser_devices.id = host_browser_pins.browser_device_id LEFT OUTER JOIN browser_devices AS browser_devices_1 ON browser_devices_1.id = host_browser_pins.endorser_device_id 
+WHERE host_browser_pins.host_id = '<host>'
+SELECT host_browser_pins.browser_device_id, host_browser_pins.browser_key_algorithm, host_browser_pins.browser_public_key, host_browser_pins.browser_key_fingerprint, host_browser_pins.endorsement_signature, browser_devices_1.public_key AS endorser_public_key 
+FROM host_browser_pins LEFT OUTER JOIN browser_devices AS browser_devices_1 ON browser_devices_1.id = host_browser_pins.endorser_device_id 
+WHERE host_browser_pins.host_id = '<host>' ORDER BY host_browser_pins.browser_device_id
+2 x driver rollback
+SELECT browser_devices.public_key 
+FROM browser_devices 
+WHERE browser_devices.owner_user_id = '<account>' AND browser_devices.revoked_at IS NOT NULL UNION SELECT revoked_browser_keys.public_key 
+FROM revoked_browser_keys 
+WHERE revoked_browser_keys.owner_user_id = '<account>'
+2 x driver rollback
+SELECT hosts.id 
+FROM hosts 
+WHERE hosts.id = '<host>' AND hosts.daemon_connection_id = '<connection>' AND hosts.daemon_generation = 1
+SELECT sessions.id AS sessions_id, sessions.owner_user_id AS sessions_owner_user_id, sessions.host_id AS sessions_host_id, sessions.cwd AS sessions_cwd, sessions.name AS sessions_name, sessions.status AS sessions_status, sessions.started_at AS sessions_started_at, sessions.exited_at AS sessions_exited_at, sessions.last_output_at AS sessions_last_output_at, sessions.last_input_at AS sessions_last_input_at, sessions.exit_code AS sessions_exit_code, sessions.foreground_command AS sessions_foreground_command, sessions.agent_id AS sessions_agent_id, sessions.agent_session_id AS sessions_agent_session_id 
+FROM sessions 
+WHERE sessions.id = '<worker>'
+2 x driver rollback
+wire {"type": "registered", "host_id": "<host>", "account_id": "<account>", "browser_device_ids": ["<device>"], "browser_pins": [{"browser_device_id": "<device>", "browser_key_algorithm": "ed25519", "browser_public_key": "<public-key>", "browser_key_fingerprint": "<fingerprint>", "endorsement_signature": null, "endorser_public_key": null}], "revoked_browser_keys": ["<revoked-key>"], "access_token": "<rotated-token>"}
+websocket.receive {"type": "host.heartbeat"}
+BEGIN 
+UPDATE hosts SET last_seen_at='<daemon-time-3>' WHERE hosts.id = '<host>' AND hosts.daemon_connection_id = '<connection>' AND hosts.daemon_generation = 1
+driver commit
+COMMIT
+driver rollback
+wire {"type": "host.heartbeat"}
+websocket.disconnect None
+BEGIN 
+UPDATE hosts SET daemon_pending_connection_id=NULL, daemon_pending_generation=NULL WHERE hosts.id = '<host>' AND hosts.daemon_pending_connection_id = '<connection>' AND hosts.daemon_pending_generation = 1
+driver commit
+COMMIT
+driver rollback
+BEGIN 
+UPDATE hosts SET status='offline', daemon_connection_id=NULL, last_seen_at='<daemon-time-4>', last_disconnect_at='<daemon-time-5>', last_disconnect_reason='socket_closed' WHERE hosts.id = '<host>' AND hosts.daemon_connection_id = '<connection>' AND hosts.daemon_generation = 1
+driver commit
+COMMIT
+driver rollback
+[remove device]
+SELECT users.id AS users_id, users.email AS users_email, users.password_hash AS users_password_hash, users.created_at AS users_created_at, users.session_epoch AS users_session_epoch, users.email_verified_at AS users_email_verified_at, users.is_admin AS users_is_admin 
+FROM users 
+WHERE users.id = '<account>'
+BEGIN 
+UPDATE browser_devices SET revoked_at='<time-1>', revoked_by_device_id=NULL WHERE browser_devices.id = '<device>' AND browser_devices.owner_user_id = '<account>' AND browser_devices.public_key = '<public-key>' AND browser_devices.revoked_at IS NULL
+SELECT browser_devices.id, browser_devices.owner_user_id, browser_devices.key_algorithm, browser_devices.public_key, browser_devices.label, browser_devices.is_root, browser_devices.created_at, browser_devices.last_seen_at, browser_devices.approval_requested_at, browser_devices.revoked_at, browser_devices.revoked_by_device_id 
+FROM browser_devices 
+WHERE browser_devices.id = '<device>' AND browser_devices.owner_user_id = '<account>'
+SELECT revoked_browser_keys.owner_user_id AS revoked_browser_keys_owner_user_id, revoked_browser_keys.public_key AS revoked_browser_keys_public_key, revoked_browser_keys.key_algorithm AS revoked_browser_keys_key_algorithm, revoked_browser_keys.revoked_at AS revoked_browser_keys_revoked_at, revoked_browser_keys.revoked_by_device_id AS revoked_browser_keys_revoked_by_device_id 
+FROM revoked_browser_keys 
+WHERE revoked_browser_keys.owner_user_id = '<account>' AND revoked_browser_keys.public_key = '<public-key>'
+INSERT INTO revoked_browser_keys (owner_user_id, public_key, key_algorithm, revoked_at, revoked_by_device_id) VALUES ('<account>', '<public-key>', 'ed25519', '<time-1>', NULL)
+DELETE FROM host_browser_pins WHERE host_browser_pins.browser_device_id = '<device>'
+driver commit
+COMMIT
+driver rollback
+SELECT hosts.id 
+FROM hosts 
+WHERE hosts.owner_user_id = '<account>'
+2 x driver rollback
+[200, "{\"id\":\"<device>\",\"key_algorithm\":\"ed25519\",\"public_key\":\"<public-key>\",\"label\":null,\"created_at\":\"2000-01-01T00:00:00\",\"last_seen_at\":null,\"approval_requested_at\":null,\"revoked_at\":\"<revoked-at>\",\"revoked_by_device_id\":null,\"is_root\":false}", []]
+[delete account]
+SELECT users.id AS users_id, users.email AS users_email, users.password_hash AS users_password_hash, users.created_at AS users_created_at, users.session_epoch AS users_session_epoch, users.email_verified_at AS users_email_verified_at, users.is_admin AS users_is_admin 
+FROM users 
+WHERE users.id = '<account>'
+SELECT count(*) AS count_1 
+FROM auth_identities 
+WHERE auth_identities.user_id = '<account>'
+SELECT hosts.id 
+FROM hosts 
+WHERE hosts.owner_user_id = '<account>'
+BEGIN 
+DELETE FROM host_key_claims WHERE host_key_claims.owner_user_id = '<account>'
+51 x DELETE FROM users WHERE users.id = '<account>'
+driver commit
+COMMIT
+driver rollback
+[204, "", ["spawn_session=\"\"; expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/; SameSite=lax"]]

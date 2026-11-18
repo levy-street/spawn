@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -41,6 +42,7 @@ from .routes import trust_bundle as trust_bundle_routes
 from .routes import waitlist as waitlist_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .support_log_dispatch import SupportLogPump
 from .support_log_files import prepare_store
 from .support_log_retention import start_sweeps, stop_sweeps
 from .turn import validate_and_log_ice_config
@@ -100,7 +102,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:  # noqa: BLE001
             log.warning("builtin agent seed skipped: %s", e)
 
-    support_sweeps = None
     store = await prepare_store()
     if store is not None:
         # Include once per app, even if a test enters its lifespan again.
@@ -113,10 +114,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.openapi_schema = None
         app.state.support_log_store = store
         support_sweeps = start_sweeps(store)
+        pump = app.state.support_log_pump = SupportLogPump()
+        pump_task = asyncio.create_task(pump.run(), name="support-log-dispatch")
     try:
         yield
     finally:
-        if support_sweeps is not None:
+        if store is not None:
+            del app.state.support_log_pump
+            pump.stop()
+            await pump_task
             del app.state.support_log_store
             for route in app.state.support_log_routes:
                 app.routes.remove(route)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
@@ -18,6 +17,7 @@ from .support_log_files import finish_job
 log = logging.getLogger("spawn.support_log")
 BATCH = 100
 INTERVAL_SECONDS = 15 * 60
+CLEANUP_SECONDS = 2
 
 
 async def delete_collected(store, record_id: str, *, now: datetime | None = None):
@@ -26,9 +26,11 @@ async def delete_collected(store, record_id: str, *, now: datetime | None = None
     await transition(record_id, "collected", "deleted", now=now)
 
 
-async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
+async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH, stop=None):
     now = now or _utcnow()
-    async with store.locked():
+    async with store.locked(stop) as acquired:
+        if not acquired:
+            return
         async with get_sessionmaker()() as session:
             expired = (
                 await session.scalars(
@@ -108,87 +110,63 @@ async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
         for name in names:
             if name.endswith(".ndjson") and name.removesuffix(".ndjson") in retained:
                 continue
-            await asyncio.to_thread((store.root / name).unlink, missing_ok=True)
+            await asyncio.to_thread(store.unlink, name)
 
 
-async def sharing_turned_off(user_id: str, store):
-    """Called after storing the signed off statement; never substitutes a null row."""
-    if store is None:
-        return
-    async with get_sessionmaker()() as session:
-        await session.execute(
-            update(Collection)
-            .where(
+def _track_cleanup(pending, future):
+    pending.add(future)
+
+    def finished(done):
+        pending.discard(done)
+        if not done.cancelled():
+            done.exception()  # The waiter may already have timed out.
+
+    future.add_done_callback(finished)
+    return future
+
+
+async def remove_files(store, ids):
+    # Try the lock once. A slow filesystem cannot delay the caller past
+    # the deadline. The worker owns its locked descriptor until it finishes.
+    try:
+        worker = store.submit_cleanup(ids, CLEANUP_SECONDS)
+        if worker is None:
+            return
+        _track_cleanup(store.cleanup_tasks, worker)
+        async with asyncio.timeout(CLEANUP_SECONDS):
+            await asyncio.shield(worker)
+    except Exception:
+        log.error("SPAWN D support log file cleanup failed; sweep will retry")
+
+
+async def start_file_cleanup(store, ids):
+    """Called after the delete response has been sent. The sweep covers interruptions."""
+    if not store.cleanup_tasks and not store.cleanup_stopping.is_set():
+        _track_cleanup(store.cleanup_tasks, asyncio.create_task(remove_files(store, ids)))
+
+
+async def account_file_ids(session, user_id: str):
+    try:
+        ids = await session.scalars(
+            select(Collection.id).where(
                 Collection.owner_user_id == user_id,
-                Collection.state.in_(["requested", "dispatched"]),
+                Collection.state.in_(("collected", "deleted", "dispatched")),
             )
-            .values(state="cancelled", completed_at=_utcnow())
         )
-        await session.commit()
-    async with store.locked():
-        while True:
-            async with get_sessionmaker()() as session:
-                ids = (
-                    await session.scalars(
-                        select(Collection.id)
-                        .where(
-                            Collection.owner_user_id == user_id,
-                            Collection.state == "collected",
-                        )
-                        .order_by(Collection.id)
-                        .limit(BATCH)
-                    )
-                ).all()
-            if not ids:
-                break
-            for record_id in ids:
-                await delete_collected(store, record_id)
-
-
-async def account_file_ids(session, user_id: str, store) -> list[str]:
-    # No extra query, path access or transaction when the feature is off.
-    if store is None:
+        return ids.all()
+    except Exception:
+        # A failed SELECT can abort the transaction on PostgreSQL. The route
+        # has only read authorization and host IDs so far.
+        await session.rollback()
+        log.error("SPAWN D support log file lookup failed; sweep will retry")
         return []
-    return list(
-        (
-            await session.scalars(
-                select(Collection.id).where(
-                    Collection.owner_user_id == user_id,
-                )
-            )
-        ).all()
-    )
-
-
-@asynccontextmanager
-async def account_deletion_files(session, user_id: str, store):
-    """Fence publication from the file-id snapshot through the account commit.
-
-    With storage off this is a no-op, including the caller's transaction. With
-    storage on, finish its read-only authorization transaction before file I/O.
-    The caller deletes the account and commits inside this context.
-    """
-    if store is None:
-        yield
-        return
-    await session.commit()
-    async with store.locked():
-        ids = await account_file_ids(session, user_id, store)
-        yield
-        for record_id in ids:
-            try:
-                await asyncio.to_thread(store.remove, record_id)
-            except OSError:
-                # The account commit has succeeded. Preserve socket/cookie cleanup;
-                # the orphan sweep will retry the remaining file after its grace.
-                log.error("SPAWN D support log account file cleanup failed; sweep will retry")
 
 
 async def run_sweeps(store, stop: asyncio.Event):
     try:
         while not stop.is_set():
             try:
-                await finish_job(sweep_once(store))
+                await finish_job(sweep_once(store, stop=stop))
             except Exception:
                 log.error("SPAWN D support log retention pass failed")
             try:
@@ -196,6 +174,9 @@ async def run_sweeps(store, stop: asyncio.Event):
             except TimeoutError:
                 pass
     finally:
+        store.cleanup_stopping.set()
+        if store.cleanup_tasks:
+            await asyncio.wait(store.cleanup_tasks, timeout=CLEANUP_SECONDS)
         await asyncio.to_thread(store.close)
 
 
