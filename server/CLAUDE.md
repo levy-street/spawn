@@ -107,7 +107,8 @@ minutes. The released daemon stops sharing for the life of its process after
 Once a change commits, the server wakes the pump and publishes one
 `support-log` data event to the owner's alert channel. The response has the
 same fields as GET. Statements are stored and sent, never confirmed by a host.
-PUT refusals carry `detail.code`. A stale statement returns 409 with the
+Authentication failures return 401 with a string in `detail`. Consent refusals
+carry `detail.code`. A stale statement returns 409 with the
 stored `detail.issued_at_ms`. Malformed or future-dated statements return
 422, bad signatures return 400, and account or signer refusals return 403.
 

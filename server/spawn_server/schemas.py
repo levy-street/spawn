@@ -103,6 +103,40 @@ class SupportLogTimestampRefusal(BaseModel):
     code: Literal["timestamp_overflow", "future_timestamp"]
 
 
+class SupportLogError[Detail](BaseModel):
+    detail: Detail
+
+
+class InvalidConsentSignature(BaseModel):
+    code: Literal["invalid_signature"]
+
+
+class ConsentSignerRefusal(BaseModel):
+    code: Literal["account_mismatch", "signer_untrusted", "signer_removed", "signer_key_mismatch"]
+
+
+class ConsentReceiveTimeout(BaseModel):
+    code: Literal["receive_timeout"]
+
+
+class StaleConsent(BaseModel):
+    code: Literal["stale_statement"]
+    issued_at_ms: int = Field(ge=0, le=U64_MAX)
+
+
+class ConsentBodyTooLarge(BaseModel):
+    code: Literal["body_too_large"]
+
+
+class InvalidConsentStatement(BaseModel):
+    code: Literal["invalid_envelope", "future_timestamp", "timestamp_overflow"]
+
+
+class ConsentCooldown(BaseModel):
+    code: Literal["rate_limited"]
+    retry_after_seconds: int = Field(ge=1)
+
+
 class SupportLogAccountOut(BaseModel):
     statement: StoredSupportStatement | None
     sharing: Literal["on", "off", "off_signer_removed"]

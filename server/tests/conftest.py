@@ -43,6 +43,11 @@ get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 @pytest.fixture
+def inprocess_pubsub(monkeypatch):
+    monkeypatch.setattr(get_settings(), "use_inprocess_pubsub", True)
+
+
+@pytest.fixture
 def sansio_launch(monkeypatch):
     monkeypatch.setattr(sys, "argv", [sys.argv[0], "--ws", "websockets-sansio"])
 

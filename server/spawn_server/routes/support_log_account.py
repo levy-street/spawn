@@ -7,7 +7,7 @@ import math
 from datetime import UTC, timedelta
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
@@ -16,7 +16,9 @@ from .. import auth, data_events, schemas, support_consent
 from ..db import get_session, get_sessionmaker
 from ..models import BrowserDevice, Host, SupportLogConsent, User, _utcnow
 from ..models import SupportLogCollection as Collection
+from ..schemas import SupportLogError
 from ..support_consent import ConsentError, ConsentReason
+from ..support_log_files import finish_job
 from .support_log import bounded_body
 
 router = APIRouter(prefix="/api/support-log", tags=["support-log"])
@@ -24,6 +26,7 @@ MAX_STATEMENT_BYTES = 64 * 1024
 # Only overlapping requests share a lock. The single server worker is the only
 # statement writer. The locks carry no timestamps or history across requests.
 _write_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_publish_tasks: set[asyncio.Task[None]] = set()
 
 
 async def account_state(owner: str, db: AsyncSession):
@@ -96,7 +99,7 @@ async def account_state(owner: str, db: AsyncSession):
         statement=statement,
         sharing=sharing,
         next_issued_at_ms=next_time,
-        hosts=hosts.mappings().all(),
+        hosts=[dict(row) for row in hosts.mappings()],
         collections=collections,
         retention_days=7,
     )
@@ -106,7 +109,8 @@ async def account_state(owner: str, db: AsyncSession):
 async def get_support_log(
     user: User = Depends(auth.current_user), db: AsyncSession = Depends(get_session)
 ):
-    return await account_state(user.id, db)
+    async with db:
+        return await account_state(user.id, db)
 
 
 async def read_statement(request: Request):
@@ -163,7 +167,9 @@ _REFUSAL_STATUS = {
 }
 
 
-async def store_choice(owner, raw, enabled):
+async def store_and_notify(
+    owner: str, raw: bytes, enabled: bool, wake: asyncio.Event, origin: str | None
+) -> None:
     consent = SupportLogConsent
     async with get_sessionmaker()() as db:
         current = (
@@ -189,7 +195,7 @@ async def store_choice(owner, raw, enabled):
     try:
         if current is not None and not current.enabled and not enabled:
             await verify_repeated_off(owner, raw)
-            return False
+            return
         # Withdrawal marks collected rows in this commit. The orphan sweep
         # removes their files, so the account route needs no store handle.
         await support_consent.store_statement(owner, raw)
@@ -198,13 +204,28 @@ async def store_choice(owner, raw, enabled):
         if exc.reason == ConsentReason.STALE_STATEMENT:
             detail["issued_at_ms"] = current.issued_at_ms
         raise HTTPException(_REFUSAL_STATUS[exc.reason], detail) from None
-    return True
+    wake.set()
+    task = asyncio.create_task(
+        data_events.publish_data_changed(owner, data_events.SUPPORT_LOG_RESOURCE, origin=origin)
+    )
+    _publish_tasks.add(task)
+    task.add_done_callback(_publish_tasks.discard)
 
 
 @router.put(
     "/consent",
     response_model=schemas.SupportLogAccountOut,
     response_model_exclude_unset=True,
+    responses={
+        400: {"model": SupportLogError[schemas.InvalidConsentSignature]},
+        401: {"model": SupportLogError[str]},
+        403: {"model": SupportLogError[schemas.ConsentSignerRefusal]},
+        408: {"model": SupportLogError[schemas.ConsentReceiveTimeout]},
+        409: {"model": SupportLogError[schemas.StaleConsent]},
+        413: {"model": SupportLogError[schemas.ConsentBodyTooLarge]},
+        422: {"model": SupportLogError[schemas.InvalidConsentStatement]},
+        429: {"model": SupportLogError[schemas.ConsentCooldown]},
+    },
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -216,7 +237,6 @@ async def store_choice(owner, raw, enabled):
 )
 async def put_support_consent(
     request: Request,
-    background: BackgroundTasks,
     user: User = Depends(auth.current_user),
     db: AsyncSession = Depends(get_session),
 ):
@@ -225,14 +245,10 @@ async def put_support_consent(
     raw, body = await read_statement(request)
     if body.account_id != owner:
         raise HTTPException(403, {"code": ConsentReason.ACCOUNT_MISMATCH})
+    wake = request.app.state.support_log_pump.wake
+    origin = data_events._bounded(request.headers.get("x-spawn-client"))
     async with _write_locks.setdefault(owner, asyncio.Lock()):
-        if await store_choice(owner, raw, body.enabled):
-            request.app.state.support_log_pump.wake.set()
-            origin = data_events._bounded(request.headers.get("x-spawn-client"))
-            background.add_task(
-                data_events.publish_data_changed,
-                owner,
-                data_events.SUPPORT_LOG_RESOURCE,
-                origin=origin,
-            )
-    return await account_state(owner, db)
+        # Defer request cancellation until a committed write has scheduled its notification.
+        await finish_job(store_and_notify(owner, raw, body.enabled, wake, origin))
+    async with db:
+        return await account_state(owner, db)

@@ -43,9 +43,9 @@ def sign(statement, key):
     return value
 
 
-async def seed_statement(*, enabled=True, issued=1000):
+async def seed_signer(*, enabled, issued, owner=None):
     key = Ed25519PrivateKey.generate()
-    user_id, device_id = str(uuid.uuid4()), str(uuid.uuid4())
+    user_id, device_id = owner or str(uuid.uuid4()), str(uuid.uuid4())
     value = dict(
         version=1,
         account_id=user_id,
@@ -56,8 +56,9 @@ async def seed_statement(*, enabled=True, issued=1000):
         carried_endorsements=[],
     )
     async with get_sessionmaker()() as session:
-        session.add(User(id=user_id, email=uuid.uuid4().hex, password_hash="unused"))
-        await session.flush()
+        if owner is None:
+            session.add(User(id=user_id, email=uuid.uuid4().hex, password_hash="unused"))
+            await session.flush()
         session.add(
             BrowserDevice(
                 id=device_id,
@@ -67,8 +68,12 @@ async def seed_statement(*, enabled=True, issued=1000):
             )
         )
         await session.commit()
-    value = sign(value, key)
-    await store_statement(user_id, value, clock_ms=issued)
+    return sign(value, key), key
+
+
+async def seed_statement(*, enabled=True, issued=1000):
+    value, key = await seed_signer(enabled=enabled, issued=issued)
+    await store_statement(value["account_id"], value, clock_ms=issued)
     return value, key
 
 

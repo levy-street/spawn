@@ -4,19 +4,20 @@ import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import DEFAULT, AsyncMock, Mock, patch
 
 import pytest
+from aiosqlite import Connection
 from sqlalchemy import delete, update
 
 from spawn_server import auth, data_events, main, support_consent, support_log_retention
 from spawn_server.config import get_settings
-from spawn_server.db import get_sessionmaker
+from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogCollection, SupportLogConsent, User
 from spawn_server.redis import get_backend, user_alert_channel
 from spawn_server.routes import support_log_account as route
 from spawn_server.support_log import get_collection, mark_dispatched, transition
-from tests.test_support_consent import VECTORS, seed_statement, sign
+from tests.test_support_consent import VECTORS, seed_signer, seed_statement, sign
 from tests.test_support_log_retention import lifespan_db as lifespan_db
 from tests.test_support_log_uploads import raw_request, seed_request
 
@@ -25,7 +26,7 @@ CONSENT = STATE + "/consent"
 
 
 @pytest.fixture
-def server(lifespan_db, tmp_path, monkeypatch):
+def server(inprocess_pubsub, lifespan_db, tmp_path, monkeypatch):
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
     monkeypatch.setattr(main.SupportLogPump, "run_once", AsyncMock())
     monkeypatch.setattr(support_log_retention, "sweep_once", AsyncMock())
@@ -47,6 +48,20 @@ def clock(monkeypatch):
     monkeypatch.setattr(support_consent, "_utcnow", clock)
     monkeypatch.setattr(support_consent, "now_ms", lambda: int(clock().timestamp() * 1000))
     return clock
+
+
+@pytest.fixture
+def wake(ready):
+    event = ready.state.support_log_pump.wake
+    with patch.object(event, "set", wraps=event.set) as spy:
+        yield spy
+
+
+@pytest.fixture
+def publish(monkeypatch):
+    spy = AsyncMock(wraps=data_events.publish_data_changed)
+    monkeypatch.setattr(data_events, "publish_data_changed", spy)
+    return spy
 
 
 async def request(app, owner, body=None):
@@ -111,6 +126,57 @@ async def test_ready_routes_require_session(ready):
     for method, path in (("GET", STATE), ("PUT", CONSENT)):
         status, _, reads = await raw_request(ready, "", method=method, path=path)
         assert (status, reads) == (401, 0)
+
+
+async def test_openapi_describes_consent_refusals(ready):
+    spec = ready.openapi()
+    responses = spec["paths"][CONSENT]["put"]["responses"]
+
+    def resolve(schema):
+        if "$ref" in schema:
+            return spec["components"]["schemas"][schema["$ref"].split("/")[-1]]
+        return schema
+
+    for status in ("400", "401", "403", "408", "409", "413", "422", "429"):
+        error = resolve(responses[status]["content"]["application/json"]["schema"])
+        assert error["required"] == ["detail"]
+        detail = resolve(error["properties"]["detail"])
+        if status == "401":
+            assert detail["type"] == "string"
+            continue
+        assert detail["type"] == "object"
+        assert detail["properties"]["code"]["type"] == "string"
+        field = {"409": "issued_at_ms", "429": "retry_after_seconds"}.get(status)
+        assert set(detail["required"]) == ({"code", field} if field else {"code"})
+        if field:
+            assert detail["properties"][field]["type"] == "integer"
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+async def test_held_response_has_returned_its_connection(ready, method):
+    value, key = await seed_statement()
+    off = sign({**value, "enabled": False}, key)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def held_app(scope, receive, send):
+        async def held_send(message):
+            if message["type"] == "http.response.start":
+                started.set()
+                await release.wait()
+            await send(message)
+
+        await ready(scope, receive, held_send)
+
+    response = asyncio.create_task(
+        request(held_app, value["account_id"], off if method == "PUT" else None)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 30)
+        assert get_engine().sync_engine.pool.checkedout() == 0
+    finally:
+        release.set()
+        status, _ = await response
+    assert status == 200
 
 
 async def test_only_the_owners_metadata_is_visible(ready, clock):
@@ -311,7 +377,7 @@ async def test_stores_exact_carried_set_and_defaults_missing_set(ready):
 
 
 @pytest.mark.parametrize("already_off", [True, False])
-async def test_refusals_and_account_binding(ready, clock, already_off):
+async def test_refusals_and_account_binding(ready, clock, already_off, wake, publish):
     value, key = await seed_statement(enabled=not already_off)
     owner = value["account_id"]
     other, other_key = await seed_statement(enabled=False)
@@ -353,6 +419,8 @@ async def test_refusals_and_account_binding(ready, clock, already_off):
         )
         await db.commit()
     await refused(off, 403, "signer_removed")
+    wake.assert_not_called()
+    publish.assert_not_called()
 
 
 async def test_malformed_envelopes(ready):
@@ -403,7 +471,9 @@ async def test_size_refused_before_parsing(ready, monkeypatch, declared):
     parser.assert_not_called()
 
 
-async def test_withdrawal_effects_and_notifications_only_after_a_write(ready, clock, monkeypatch):
+async def test_withdrawal_effects_and_notifications_only_after_a_write(
+    ready, clock, wake, monkeypatch
+):
     value, key = await seed_statement()
     owner = value["account_id"]
     async with get_sessionmaker()() as db:
@@ -421,9 +491,9 @@ async def test_withdrawal_effects_and_notifications_only_after_a_write(ready, cl
 
     def after_commit():
         assert support_consent.statement_generation(owner) == generation + 1
+        return DEFAULT
 
-    wake = Mock(side_effect=after_commit)
-    monkeypatch.setattr(ready.state.support_log_pump.wake, "set", wake)
+    wake.side_effect = after_commit
     publish = AsyncMock(wraps=get_backend().publish_channel)
     monkeypatch.setattr(get_backend(), "publish_channel", publish)
     status, state = await request(ready, owner, off)
@@ -434,6 +504,8 @@ async def test_withdrawal_effects_and_notifications_only_after_a_write(ready, cl
     record = await get_collection(collected)
     assert record.state == "deleted" and record.deleted_at is not None
     assert await support_consent.get_statement(owner) == off
+    wake.assert_called_once_with()
+    publish.assert_awaited_once()
     stored_time = clock()
     clock.return_value += timedelta(seconds=5)
     # A newer signed off also leaves the timestamp floor and cooldown intact.
@@ -457,27 +529,110 @@ async def test_withdrawal_effects_and_notifications_only_after_a_write(ready, cl
     assert data_events.forwardable_data_frame(event) == event
 
 
-async def test_pacing_before_signature_and_after_server_restart(server, clock, monkeypatch):
-    first_app = server()
-    async with main.lifespan(first_app):
-        value, key = await seed_statement()
-        owner = value["account_id"]
-        await clear_statement(owner)
-        assert (await request(first_app, owner, value))[0] == 200
-        newer = sign({**value, "issued_at_ms": value["issued_at_ms"] + 1}, key)
-        with monkeypatch.context() as patch:
-            verifier = Mock(side_effect=AssertionError)
-            patch.setattr(support_consent, "verify_statement", verifier)
-            assert await request(first_app, owner, newer) == (
-                429,
-                {"detail": {"code": "rate_limited", "retry_after_seconds": 60}},
-            )
-            verifier.assert_not_called()
-        clock.return_value += timedelta(seconds=2)
-        assert (await request(first_app, owner, sign({**value, "enabled": False}, key)))[0] == 200
+async def test_cancel_during_commit_keeps_lock_and_notifies(ready, monkeypatch, wake, publish):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    off = sign({**value, "enabled": False}, key)
+    entered, release = asyncio.Event(), asyncio.Event()
+    commit = Connection.commit
 
-    # New lifespan, engine, broker and pump. Only the stored off's updated_at
-    # can distinguish 59.001 seconds from the exact 60-second boundary.
+    async def held_commit(connection):
+        entered.set()
+        await release.wait()
+        await commit(connection)
+
+    monkeypatch.setattr(Connection, "commit", held_commit)
+    writer = asyncio.create_task(request(ready, owner, off))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        writer.cancel()
+        await asyncio.sleep(0)  # Deliver cancellation while the commit is still blocked.
+        assert not writer.done() and route._write_locks[owner].locked()
+        wake.assert_not_called()
+        publish.assert_not_called()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+    assert await support_consent.get_statement(owner) == off
+    wake.assert_called_once_with()
+    publish.assert_awaited_once_with(owner, data_events.SUPPORT_LOG_RESOURCE, origin="app")
+
+
+@pytest.mark.parametrize("failure", ["readback", "serialization"])
+async def test_response_failure_preserves_commit_and_notifications(
+    ready, monkeypatch, wake, publish, failure
+):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    off = sign({**value, "enabled": False}, key)
+    release = asyncio.Event()
+
+    async def held_publish(*args, **kwargs):
+        await release.wait()
+
+    publish.side_effect = held_publish
+
+    async def fail(*args, **kwargs):
+        wake.assert_called_once_with()
+        publish.assert_called_once_with(owner, data_events.SUPPORT_LOG_RESOURCE, origin="app")
+        assert len(route._publish_tasks) == 1
+        raise RuntimeError(failure)
+
+    if failure == "readback":
+        monkeypatch.setattr(route, "account_state", fail)
+    else:
+        monkeypatch.setattr("fastapi.routing.serialize_response", fail)
+    try:
+        with pytest.raises(RuntimeError, match=failure):
+            await asyncio.wait_for(request(ready, owner, off), 30)
+        assert await support_consent.get_statement(owner) == off
+    finally:
+        release.set()
+        await asyncio.gather(*route._publish_tasks)
+    publish.assert_awaited_once()
+
+
+async def test_pacing_before_signature(ready, clock, monkeypatch, wake, publish):
+    value, key = await seed_signer(enabled=True, issued=1000)
+    owner = value["account_id"]
+    assert (await request(ready, owner, value))[0] == 200
+    newer = sign({**value, "issued_at_ms": value["issued_at_ms"] + 1}, key)
+    with monkeypatch.context() as patch:
+        verifier = Mock(side_effect=AssertionError)
+        patch.setattr(support_consent, "verify_statement", verifier)
+        assert await request(ready, owner, newer) == (
+            429,
+            {"detail": {"code": "rate_limited", "retry_after_seconds": 60}},
+        )
+        verifier.assert_not_called()
+    wake.assert_called_once_with()
+    publish.assert_awaited_once()
+    clock.return_value += timedelta(seconds=2)
+    assert (await request(ready, owner, sign({**value, "enabled": False}, key)))[0] == 200
+
+
+async def test_pacing_after_restart_with_another_current_device(server, clock):
+    async with main.lifespan(server()):
+        stored, _ = await seed_signer(enabled=False, issued=1000)
+        owner = stored["account_id"]
+        newer, key = await seed_signer(enabled=True, issued=1001, owner=owner)
+        async with get_sessionmaker()() as db:
+            db.add(
+                SupportLogConsent(
+                    owner_user_id=owner,
+                    enabled=stored["enabled"],
+                    issued_at_ms=stored["issued_at_ms"],
+                    signer_device_id=stored["signer_device_id"],
+                    signed_device_id=stored["signer_device_id"],
+                    signer_public_key=stored["signer_public_key"],
+                    signature=stored["signature"],
+                    carried_endorsements=stored["carried_endorsements"],
+                    updated_at=clock(),
+                )
+            )
+            await db.commit()
+
     second_app = server()
     async with main.lifespan(second_app):
         clock.return_value += timedelta(seconds=59, milliseconds=1)
@@ -486,7 +641,8 @@ async def test_pacing_before_signature_and_after_server_restart(server, clock, m
             {"detail": {"code": "rate_limited", "retry_after_seconds": 1}},
         )
         clock.return_value += timedelta(milliseconds=999)
-        assert (await request(second_app, owner, newer))[0] == 200
+        status, result = await request(second_app, owner, newer)
+        assert status == 200 and result["statement"]["signer_device_id"] == newer["signer_device_id"]
         clock.return_value += timedelta(seconds=61)
         newest = sign({**newer, "issued_at_ms": newer["issued_at_ms"] + 1}, key)
         assert (await request(second_app, owner, newest))[0] == 200

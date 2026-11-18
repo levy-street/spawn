@@ -19,6 +19,8 @@ from spawn_server.ws.daemon import daemon_ws
 from tests.test_support_consent import VECTORS, seed_statement, sign
 from tests.test_ws_daemon import FakeDaemonWebSocket, _create_host
 
+pytestmark = pytest.mark.usefixtures("inprocess_pubsub")
+
 
 async def registration_trace(app, *, flag=True):
     statement, _ = await seed_statement()
