@@ -1,5 +1,6 @@
 """Operator commands use only the configured store and database."""
 
+import hashlib
 import json
 import uuid
 from datetime import timedelta
@@ -22,8 +23,10 @@ from tests.test_support_log_uploads import BODY
 
 
 @pytest.fixture
-def configured(tmp_path, monkeypatch):
+async def configured(tmp_path, monkeypatch):
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
+    store = await prepare_store()
+    store.close()
 
 
 def collect(owner, host):
@@ -71,6 +74,8 @@ async def test_collect_usage_and_private_errors(app, configured, monkeypatch, ca
         collect("", "") + ["--by", "operator", "--reason", "x" * 201],
         collect("", "") + ["--by", "operator", "--wait", "-1"],
         collect("", "") + ["--by", "operator", "--hours", "nan"],
+        collect("", "") + ["--by", "operator", "--hours", "73"],
+        collect("", "") + ["--by", "operator", "--wait", "9" * 400],
     ]:
         with no_statements():
             assert (await output(argv, capsys, 2))["error"]
@@ -143,7 +148,7 @@ async def test_collect_lookup_status_list_and_limits(app, configured, monkeypatc
         await db.commit()
     monkeypatch.setenv("SPAWN_SUPPORT_LOG_BY", "from environment")
     argv = collect(user.email.upper(), name)
-    made = await output([*argv, "--hours", "73", "--by", "from argument"], capsys)
+    made = await output([*argv, "--hours", "72", "--by", "from argument"], capsys)
     record = await get_collection(made["id"])
     assert made["state"] == "requested" and record.host_id == host and record.host_name == name
     assert record.reason == argv[-1] and record.requested_by == "from argument"
@@ -205,7 +210,10 @@ async def test_show_checks_record_file_expiry_and_purge(app, configured, capsys)
     assert "no collected bundle" in (await output(["show", queued], capsys, 9))["error"]
     now = _utcnow()
     assert await mark_dispatched(queued)
-    assert await transition(queued, "dispatched", "collected", expires_at=now + timedelta(days=7))
+    assert await transition(
+        queued, "dispatched", "collected", expires_at=now + timedelta(days=7),
+        digest=hashlib.sha256(BODY).hexdigest(), size_bytes=len(BODY), line_count=1,
+    )
     assert "file is missing" in (await output(["show", queued], capsys, 9))["error"]
     store = await prepare_store()
     store.write(queued, BODY)
@@ -213,9 +221,138 @@ async def test_show_checks_record_file_expiry_and_purge(app, configured, capsys)
     assert await cli.run(["show", queued, "--raw"]) == 0
     assert capsys.readouterr().out.encode() == BODY
     assert await cli.run(["show", queued]) == 0
-    assert '"format": 3' in capsys.readouterr().out
+    assert capsys.readouterr().out.encode() == BODY
     await age_record(queued, expires_at=now)
     assert "expired" in (await output(["show", queued], capsys, 9))["error"]
     assert await cli.run(["purge"]) == 0
     assert "finished" in capsys.readouterr().out
     assert (await get_collection(queued)).state == "deleted" and not store.path(queued).exists()
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "damage", ["truncated", "swapped", "symlink", "oversized", "newline", "array"]
+)
+async def test_show_verifies_entire_file_before_output(app, configured, capsys, damage):
+    from spawn_server.routes.support_log import MAX_BUNDLE
+
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    record = await request(owner, await capable(owner))
+    assert await mark_dispatched(record)
+    store = await prepare_store()
+    path = store.path(record)
+    contents = BODY
+    expected = BODY
+    if damage == "swapped":
+        other = await request(owner, await capable(owner))
+        await mark_dispatched(other)
+        contents = BODY.replace(b'"event":1', b'"event":2')
+        await transition(
+            other,
+            "dispatched",
+            "collected",
+            size_bytes=len(contents),
+            digest=hashlib.sha256(contents).hexdigest(),
+            line_count=1,
+            expires_at=_utcnow() + timedelta(days=1),
+        )
+        store.write(other, contents)
+        contents = store.path(other).read_bytes()
+    elif damage == "truncated":
+        contents = b'{"format":3}\n'
+    elif damage == "oversized":
+        contents = expected = b'{"value":"' + b"x" * MAX_BUNDLE + b'"}\n'
+    elif damage == "newline":
+        contents = expected = BODY.rstrip(b"\n")
+    elif damage == "array":
+        contents = expected = b'{"format":3}\n[]\n'
+    if damage == "symlink":
+        target = store.root / "target"
+        target.write_bytes(contents)
+        path.symlink_to(target)
+    else:
+        path.write_bytes(contents)
+    store.close()
+    assert await transition(
+        record,
+        "dispatched",
+        "collected",
+        size_bytes=len(expected),
+        digest=hashlib.sha256(expected).hexdigest(),
+        line_count=1,
+        expires_at=_utcnow() + timedelta(days=1),
+    )
+    for options in ([], ["--raw"]):
+        assert await cli.run(["show", record, *options]) == 9
+        captured = capsys.readouterr()
+        assert not captured.out and captured.err == "The bundle failed verification.\n"
+
+
+async def test_show_escapes_controls_and_raw_requires_redirection(
+    app, configured, capsys, monkeypatch
+):
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    record = await request(owner, await capable(owner))
+    event = {"event": "\x1b\n\r\t\x7f\x85\u202e"}
+    body = b"{}\n" + json.dumps(event, ensure_ascii=False).encode() + b"\n"
+    await mark_dispatched(record)
+    await transition(
+        record,
+        "dispatched",
+        "collected",
+        size_bytes=len(body),
+        digest=hashlib.sha256(body).hexdigest(),
+        line_count=1,
+        expires_at=_utcnow() + timedelta(days=1),
+    )
+    store = await prepare_store()
+    store.write(record, body)
+    store.close()
+    assert await cli.run(["show", record]) == 0
+    assert capsys.readouterr().out == "{}\n" + json.dumps(event, ensure_ascii=True) + "\n"
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    assert await cli.run(["show", record, "--raw"]) == 2
+    captured = capsys.readouterr()
+    assert not captured.out and "pipe or a file" in captured.err
+
+
+async def test_unrelated_directory_is_untouched_by_commands_startup_and_sweep(
+    app, monkeypatch, tmp_path, capsys
+):
+    import os
+
+    from spawn_server.support_log_files import SupportLogFiles
+    from spawn_server.support_log_retention import sweep_once
+
+    root = tmp_path / "unrelated"
+    monkeypatch.setattr(get_settings(), "support_log_dir", str(root))
+    assert await cli.run(["purge"]) == 8
+    assert not root.exists()
+    capsys.readouterr()
+    root.mkdir(mode=0o755)
+    old = root / f"{uuid.uuid4()}.ndjson"
+    old.write_bytes(BODY)
+    os.utime(old, (1, 1))
+    before = root.stat()
+    for argv in [
+        ["accounts"],
+        collect("", "") + ["--by", "operator"],
+        ["status", ""],
+        ["list"],
+        ["show", ""],
+        ["purge"],
+    ]:
+        with no_statements():
+            await output(argv, capsys, 8)
+    assert await prepare_store() is None
+    store = SupportLogFiles(root)
+    try:
+        with no_statements(), pytest.raises(OSError):
+            await sweep_once(store)
+    finally:
+        store.close()
+    assert list(root.iterdir()) == [old] and old.read_bytes() == BODY
+    after = root.stat()
+    assert (before.st_mode, before.st_ctime_ns) == (after.st_mode, after.st_ctime_ns)

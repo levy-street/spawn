@@ -11,7 +11,14 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import delete, event
 
-from spawn_server import auth, main, support_consent, support_log_dispatch, support_log_files
+from spawn_server import (
+    auth,
+    main,
+    support_consent,
+    support_delivery,
+    support_log_dispatch,
+    support_log_files,
+)
 from spawn_server.config import get_settings
 from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogCollection, _utcnow
@@ -23,13 +30,13 @@ from spawn_server.support_log import (
     get_collection,
     transition,
 )
-from spawn_server.support_log_dispatch import SupportLogPump, support_log_consent_changed
+from spawn_server.support_log_dispatch import SupportLogPump
 from tests.test_support_consent import seed_statement, sign
-from tests.test_support_log_registration import connected, pump
+from tests.test_support_log_registration import connected, pump, temporary_prebuilts
 from tests.test_support_log_retention import age_record, lifespan_db
 from tests.test_support_log_uploads import BODY, raw_request
 
-__all__ = ["lifespan_db", "pump"]
+__all__ = ["lifespan_db", "pump", "temporary_prebuilts"]
 
 
 async def request(owner, host, **kwargs):
@@ -179,7 +186,10 @@ async def test_scan_once_empty_uses_state_index(app, pump):
     assert len(sql) == 1
     async with engine.connect() as db:
         plan = await db.exec_driver_sql("EXPLAIN QUERY PLAN " + sql[0][0], sql[0][1])
-        assert any("ix_support_log_state_requested" in row[-1] for row in plan)
+        assert any(
+            "SEARCH support_log_collections USING INDEX ix_support_log_state_requested" in row[-1]
+            for row in plan
+        )
 
 
 @pytest.mark.parametrize("off", ["signed", "removed"])
@@ -212,9 +222,6 @@ async def test_change_races_collect_and_only_current_statement_can_dispatch(app,
     newer = sign({**value, "issued_at_ms": 1001}, key)
     async with connected(app, owner, host, supports_support_log=True) as (ws, frames, conn):
         assert frames.get_nowait()["support_log_consent"] == value
-        await store_statement(owner, newer)
-        await pump.run_once()  # The signed on changed, but its push has not started.
-        assert frames.empty() and (await get_collection(record_id)).state == "requested"
         started, release, dispatch_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
         send = ws.send_text
 
@@ -225,15 +232,15 @@ async def test_change_races_collect_and_only_current_statement_can_dispatch(app,
             await send(wire)
 
         monkeypatch.setattr(ws, "send_text", held_push)
-        monkeypatch.setattr("spawn_server.ws.daemon.HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS", 30)
-        push = asyncio.create_task(support_log_consent_changed(app, owner))
+        monkeypatch.setattr(support_delivery, "SEND_SECONDS", 30)
+        push = asyncio.create_task(store_statement(owner, newer))
         await asyncio.wait_for(started.wait(), 30)
 
         def observe_lock(owner):
             dispatch_waiting.set()
-            return support_consent.delivery_lock(owner)
+            return support_consent.delivery_order(owner)
 
-        monkeypatch.setattr(support_log_dispatch, "delivery_lock", observe_lock)
+        monkeypatch.setattr(support_log_dispatch, "delivery_order", observe_lock)
         dispatch = asyncio.create_task(pump.run_once())
         try:
             await asyncio.wait_for(dispatch_waiting.wait(), 30)
@@ -273,10 +280,11 @@ async def test_failed_send_is_never_retried_and_next_record_proceeds(
             broken.assert_awaited_once()
             from spawn_server.support_log_retention import sweep_once
 
-            await sweep_once(
-                support_log_files.SupportLogFiles(tmp_path),
-                now=now + timedelta(minutes=5, seconds=1),
-            )
+            store = support_log_files._store(str(tmp_path / "bundles"))
+            try:
+                await sweep_once(store, now=now + timedelta(minutes=5, seconds=1))
+            finally:
+                store.close()
             assert (await get_collection(failed)).state == "failed"
 
 
@@ -449,7 +457,7 @@ async def test_store_racing_a_claimed_send_has_no_write_transaction_to_wait_for(
     queued = await request(owner, host)
     off = sign({**value, "enabled": False}, key)
     started, release, store_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    monkeypatch.setattr("spawn_server.ws.daemon.HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(support_delivery, "SEND_SECONDS", 30)
     async with connected(app, owner, host, supports_support_log=True) as (ws, frames, _):
         assert frames.get_nowait()["support_log_consent"] == value
         send = ws.send_text
@@ -465,14 +473,14 @@ async def test_store_racing_a_claimed_send_has_no_write_transaction_to_wait_for(
         try:
             await asyncio.wait_for(started.wait(), 30)
             assert (await get_collection(queued)).state == "dispatched"
-            lock = support_consent.delivery_lock
+            lock = support_consent.delivery_order
 
             def observe_store(account):
                 if account == owner:
                     store_waiting.set()
                 return lock(account)
 
-            monkeypatch.setattr(support_consent, "delivery_lock", observe_store)
+            monkeypatch.setattr(support_consent, "delivery_order", observe_store)
             withdrawal = asyncio.create_task(store_statement(owner, off))
             await asyncio.wait_for(store_waiting.wait(), 30)
             # An unrelated writer can commit while this socket is held.
@@ -481,7 +489,6 @@ async def test_store_racing_a_claimed_send_has_no_write_transaction_to_wait_for(
         finally:
             release.set()
         await asyncio.wait_for(asyncio.gather(withdrawal, dispatch), 30)
-        await support_log_consent_changed(app, owner)
         assert frames.get_nowait()["request_id"] == queued
         assert frames.get_nowait() == {"type": "host.support_log_consent", "consent": off}
 
@@ -499,9 +506,8 @@ async def test_expired_request_never_dispatched_and_failed_push_does_not_enable(
         await pump.run_once(now=now)
         assert frames.empty() and (await get_collection(queued)).state == "requested"
         await age_record(queued, requested_at=now)
-        await store_statement(owner, sign({**value, "issued_at_ms": 1001}, key))
         monkeypatch.setattr(ws, "send_text", AsyncMock(side_effect=OSError))
-        await support_log_consent_changed(app, owner)
+        await store_statement(owner, sign({**value, "issued_at_ms": 1001}, key))
         assert conn.support_enabled_sent_ms is None
         await pump.run_once(now=now)
         assert frames.empty() and (await get_collection(queued)).state == "requested"
@@ -526,23 +532,348 @@ async def test_periodic_pass_uses_ten_second_timer(pump, monkeypatch):
     assert timeouts == [10] and len(passes) == 2
 
 
-async def test_full_registration_over_wire_limit_preserves_fields_and_holds_collect(
-    app, pump, monkeypatch
+@pytest.mark.parametrize("cancel_writer", [False, True])
+async def test_two_writers_deliver_each_statement_once_to_both_hosts(
+    app, pump, monkeypatch, cancel_writer
+):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    off = sign({**value, "enabled": False}, key)
+    on = sign({**value, "issued_at_ms": 1001}, key)
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async with AsyncExitStack() as stack:
+        sockets = [
+            await stack.enter_async_context(
+                connected(app, owner, await capable(owner), supports_support_log=True)
+            )
+            for _ in range(2)
+        ]
+        ws = sockets[0][0]
+        original = ws.send_text
+
+        async def held(wire):
+            if json.loads(wire).get("consent") == off:
+                entered.set()
+                await release.wait()
+            await original(wire)
+
+        monkeypatch.setattr(ws, "send_text", held)
+        monkeypatch.setattr(support_delivery, "SEND_SECONDS", 30)
+        first = asyncio.create_task(store_statement(owner, off))
+        await asyncio.wait_for(entered.wait(), 30)
+        if cancel_writer:
+            first.cancel()
+        original_order = support_consent.delivery_order
+
+        def observe(owner):
+            waiting.set()
+            return original_order(owner)
+
+        monkeypatch.setattr(support_consent, "delivery_order", observe)
+        second = asyncio.create_task(store_statement(owner, on))
+        try:
+            await asyncio.wait_for(waiting.wait(), 30)
+            assert not second.done()
+            assert await support_consent.get_statement(owner) == off
+        finally:
+            release.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 30)
+        assert results[1] == on
+        assert isinstance(results[0], asyncio.CancelledError) if cancel_writer else results[0] == off
+        for _, frames, _ in sockets:
+            assert frames.get_nowait()["type"] == "registered"
+            assert [frames.get_nowait()["consent"] for _ in range(2)] == [off, on]
+            assert frames.empty()
+
+
+async def test_stalled_host_misses_delivery_until_reconnect(app, pump, monkeypatch):
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    host = await capable(owner)
+    first = await request(owner, host)
+    other = await capable(owner)
+    async with connected(app, owner, host, supports_support_log=True) as (ws, _, conn):
+        async with connected(app, owner, other, supports_support_log=True) as (_, frames, _):
+            frames.get_nowait()
+            entered = asyncio.Event()
+            deadlines = []
+            real_timeout = asyncio.timeout
+
+            def observe_timeout(seconds):
+                deadline = real_timeout(seconds)
+                if seconds == support_delivery.SEND_SECONDS:
+                    deadlines.append(deadline)
+                return deadline
+
+            async def stall(wire):
+                entered.set()
+                await asyncio.Future()
+
+            monkeypatch.setattr(ws, "send_text", stall)
+            monkeypatch.setattr(asyncio, "timeout", observe_timeout)
+            on = sign({**value, "issued_at_ms": 1001}, key)
+            send = asyncio.create_task(store_statement(owner, on))
+            await asyncio.wait_for(entered.wait(), 30)
+            assert (await asyncio.wait_for(frames.get(), 30))["consent"] == on
+            for deadline in deadlines:
+                if deadline.when() is not None and not deadline.expired():
+                    try:
+                        deadline.reschedule(asyncio.get_running_loop().time())
+                    except RuntimeError:  # The healthy host's deadline has exited.
+                        pass
+            await asyncio.wait_for(send, 30)
+            assert not conn.support_delivery_ready
+            await pump.run_once()
+            assert (await get_collection(first)).state == "requested"
+            await store_statement(owner, sign({**on, "issued_at_ms": 1002}, key))
+            assert not conn.support_delivery_ready
+    async with connected(app, owner, host, supports_support_log=True) as (_, frames, _):
+        assert frames.get_nowait()["support_log_consent"]["issued_at_ms"] == 1002
+        await pump.run_once()
+        assert frames.get_nowait()["request_id"] == first
+
+
+@pytest.mark.parametrize("route", ["remove", "delete"])
+@pytest.mark.parametrize("order", ["dispatch_first", "reduction_first", "reduction_timeout"])
+async def test_real_removal_and_deletion_order_against_collect(
+    app, file_sqlite_client, pump, tmp_path, monkeypatch, route, order
+):
+    from spawn_server import support_log_retention
+    from spawn_server.db import configure_sqlite_connections
+    from spawn_server.models import AuthIdentity, User
+    from spawn_server.routes import browser_devices
+
+    configure_sqlite_connections(get_engine())
+    await get_engine().dispose()
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await capable(owner)
+    queued = await request(owner, host)
+    async with get_sessionmaker()() as db:
+        user = await db.get(User, owner)
+        db.add(
+            AuthIdentity(
+                user_id=owner, provider="test", provider_user_id=uuid.uuid4().hex, email=user.email
+            )
+        )
+        await db.commit()
+    store = support_log_files._store(str(tmp_path / "bundles"))
+    monkeypatch.setattr(app.state, "support_log_store", store, raising=False)
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observations = []
+    module = browser_devices if route == "remove" else support_log_retention
+    target = "_revoke_device" if route == "remove" else "account_file_ids"
+    mutate = getattr(module, target)
+
+    async def held_mutation(*args):
+        if order == "reduction_first":
+            entered.set()
+            await release.wait()
+        return await mutate(*args)
+
+    monkeypatch.setattr(module, target, held_mutation)
+    original_order = support_delivery.delivery_order
+
+    def observe(owner):
+        waiting.set()
+        return original_order(owner)
+
+    async def reduce():
+        path, body = (
+            (
+                f"/api/browser-devices/{value['signer_device_id']}/revoke",
+                {"expected_public_key": value["signer_public_key"]},
+            )
+            if route == "remove"
+            else ("/api/account/delete", {"confirm_email": user.email})
+        )
+        response = await file_sqlite_client.post(
+            path,
+            json=body,
+            headers={
+                "authorization": f"Bearer {auth.issue_access_token(owner)}",
+            },
+        )
+        assert response.status_code == (200 if route == "remove" else 204)
+
+    async with connected(app, owner, host, supports_support_log=True) as (ws, frames, _):
+        frames.get_nowait()
+        send = ws.send_text
+
+        async def held_collect(wire):
+            if json.loads(wire)["type"] == "support_log.collect":
+                if order != "reduction_first":
+                    entered.set()
+                    await release.wait()
+                observations.append(await support_consent.is_sharing_on(owner))
+            await send(wire)
+
+        monkeypatch.setattr(ws, "send_text", held_collect)
+        monkeypatch.setattr(support_delivery, "SEND_SECONDS", 30)
+        first = asyncio.create_task(reduce() if order == "reduction_first" else pump.run_once())
+        try:
+            await asyncio.wait_for(entered.wait(), 30)
+            if order == "reduction_timeout":
+                monkeypatch.setattr(support_delivery, "ORDER_SECONDS", 0)
+            monkeypatch.setattr(
+                support_log_dispatch if order == "reduction_first" else module,
+                "delivery_order",
+                observe,
+            )
+            second = asyncio.create_task(
+                pump.run_once() if order == "reduction_first" else reduce()
+            )
+            await asyncio.wait_for(waiting.wait(), 30)
+            if order == "reduction_timeout":
+                await asyncio.wait_for(second, 30)
+            else:
+                assert not second.done()
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 30)
+        assert observations == ([True] if order == "dispatch_first" else [])
+        await pump.run_once()
+        assert not await support_consent.is_sharing_on(owner)
+        delivered = [json.loads(wire) for wire in ws.sent_text[1:]]
+        if route == "remove":
+            assert [f["consent"] for f in delivered if f["type"] == "host.support_log_consent"] == [
+                None
+            ]
+        else:
+            assert await get_collection(queued) is None
+        assert sum(f["type"] == "support_log.collect" for f in delivered) == len(observations)
+    store.close()
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+async def test_shutdown_during_paged_backlog_stops_claims(app, pump, monkeypatch, page_size):
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    now = _utcnow()
+    for n in (4, 3):
+        await request(owner, await capable(owner), now=now - timedelta(seconds=n))
+    monkeypatch.setattr(support_log_dispatch, "PAGE_SIZE", page_size)
+    async with AsyncExitStack() as stack:
+        hosts = []
+        for n in (2, 1):
+            host = await capable(owner)
+            ws, frames, _ = await stack.enter_async_context(
+                connected(app, owner, host, supports_support_log=True)
+            )
+            frames.get_nowait()
+            hosts.append((ws, frames, await request(owner, host, now=now - timedelta(seconds=n))))
+        original = hosts[0][0].send_text
+
+        async def stop(wire):
+            await original(wire)
+            pump.stop()
+
+        monkeypatch.setattr(hosts[0][0], "send_text", stop)
+        await pump.run_once(now=now)
+        assert hosts[0][1].get_nowait()["request_id"] == hosts[0][2]
+        assert hosts[1][1].empty() and (await get_collection(hosts[1][2])).state == "requested"
+
+
+@pytest.mark.parametrize("close_by", ["withdrawal", "sweep"])
+async def test_closed_uploads_still_reading_occupy_dispatch_capacity(
+    app, file_sqlite_client, pump, tmp_path, close_by
+):
+    from spawn_server.routes import support_log
+    from spawn_server.support_log import mark_dispatched
+    from spawn_server.support_log_retention import sharing_turned_off, sweep_once
+
+    upload_app = main.create_app()
+    upload_app.include_router(support_log.router)
+    store = support_log_files._store(str(tmp_path / "bundles"))
+    upload_app.state.support_log_store = store
+    upload_app.state.support_log_pump = pump
+    value, key = await seed_statement()
+    owner = value["account_id"]
+    other, _ = await seed_statement()
+    next_owner = other["account_id"]
+    next_host = await capable(next_owner)
+    queued = await request(next_owner, next_host)
+    readers, release = [], asyncio.Event()
+    async with connected(app, next_owner, next_host, supports_support_log=True) as (_, frames, _):
+        frames.get_nowait()
+        try:
+            for _ in range(2):
+                host = await capable(owner)
+                record = await request(owner, host)
+                assert await mark_dispatched(record)
+                entered = asyncio.Event()
+
+                async def receive(entered=entered):
+                    entered.set()
+                    await release.wait()
+                    return {"type": "http.request", "body": BODY, "more_body": False}
+
+                readers.append(
+                    asyncio.create_task(
+                        raw_request(
+                            upload_app,
+                            record,
+                            token=auth.issue_daemon_token(host, owner),
+                            receive_body=receive,
+                        )
+                    )
+                )
+                await asyncio.wait_for(entered.wait(), 30)
+            if close_by == "withdrawal":
+                await store_statement(owner, sign({**value, "enabled": False}, key))
+                await sharing_turned_off(owner, store)
+            else:
+                await sweep_once(store, now=_utcnow() + timedelta(minutes=6))
+            await pump.run_once()
+            assert frames.empty() and (await get_collection(queued)).state == "requested"
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*readers), 30)
+            store.close()
+        assert [r[0] for r in results] == [409, 409]
+        await pump.run_once()
+        assert frames.get_nowait()["request_id"] == queued
+
+
+async def test_replacement_during_claim_never_inherits_a_collect(
+    app, file_sqlite_client, pump, monkeypatch
 ):
     value, _ = await seed_statement()
     owner = value["account_id"]
     host = await capable(owner)
     queued = await request(owner, host)
-    roster = [str(uuid.uuid4()) for _ in range(1800)]
-    monkeypatch.setattr(
-        "spawn_server.ws.daemon._live_browser_device_ids", AsyncMock(return_value=roster)
-    )
-    async with connected(app, owner, host, supports_support_log=True) as (_, frames, conn):
-        registered = frames.get_nowait()
-        assert (
-            registered["browser_device_ids"] == roster
-            and registered["support_log_consent"] == value
-        )
-        assert conn.support_oversized_frame_sent
-        await pump.run_once()
-        assert frames.empty() and (await get_collection(queued)).state == "requested"
+    claimed, release = asyncio.Event(), asyncio.Event()
+    original = support_log_dispatch.mark_dispatched
+
+    async def hold_claim(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        claimed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(support_log_dispatch, "mark_dispatched", hold_claim)
+    async with connected(app, owner, host, supports_support_log=True) as (_, before, old_conn):
+        before.get_nowait()
+        task = asyncio.create_task(pump.run_once())
+        await asyncio.wait_for(claimed.wait(), 30)
+        # The new owner has already taken the socket before it waits for the
+        # account order. Release the claim at exactly that boundary.
+        from spawn_server.ws import daemon
+
+        order = daemon.delivery_order
+
+        def replacement_at_order(user_id):
+            assert daemon.get_broker().get_daemon_for_host(host) is not old_conn
+            release.set()
+            return order(user_id)
+
+        monkeypatch.setattr(daemon, "delivery_order", replacement_at_order)
+        try:
+            async with connected(app, owner, host, supports_support_log=True) as (_, after, _):
+                await asyncio.wait_for(task, 30)
+                assert after.get_nowait()["support_log_consent"] == value
+                assert after.empty() and before.empty()
+                assert (await get_collection(queued)).state == "dispatched"
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 30)

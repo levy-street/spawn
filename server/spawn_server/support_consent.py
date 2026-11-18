@@ -11,7 +11,6 @@ import json
 import time
 import uuid
 from enum import StrEnum
-from weakref import WeakValueDictionary
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -24,24 +23,12 @@ from .browser_registration import decode_ed25519_signature
 from .db import get_sessionmaker
 from .host_identity import _decode_strict_ed25519_point, decode_ed25519_public_key
 from .models import BrowserDevice, SupportLogCollection, SupportLogConsent, User
+from .support_delivery import deliver_statement, delivery_order
 from .ws.signed_signal_relay import sanitize_carried_endorsements
 
 MAGIC = b"SPAWN-SUPPORT-LOG-CONSENT-V1"
 U64_MAX = (1 << 64) - 1
 FUTURE_MS = 86_400_000
-
-
-# A device statement commit and a support send for that account must have a
-# definite order. Only in-flight work retains a lock. No database transaction
-# is held while a socket is sending.
-_delivery_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
-
-
-def delivery_lock(user_id: str) -> asyncio.Lock:
-    lock = _delivery_locks.get(user_id)
-    if lock is None:
-        lock = _delivery_locks[user_id] = asyncio.Lock()
-    return lock
 
 
 class ConsentReason(StrEnum):
@@ -221,11 +208,7 @@ def _envelope(row: SupportLogConsent | None) -> dict | None:
     }
 
 
-def enabled_timestamp(statement: dict | None) -> int | None:
-    return statement["issued_at_ms"] if statement and statement["enabled"] else None
-
-
-async def delivery_snapshot(session, user_id: str, *, registering: bool = False):
+async def delivery_snapshot(session, user_id: str):
     # The outer join returns the wake decision even without a deliverable
     # statement. A signed off remains deliverable after removal of its signer.
     consent = SupportLogConsent
@@ -248,21 +231,20 @@ async def delivery_snapshot(session, user_id: str, *, registering: bool = False)
         )
         .where(User.id == user_id)
     )
-    if registering:
-        query = query.add_columns(
-            exists().where(
-                SupportLogCollection.owner_user_id == user_id,
-                SupportLogCollection.state.in_(("requested", "dispatched")),
-            )
+    query = query.add_columns(
+        exists().where(
+            SupportLogCollection.owner_user_id == user_id,
+            SupportLogCollection.state.in_(("requested", "dispatched")),
         )
+    )
     row = (await session.execute(query)).one_or_none()
     if row is None:
         return None, False
-    return _envelope(row[0]), registering and row[1]
+    return _envelope(row[0]), row[1]
 
 
 async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | None = None):
-    from .models import _utcnow
+    from .support_log_files import finish_job
 
     statement = await asyncio.to_thread(verify_statement, value)
     if statement["account_id"] != user_id:
@@ -270,6 +252,18 @@ async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | 
     clock = now_ms() if clock_ms is None else clock_ms
     if statement["issued_at_ms"] > clock + FUTURE_MS:
         raise ConsentError(ConsentReason.FUTURE_TIMESTAMP)
+    async with delivery_order(user_id).enter(reducing=not statement["enabled"]) as turn:
+        if turn is None:
+            raise TimeoutError("Support log delivery is busy")
+        # A cancelled caller cannot release the order halfway through a commit
+        # or leave its signed withdrawal undelivered on healthy sockets.
+        await finish_job(_commit_and_deliver(turn, user_id, statement))
+    return statement
+
+
+async def _commit_and_deliver(turn, user_id, statement):
+    from .models import _utcnow
+
     values = dict(
         owner_user_id=user_id,
         enabled=statement["enabled"],
@@ -282,7 +276,7 @@ async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | 
         updated_at=_utcnow(),
     )
     table = SupportLogConsent.__table__
-    async with delivery_lock(user_id), get_sessionmaker()() as session:
+    async with get_sessionmaker()() as session:
         insert = sqlite_insert if session.bind.dialect.name == "sqlite" else pg_insert
         # One conditional upsert covers both first-write races and monotonic updates.
         stmt = insert(table).from_select(
@@ -316,4 +310,4 @@ async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | 
                 reason = ConsentReason.STALE_STATEMENT
             raise ConsentError(reason)
         await session.commit()
-    return statement
+    await deliver_statement(turn, user_id, statement)

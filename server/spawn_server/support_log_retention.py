@@ -12,6 +12,7 @@ from sqlalchemy import delete, select, update
 from .db import get_sessionmaker
 from .models import SupportLogCollection as Collection
 from .models import _utcnow
+from .support_delivery import delivery_order
 from .support_log import transition
 from .support_log_files import finish_job
 
@@ -108,7 +109,7 @@ async def sweep_once(store, *, now: datetime | None = None, limit: int = BATCH):
         for name in names:
             if name.endswith(".ndjson") and name.removesuffix(".ndjson") in retained:
                 continue
-            await asyncio.to_thread((store.root / name).unlink, missing_ok=True)
+            await asyncio.to_thread(store.unlink, name)
 
 
 async def sharing_turned_off(user_id: str, store):
@@ -172,7 +173,7 @@ async def account_deletion_files(session, user_id: str, store):
         yield
         return
     await session.commit()
-    async with store.locked():
+    async with delivery_order(user_id).enter(reducing=True), store.locked():
         ids = await account_file_ids(session, user_id, store)
         yield
         for record_id in ids:

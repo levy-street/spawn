@@ -80,7 +80,7 @@ async def test_every_sweep_rule_and_grace(client, storage):
     os.utime(orphan, (old_time, old_time))
     fresh_orphan = storage.path(str(uuid.uuid4()))
     fresh_orphan.write_bytes(BODY)
-    temporary = storage.root / ".upload-incomplete"
+    temporary = storage.root / f".upload-{uuid.uuid4()}.tmp"
     temporary.write_bytes(b"partial")
     os.utime(temporary, (old_time, old_time))
     await sweep_once(storage, now=now)
@@ -107,7 +107,7 @@ async def test_sweep_bounds_and_cursor_make_progress(client, storage):
         records.append(record_id)
     fresh = storage.root / ".fresh"
     fresh.touch()
-    old = storage.root / ".old"
+    old = storage.path(str(uuid.uuid4()))
     old.touch()
     stamp = (now - timedelta(hours=1)).timestamp()
     os.utime(old, (stamp, stamp))
@@ -123,7 +123,7 @@ async def test_sweep_bounds_and_cursor_make_progress(client, storage):
 async def test_orphans_do_not_follow_symlinks_or_remove_subdirectories(client, storage, tmp_path):
     outside = tmp_path / "outside"
     outside.write_bytes(b"preserved")
-    link = storage.root / "link"
+    link = storage.path(str(uuid.uuid4()))
     link.symlink_to(outside)
     stamp = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
     os.utime(link, (stamp, stamp), follow_symlinks=False)
@@ -363,10 +363,14 @@ async def test_bad_configuration_logs_once_and_stays_off(
         monkeypatch.setattr(support_log_files.fcntl, "flock", Mock(side_effect=OSError))
     else:
         directory = str(tmp_path / "storage")
-        monkeypatch.setattr(
-            "spawn_server.support_log_files.tempfile.mkstemp",
-            lambda **_kw: (_ for _ in ()).throw(PermissionError()),
-        )
+        original_open = os.open
+
+        def fail_probe(path, flags, *args, **kwargs):
+            if flags & os.O_CREAT and str(path).startswith(".upload-"):
+                raise PermissionError
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fail_probe)
     monkeypatch.setattr(get_settings(), "support_log_dir", str(directory))
     caplog.set_level(logging.INFO, logger="spawn.support_log")
     app = main.create_app()
@@ -531,3 +535,21 @@ async def test_deletion_fences_a_late_upload(file_sqlite_client, storage, monkey
     assert upload.status_code in {401, 404, 409}
     assert not list(storage.root.iterdir())
     assert await get_collection(record_id) is None
+
+
+async def test_sweep_only_unlinks_store_names_and_rechecks_identity(client, storage):
+    old = storage.path(str(uuid.uuid4()))
+    temporary = storage.root / f".upload-{uuid.uuid4()}.tmp"
+    unrelated = storage.root / "unrelated.ndjson"
+    unrelated_temp = storage.root / ".upload-unrelated"
+    for path in (old, temporary, unrelated, unrelated_temp):
+        path.write_bytes(BODY)
+        os.utime(path, (1, 1))
+    await sweep_once(storage)
+    assert set(storage.root.iterdir()) == {unrelated, unrelated_temp}
+    old.write_bytes(BODY)
+    os.utime(old, (1, 1))
+    os.removexattr(storage.root, support_log_files.STORE_ATTRIBUTE)
+    with pytest.raises(OSError):
+        await sweep_once(storage)
+    assert set(storage.root.iterdir()) == {unrelated, unrelated_temp, old}

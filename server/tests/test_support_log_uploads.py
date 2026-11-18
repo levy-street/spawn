@@ -395,10 +395,11 @@ async def test_atomic_publication_failure(client, storage, monkeypatch, boundary
     record_id, token, statement, key, _host = await setup_request()
     if boundary == "rename":
 
-        def fail_rename(source, destination):
-            assert source != destination and destination == storage.path(record_id)
-            assert not destination.exists()
-            assert stat.S_IMODE(__import__("os").stat(source).st_mode) == 0o600
+        def fail_rename(source, destination, *, src_dir_fd, dst_dir_fd):
+            assert src_dir_fd == dst_dir_fd == storage.fd
+            assert source != destination and destination == storage.path(record_id).name
+            assert not storage.path(record_id).exists()
+            assert stat.S_IMODE((storage.root / source).stat().st_mode) == 0o600
             raise OSError("injected")
 
         monkeypatch.setattr("spawn_server.support_log_files.os.replace", fail_rename)

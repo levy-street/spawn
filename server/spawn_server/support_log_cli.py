@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
+import re
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from .auth import normalize_email
 from .db import dispose_engine, get_sessionmaker
 from .models import Host, SupportLogCollection, User, _utcnow
+from .routes.support_log import MAX_BUNDLE, validate_bundle
 from .support_consent import sharing_on
 from .support_log import (
     OPEN_STATES,
@@ -26,7 +27,7 @@ from .support_log import (
     create_request,
     get_collection,
 )
-from .support_log_files import file_status, prepare_store
+from .support_log_files import open_existing_store
 from .support_log_retention import sweep_once
 
 EXIT_CODES = {
@@ -79,12 +80,14 @@ def arguments(argv):
             raise CommandError(2, "Supply an operator label with --by or SPAWN_SUPPORT_LOG_BY.")
         if not args.reason.strip() or not 1 <= len(args.reason) <= 200:
             raise CommandError(2, "Supply a reason of 1 to 200 characters.")
-        if not math.isfinite(args.hours) or args.hours <= 0 or args.wait < 0:
-            raise CommandError(2, "Supply positive hours and a nonnegative wait.")
+        if not 0 < args.hours <= 72 or not 0 <= args.wait <= 86400:
+            raise CommandError(2, "Supply positive hours up to 72 and a wait of 0 to 86400 seconds.")
     if args.command == "list" and args.days < 1:
         raise CommandError(2, "Supply a positive day count.")
     if args.command == "show" and args.raw and getattr(args, "json", False):
         raise CommandError(2, "Choose one output format.")
+    if args.command == "show" and args.raw and sys.stdout.isatty():
+        raise CommandError(2, "Raw output requires a pipe or a file.")
     return args
 
 
@@ -183,7 +186,7 @@ async def command(args, store):
         async with get_sessionmaker()() as session:
             owner = await account_id(session, args.account)
             host = await resolve_host(session, owner, args.host)
-        seconds = clamp_window(int(min(args.hours, 72) * 3600))
+        seconds = clamp_window(int(args.hours * 3600))
         record_id = await create_request(
             owner_user_id=owner,
             host_id=host,
@@ -219,17 +222,32 @@ async def command(args, store):
                 expiry = expiry.replace(tzinfo=UTC)
             if expiry is None or expiry <= _utcnow():
                 raise CommandError(9, "This bundle has expired.")
-            if await file_status(record, store) != "present":
-                raise CommandError(9, "The bundle file is missing.")
             try:
-                body = await asyncio.to_thread(store.path(record.id).read_bytes)
+                body = await asyncio.to_thread(verified_bundle, store, record)
             except FileNotFoundError:
                 raise CommandError(9, "The bundle file is missing.") from None
-        if args.raw:
-            return body.decode("utf-8")
-        return {"bundle": [json.loads(line) for line in body.split(b"\n")[:-1]]}
+            except (OSError, ValueError, TypeError, RecursionError):
+                raise CommandError(9, "The bundle failed verification.") from None
+        return body
     await sweep_once(store)
     return {"message": "The retention pass finished."}
+
+
+def verified_bundle(store, record):
+    body = store.read(record.id, MAX_BUNDLE)
+    if len(body) > MAX_BUNDLE or len(body) != record.size_bytes:
+        raise ValueError
+    validate_bundle(body, {"digest": record.digest, "line_count": record.line_count})
+    return body
+
+
+def display_bundle(body, as_json):
+    # Framing has already been verified. Literal tabs and carriage returns can
+    # only be JSON whitespace. Escape non-ASCII text and DEL inside strings,
+    # preserving numeric spellings and existing JSON escapes.
+    lines = body.decode("utf-8").replace("\t", " ").replace("\r", " ").split("\n")[:-1]
+    safe = [re.sub(r"[^ -~]+", lambda m: json.dumps(m[0])[1:-1], line) for line in lines]
+    print('{"bundle":[' + ",".join(safe) + "]}" if as_json else "\n".join(safe))
 
 
 async def run(argv):
@@ -238,9 +256,7 @@ async def run(argv):
     try:
         args = arguments(argv)
         as_json = getattr(args, "json", False)
-        store = await prepare_store()
-        if store is None:
-            raise CommandError(8, "Support log storage is not configured or usable.")
+        store = await asyncio.to_thread(open_existing_store)
         try:
             result = await command(args, store)
         finally:
@@ -252,17 +268,17 @@ async def run(argv):
     except (OSError, SQLAlchemyError):
         code, result = 8, {"error": "Support log storage is not usable."}
 
-    if isinstance(result, str):
-        sys.stdout.buffer.write(result.encode("utf-8"))
+    if isinstance(result, bytes):
+        if args.raw:
+            sys.stdout.buffer.write(result)
+        else:
+            display_bundle(result, as_json)
     elif as_json:
         print(json.dumps(result, default=str))
     elif code:
         print(result["error"], file=sys.stderr)
     elif "message" in result:
         print(result["message"])
-    elif "bundle" in result:
-        for item in result["bundle"]:
-            print(json.dumps(item, indent=2))
     elif "accounts" in result:
         if not result["accounts"]:
             print("No accounts have sharing on.")

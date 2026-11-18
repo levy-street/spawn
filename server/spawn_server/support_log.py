@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import case, exists, or_, select, text, update
+from sqlalchemy import case, exists, func, or_, select, text, update
 from sqlalchemy.orm import aliased
 
 from .db import get_sessionmaker
@@ -37,6 +37,16 @@ HOST_INTERVAL = timedelta(minutes=5)
 ACCOUNT_INTERVAL = timedelta(hours=24)
 ACCOUNT_LIMIT = 10
 DISPATCH_LIMIT = 2
+body_readers: set[str] = set()
+
+
+def occupied_dispatch_slots():
+    row = aliased(SupportLogCollection)
+    readers = tuple(body_readers)
+    durable = select(func.count(row.id)).where(row.state == "dispatched")
+    if readers:
+        durable = durable.where(row.id.not_in(readers))
+    return durable.scalar_subquery() + len(readers)
 
 
 def clamp_window(seconds: int) -> int:
@@ -87,7 +97,7 @@ def pacing_refusal(owner, host, now, *, exclude=None):
             RequestRefusal.ACCOUNT_LIMIT.value,
         ),
         (
-            rows.where(other.state == "dispatched").offset(DISPATCH_LIMIT - 1).limit(1).exists(),
+            occupied_dispatch_slots() >= DISPATCH_LIMIT,
             RequestRefusal.CAPACITY.value,
         ),
     )

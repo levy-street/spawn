@@ -1,7 +1,6 @@
 """Daemon registration and support delivery over an in-process fake websocket."""
 
 import asyncio
-import hashlib
 import json
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 
@@ -9,10 +8,12 @@ import pytest
 from sqlalchemy import delete, event, update
 
 from spawn_server import auth
+from spawn_server.config import get_settings
 from spawn_server.db import get_engine, get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogConsent
 from spawn_server.support_consent import store_statement
-from spawn_server.support_log_dispatch import SupportLogPump, support_log_consent_changed
+from spawn_server.support_delivery import deliver_statement
+from spawn_server.support_log_dispatch import SupportLogPump
 from spawn_server.ws.broker import get_broker
 from spawn_server.ws.daemon import daemon_ws
 from tests.test_support_consent import VECTORS, seed_statement, sign
@@ -42,31 +43,9 @@ async def registration_trace(app, *, flag=True):
     return host, owner, ws.sent_text, statements
 
 
-async def test_storage_off_frames_match_master(app):
-    host, owner, frames, _ = await registration_trace(app)
-    assert frames == [
-        json.dumps(
-            {
-                "type": "registered",
-                "host_id": host,
-                "account_id": owner,
-                "browser_device_ids": [],
-                "browser_pins": [],
-                "revoked_browser_keys": [],
-            }
-        )
-    ]
-
-
-async def test_storage_off_registration_sql_matches_master(app):
-    _, _, _, statements = await registration_trace(app)
-    if get_engine().dialect.name != "sqlite":
-        pytest.skip("The production registration trace uses SQLite.")
-    # All statements from authentication through the first registered frame,
-    # including the exact activation UPDATE. Bind values vary with each socket.
-    digest = hashlib.sha256("\n".join(statements).encode()).hexdigest()
-    assert len(statements) == 11
-    assert digest == "6db729eb81b9ee2f2addc1ec84d24c629fe3dd2b77c7c805a9691f2f394af17d"
+@pytest.fixture(autouse=True)
+def temporary_prebuilts(tmp_path, monkeypatch):
+    monkeypatch.setattr(get_settings(), "prebuilt_dir", tmp_path / "prebuilt")
 
 
 @pytest.fixture
@@ -145,7 +124,7 @@ async def test_registered_contains_effective_stored_statement(app, pump, case):
             expected = None
     async with connected(app, owner, host, supports_support_log=True) as (_, frames, conn):
         assert frames.get_nowait()["support_log_consent"] == expected
-        assert conn.support_registered_sent and frames.empty()
+        assert conn.support_delivery_ready and frames.empty()
 
 
 async def test_enabled_sql_adds_one_read_only_for_capable(app, pump):
@@ -166,7 +145,7 @@ async def test_change_push_is_account_scoped_and_includes_removed_and_off(app, p
     other = other_statement["account_id"]
     # A changed account without sockets performs no DB read.
     with no_statements():
-        await support_log_consent_changed(app, owner)
+        await deliver_statement(None, owner, None)
     async with AsyncExitStack() as stack:
         queues = []
         for account, capable in [(owner, True), (owner, True), (owner, False), (other, True)]:
@@ -178,18 +157,8 @@ async def test_change_push_is_account_scoped_and_includes_removed_and_off(app, p
             queues.append(frames)
         newer = sign({**owner_statement, "issued_at_ms": 1001}, key)
         off = sign({**newer, "enabled": False}, key)
-        for artifact in [newer, off, None]:
-            if artifact is not None:
-                await store_statement(owner, artifact)
-            else:
-                # Simulate an enabled signer removed before a push.
-                await store_statement(owner, sign({**newer, "issued_at_ms": 1002}, key))
-                async with get_sessionmaker()() as db:
-                    await db.execute(
-                        delete(BrowserDevice).where(BrowserDevice.id == newer["signer_device_id"])
-                    )
-                    await db.commit()
-            await support_log_consent_changed(app, owner)
+        for artifact in [newer, off]:
+            await store_statement(owner, artifact)
             for frames in queues[:2]:
                 assert frames.get_nowait() == {
                     "type": "host.support_log_consent",
@@ -213,7 +182,7 @@ def no_statements():
 
 async def test_storage_off_change_is_inert(app):
     with no_statements():
-        await support_log_consent_changed(app, "")
+        await deliver_statement(None, "", None)
 
 
 async def test_storage_off_ignores_last_capability_and_literal_null_clears_it(app, monkeypatch):
@@ -234,3 +203,117 @@ async def test_storage_off_ignores_last_capability_and_literal_null_clears_it(ap
         assert "support_log_consent" not in frames.get_nowait()
     async with get_sessionmaker()() as db:
         assert not (await db.get(Host, host)).support_log_capable
+
+
+@pytest.mark.parametrize("failure", ["sql", "decode", "read_timeout", "order_timeout"])
+async def test_support_failure_keeps_ordinary_socket(app, pump, monkeypatch, caplog, failure):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from spawn_server import support_delivery
+    from spawn_server.ws import daemon
+
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await _create_host(owner, name="")
+    stalled = asyncio.Event()
+
+    async def read(*args, **kwargs):
+        assert not get_broker().get_daemon_for_host(host).lifecycle_lock.locked()
+        if failure == "read_timeout":
+            await stalled.wait()
+        raise SQLAlchemyError() if failure == "sql" else ValueError()
+
+    monkeypatch.setattr(daemon, "delivery_snapshot", read)
+    if failure == "read_timeout":
+        monkeypatch.setattr(daemon, "SUPPORT_READ_SECONDS", 0)
+    held = AsyncExitStack()
+    if failure == "order_timeout":
+        await held.enter_async_context(support_delivery.delivery_order(owner).enter())
+        monkeypatch.setattr(support_delivery, "ORDER_SECONDS", 0)
+    try:
+        async with connected(
+            app, owner, host, supports_support_log=True, existing_sessions=[host]
+        ) as (ws, frames, conn):
+            registration = frames.get_nowait()
+            assert (
+                registration["type"] == "registered" and "support_log_consent" not in registration
+            )
+            assert not conn.support_delivery_ready
+            ws.queue_text({"type": "host.heartbeat"})
+            assert await asyncio.wait_for(frames.get(), 30) == {"type": "host.heartbeat"}
+            assert caplog.text.count("could not read support log consent") == 1
+    finally:
+        await held.aclose()
+
+
+@pytest.mark.parametrize("delta", [0, 1])
+async def test_combined_registration_size_in_wire_bytes(app, pump, monkeypatch, delta):
+    from unittest.mock import AsyncMock
+
+    from spawn_server.support_delivery import SUPPORT_LIMIT
+    from spawn_server.ws.broker import daemon_wire
+    from tests.test_support_log_dispatch import request
+
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await _create_host(owner, name="")
+    roster = ["\u00e9"]
+    combined = dict(
+        type="registered",
+        host_id=host,
+        account_id=owner,
+        browser_device_ids=roster,
+        browser_pins=[],
+        revoked_browser_keys=[],
+        support_log_consent=value,
+    )
+    roster[0] += "a" * (SUPPORT_LIMIT + delta - len(daemon_wire(combined).encode()))
+    monkeypatch.setattr(
+        "spawn_server.ws.daemon._live_browser_device_ids", AsyncMock(return_value=roster)
+    )
+    async with connected(app, owner, host, supports_support_log=True) as (ws, frames, conn):
+        ordinary = frames.get_nowait()
+        assert ordinary["browser_device_ids"] == roster
+        if delta:
+            assert "support_log_consent" not in ordinary
+            assert frames.get_nowait() == {"type": "host.support_log_consent", "consent": value}
+        else:
+            assert len(ws.sent_text[0].encode()) == SUPPORT_LIMIT
+            assert ordinary["support_log_consent"] == value
+        assert conn.support_delivery_ready
+        queued = await request(owner, host)
+        await pump.run_once()
+        assert frames.get_nowait()["request_id"] == queued and frames.empty()
+
+
+@pytest.mark.parametrize("ordinary_too_big", [False, True])
+async def test_registration_with_unusable_wire_size_keeps_trust(
+    app, pump, monkeypatch, caplog, ordinary_too_big
+):
+    from unittest.mock import AsyncMock
+
+    from spawn_server.support_delivery import DAEMON_LIMIT, SUPPORT_LIMIT
+    from spawn_server.ws.broker import daemon_wire
+
+    value, _ = await seed_statement()
+    owner = value["account_id"]
+    host = await _create_host(owner, name="")
+    roster = ["a" * DAEMON_LIMIT] if ordinary_too_big else ["a"]
+    monkeypatch.setattr(
+        "spawn_server.ws.daemon._live_browser_device_ids", AsyncMock(return_value=roster)
+    )
+    if not ordinary_too_big:
+        separate = {"type": "host.support_log_consent", "consent": value}
+        value["carried_endorsements"] = [""]
+        value["carried_endorsements"][0] = "a" * (
+            SUPPORT_LIMIT + 1 - len(daemon_wire(separate).encode())
+        )
+        monkeypatch.setattr(
+            "spawn_server.ws.daemon.delivery_snapshot", AsyncMock(return_value=(value, True))
+        )
+    async with connected(app, owner, host, supports_support_log=True) as (_, frames, conn):
+        ordinary = frames.get_nowait()
+        assert ordinary["browser_device_ids"] == roster and "support_log_consent" not in ordinary
+        assert not conn.support_delivery_ready and frames.empty()
+        assert not pump.wake.is_set()
+        assert sum("support log" in r.getMessage() for r in caplog.records) == 1

@@ -25,6 +25,7 @@ spawn_server/
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   support_consent.py       signed statement encoding, validation and current storage
+  support_delivery.py      per-account order for support writes and wire delivery
   support_log.py           request admission, pacing and conditional state transitions
   support_log_dispatch.py  the server process's collection pump and statement delivery
   support_log_cli.py       the operator command, run locally with the server settings
@@ -91,23 +92,41 @@ collection. The app signing switch and owner history are still to come.
 
 With storage ready, registration records the literal JSON boolean
 `supports_support_log: true` as capable, in the existing host activation write.
-Each capable connection receives `registered.support_log_consent`. One short
-read in the existing revocation session after activation gets the signed
-statement and whether to wake the pump.
+After activation, a capable connection waits up to four seconds for its
+account's delivery order. A separate bounded read gets the statement and
+whether to wake the pump. If either fails, ordinary registration and worker
+reconciliation finish and the connection receives no collections.
 A signed off is delivered intact. Missing consent or an enabled statement whose
-signer has left the roster is sent as null. After a statement commit, the app
-route will call `support_log_consent_changed(app, user_id)` to send
-`host.support_log_consent` to this account's connected capable hosts.
-An account lock orders statement commits and socket sends. A successful send
-records only what went onto that connection. The daemon's 64 KiB support limit
-includes the ordinary registration fields. If a complete statement frame exceeds
-that limit, the server withholds collections on that connection. Reconnecting
-starts the server's send tracking over.
+signer has left the roster is sent as null.
+
+The app route will call `store_statement` once. It commits, closes the
+transaction, and sends that statement to eligible sockets under the same
+account order. Sends to different hosts run concurrently with a two-second
+deadline. A missed send leaves that connection ineligible until registration.
+Device removal and account deletion take the order before writing. Removing
+the enabled signer sends null after commit. A timed-out reduction interrupts
+outstanding support sends and proceeds. The pump holds the order from its final
+signer and ownership check through its send. A successful send records only
+what went onto that connection.
+
+The released daemon checks the UTF-8 bytes of the whole WebSocket text
+message. Above 65,536 bytes it denies support for the rest of its process and
+tries to erase its saved statement. The server reserves 1,024 bytes of margin
+on every frame carrying consent. If the combined frame would exceed the
+server limit, ordinary trust data stays together in `registered` and the
+statement follows in `host.support_log_consent` before any collect. If the
+separate frame is too large, support waits for another registration. If
+ordinary trust data alone already exceeds 65,536 bytes, even an absent field
+triggers the daemon's denial. The server preserves ordinary registration,
+logs the condition and withholds support on that connection.
 
 A host can have one open request and must wait five minutes between dispatches.
 An account can request up to ten collections in a rolling 24 hours. The same
 limit on dispatch times covers requests delayed while a host was offline.
-The server allows two dispatched records across all accounts. Admission and
+The server allows two dispatched records across all accounts. A body still
+being read occupies a slot even after its record closes. The pump reads pages
+of 32 in request-time and ID order, yields between candidates and stops
+claiming once full or stopping. Admission and
 dispatch check the records table, including attempts that failed or were
 declined. Dispatch verifies the socket owner and the enabled statement last
 sent there, commits the conditional transition, then sends `support_log.collect`
@@ -120,11 +139,19 @@ the server's settings. All commands accept `--json` for one output object.
 | Command | Result |
 | --- | --- |
 | `accounts` | Accounts with sharing on and their hosts' last seen time and last capability declaration |
-| `collect --account <id-or-email> --host <id-or-name> --reason <text> [--by <label>] [--hours N] [--wait SECONDS]` | Creates one request. The reason is 1 to 200 characters. Supply a label through `--by` or `SPAWN_SUPPORT_LOG_BY`. The default window is 24 hours. Waiting polls the database and returns the last state when the deadline passes. |
+| `collect --account <id-or-email> --host <id-or-name> --reason <text> [--by <label>] [--hours N] [--wait SECONDS]` | Creates one request. The reason is 1 to 200 characters. Supply a label through `--by` or `SPAWN_SUPPORT_LOG_BY`. Hours must be positive and at most 72, with a default of 24. The wait is 0 to 86400 seconds. Waiting polls the database and returns the last state when the deadline passes. |
 | `status <id>` | Current state and any typed refusal |
 | `list [--account <id-or-email>] [--days N]` | Requests in the chosen period, seven days by default |
-| `show <id> [--raw]` | Read the unexpired collected bundle locally. Raw output preserves the stored NDJSON bytes. |
+| `show <id> [--raw]` | Read the unexpired collected bundle locally. Raw output requires a pipe or file. |
 | `purge` | Run one bounded retention pass |
+
+The operator can read the whole bundle as the machine reported it. The server
+checks its form and cannot guarantee what the events contain. Under the store
+lock, `show` verifies a regular file, size, SHA-256 and JSON object framing
+before printing. Default output prints one object per line with terminal
+controls escaped. `show --raw` writes the stored bytes unchanged to a pipe
+or file. Metadata commands omit tokens, keys and signatures. An account-scoped
+lookup exposes no other account's data.
 
 Exit codes are 0 for success, 2 for usage, 3 for sharing off, 4 for a host
 outside the account or unknown there, 5 for missing capability, 6 for an open
@@ -138,7 +165,13 @@ to a dispatched collection.
 the body, no support file access and no sweep task. Use an absolute private
 directory outside the repository checkout. It must be on the server's local
 disk because startup waits for a worker thread to prepare it with mode 0700
-and check locking and writing. Each lifespan starts dispatch, installs the
+and check locking and writing. Under the directory lock, the server marks a
+new or empty directory with the extended attribute `user.spawnd.support-log-store`,
+version `v1`. A populated unmarked directory, including a legacy store, is
+left alone. Keep it for manual recovery and configure a fresh empty directory.
+The filesystem must support user extended attributes. The CLI opens an existing
+private marked directory and never creates, marks or chmods it.
+Each lifespan starts dispatch, installs the
 upload route and starts retention only after that check succeeds. With storage
 off, registration sends its ordinary frame and performs its ordinary SQL. A failure logs one error and
 keeps storage off for that lifespan.
@@ -154,7 +187,9 @@ reports a missing collected file explicitly; it never substitutes an empty log.
 Retention starts in the background at startup and repeats every 15 minutes.
 Each pass handles at most 100 entries in each category: expired bundles,
 old requested records, old dispatched records, year-old records and directory
-entries. Directory scanning resumes across passes. Bundles expire after seven
+entries. The orphan sweep verifies the store identity under lock and considers
+only canonical `<uuid>.ndjson` and `.upload-<uuid>.tmp` names. Directory
+scanning resumes across passes. Bundles expire after seven
 days; orphans get ten minutes of grace. Open requests expire after 24 hours or
 fail five minutes after dispatch. Collection records last at most 365 days,
 subject to the bounded sweep backlog. Signed statements have no expiry.

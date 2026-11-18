@@ -5,126 +5,121 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 
 from .db import get_sessionmaker
 from .models import SupportLogCollection as Collection
 from .models import _utcnow
-from .support_consent import (
-    delivery_lock,
-    delivery_snapshot,
-    enabled_statement_time,
-    enabled_timestamp,
-    sharing_on,
+from .support_consent import enabled_statement_time, sharing_on
+from .support_delivery import delivery_order
+from .support_log import (
+    ACCOUNT_INTERVAL,
+    DISPATCH_LIMIT,
+    clamp_window,
+    mark_dispatched,
+    occupied_dispatch_slots,
+    pacing_refusal,
+    transition,
 )
-from .support_log import ACCOUNT_INTERVAL, clamp_window, mark_dispatched, pacing_refusal, transition
 from .ws.broker import get_broker
-from .ws.daemon import _bounded_send_text
 
 log = logging.getLogger("spawn.support_log")
 INTERVAL_SECONDS = 10
+PAGE_SIZE = 32
 
 
-async def support_log_consent_changed(app, user_id: str):
-    """Call after committing a changed statement in the server process."""
-    pump = getattr(app.state, "support_log_pump", None)
-    if pump is None:
-        return
-    for conn in get_broker().support_daemons_for_account(user_id):
-        try:
-            async with delivery_lock(user_id):
-                if not conn.support_registered_sent or not pump.is_current(conn):
-                    # Registration takes the same lock and reads after acquiring it.
-                    continue
-                conn.support_enabled_sent_ms = None
-                async with get_sessionmaker()() as session:
-                    statement, _ = await delivery_snapshot(session, user_id)
-                await _bounded_send_text(
-                    conn, {"type": "host.support_log_consent", "consent": statement}
-                )
-                conn.support_enabled_sent_ms = enabled_timestamp(statement)
-        except Exception:
-            log.warning("SPAWN D could not send the support log statement to a host")
+async def requested_page(now, cursor):
+    row = Collection
+    query = select(
+        row.id,
+        row.requested_at,
+        row.owner_user_id,
+        row.host_id,
+        row.window_seconds,
+        enabled_statement_time(row.owner_user_id).scalar_subquery().label("issued"),
+        pacing_refusal(row.owner_user_id, row.host_id, now, exclude=row.id).label("paced"),
+        occupied_dispatch_slots().label("occupied"),
+        (row.requested_at < now - ACCOUNT_INTERVAL).label("too_old"),
+    ).where(row.state == "requested")
+    if cursor is not None:
+        query = query.where(tuple_(row.requested_at, row.id) > cursor)
+    async with get_sessionmaker()() as session:
+        return (
+            await session.execute(query.order_by(row.requested_at, row.id).limit(PAGE_SIZE))
+        ).all()
 
 
 class SupportLogPump:
     def __init__(self):
         self.wake = asyncio.Event()
+        self.upload_admission = asyncio.Lock()
         self.stopping = False
-
-    @staticmethod
-    def is_current(conn):
-        return get_broker().get_daemon_for_host(conn.host_id) is conn
 
     async def run_once(self, *, now=None):
         scan_time = now or _utcnow()
-        # ix_support_log_state_requested drives the scan, including offline
-        # hosts (withdrawal cancels those too). No session spans a socket send.
-        async with get_sessionmaker()() as session:
-            candidates = (
-                await session.execute(
-                    select(
-                        Collection.id,
-                        Collection.owner_user_id,
-                        Collection.host_id,
-                        Collection.window_seconds,
-                        enabled_statement_time(Collection.owner_user_id)
-                        .scalar_subquery()
-                        .label("issued"),
-                        (Collection.requested_at < scan_time - ACCOUNT_INTERVAL).label("too_old"),
-                        pacing_refusal(
-                            Collection.owner_user_id,
-                            Collection.host_id,
-                            scan_time,
-                            exclude=Collection.id,
-                        ).label("paced"),
-                    )
-                    .where(Collection.state == "requested")
-                    .order_by(Collection.requested_at, Collection.id)
-                )
-            ).all()
-        for row in candidates:
-            try:
-                if row.issued is None:
-                    await transition(
-                        row.id,
-                        "requested",
-                        "cancelled",
-                        now=now,
-                        conditions=(~sharing_on(Collection.owner_user_id),),
-                    )
-                    continue
-                if row.too_old or row.paced is not None:
-                    continue
-                conn = get_broker().get_daemon_for_host(row.host_id)
-                if (
-                    conn is None
-                    or not conn.supports_support_log
-                    or conn.user_id != row.owner_user_id
-                ):
-                    continue
-                async with delivery_lock(conn.user_id):
-                    if (
-                        conn.support_enabled_sent_ms != row.issued
-                        or conn.support_oversized_frame_sent
-                        or not self.is_current(conn)
-                    ):
-                        continue
-                    if not await mark_dispatched(
-                        row.id, now=now, connection_id=conn.id, sent_ms=conn.support_enabled_sent_ms
-                    ):
-                        continue
-                    if self.is_current(conn):
-                        await _bounded_send_text(
-                            conn,
-                            {
-                                "type": "support_log.collect",
-                                "request_id": row.id,
-                                "since_seconds": clamp_window(row.window_seconds),
-                            },
+        cursor = None
+        while not self.stopping:
+            page = await requested_page(scan_time, cursor)
+            if not page:
+                return
+            slots = DISPATCH_LIMIT - page[0].occupied
+            for row in page:
+                await asyncio.sleep(0)
+                if self.stopping:
+                    return
+                try:
+                    if row.issued is None:
+                        await transition(
+                            row.id,
+                            "requested",
+                            "cancelled",
+                            now=now,
+                            conditions=(~sharing_on(Collection.owner_user_id),),
                         )
-            except Exception:
-                log.error("SPAWN D support log dispatch failed for one request")
+                    elif slots > 0 and row.paced is None and not row.too_old:
+                        slots -= await self.dispatch(row, now)
+                except Exception:
+                    log.error("SPAWN D support log dispatch failed for one request")
+            if len(page) < PAGE_SIZE:
+                return
+            cursor = (page[-1].requested_at, page[-1].id)
+
+    async def dispatch(self, row, now):
+        broker = get_broker()
+        conn = broker.get_daemon_for_host(row.host_id)
+        if conn is None or conn.user_id != row.owner_user_id or not conn.support_delivery_ready:
+            return False
+        async with delivery_order(conn.user_id).enter() as turn:
+            if (
+                turn is None
+                or not conn.support_delivery_ready
+                or conn.support_enabled_sent_ms != row.issued
+            ):
+                return False
+            async with self.upload_admission:
+                if (
+                    self.stopping
+                    or not turn.valid
+                    or broker.get_daemon_for_host(row.host_id) is not conn
+                ):
+                    return False
+                if not await mark_dispatched(
+                    row.id, now=now, connection_id=conn.id, sent_ms=conn.support_enabled_sent_ms
+                ):
+                    return False
+            if broker.get_daemon_for_host(row.host_id) is conn:
+                try:
+                    await turn.send(
+                        conn,
+                        {
+                            "type": "support_log.collect",
+                            "request_id": row.id,
+                            "since_seconds": clamp_window(row.window_seconds),
+                        },
+                    )
+                except Exception:
+                    log.error("SPAWN D support log collect send failed")
+            return True
 
     async def run(self):
         while not self.stopping:

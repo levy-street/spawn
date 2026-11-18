@@ -7,10 +7,13 @@ SQLite transactions over disk work. All filesystem jobs run off the event loop.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
+import re
 import stat
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,13 +28,26 @@ from .support_consent import canonical_uuid
 log = logging.getLogger("spawn.support_log")
 
 
+STORE_ATTRIBUTE = "user.spawnd.support-log-store"
+STORE_VERSION = b"v1"
+UUID_NAME = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+STORE_FILE = re.compile(rf"(?:{UUID_NAME}\.ndjson|\.upload-{UUID_NAME}\.tmp)")
+
+
+def _verify_identity(fd):
+    if os.getxattr(fd, STORE_ATTRIBUTE) != STORE_VERSION:
+        raise OSError("Unrecognized support store")
+    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+        raise OSError("Support store must be private")
+
+
 def checkout_root() -> Path:
     # Resolve only when configured storage is initialized.
     return Path(__file__).resolve().parents[2]
 
 
-def _lock_directory(root: Path, flags: int) -> int:
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def _lock_directory(root: Path, flags: int, *, parent=None) -> int:
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
         fcntl.flock(fd, flags)
     except BaseException:
@@ -56,6 +72,7 @@ class SupportLogFiles:
     def __init__(self, root: Path):
         self.root = root
         self._entries = None
+        self.fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
     def path(self, record_id: str) -> Path:
         canonical_uuid(record_id)
@@ -63,7 +80,13 @@ class SupportLogFiles:
 
     def _try_lock(self):
         try:
-            return _lock_directory(self.root, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = _lock_directory(".", fcntl.LOCK_EX | fcntl.LOCK_NB, parent=self.fd)
+            try:
+                _verify_identity(fd)
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
         except BlockingIOError:
             return None
 
@@ -88,25 +111,44 @@ class SupportLogFiles:
                 os.close(fd)
 
     def write(self, record_id: str, body: bytes):
-        destination = self.path(record_id)
-        fd, temporary = tempfile.mkstemp(prefix=".upload-", dir=self.root)
+        destination = self.path(record_id).name
+        temporary = f".upload-{uuid.uuid4()}.tmp"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
         try:
             with os.fdopen(fd, "wb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(body)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, destination)
+            os.replace(temporary, destination, src_dir_fd=self.fd, dst_dir_fd=self.fd)
         finally:
-            Path(temporary).unlink(missing_ok=True)
+            self.unlink(temporary)
 
     def remove(self, record_id: str):
-        self.path(record_id).unlink(missing_ok=True)
+        self.unlink(self.path(record_id).name)
+
+    def unlink(self, name):
+        if not STORE_FILE.fullmatch(name):
+            raise ValueError("Unrecognized support file name")
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+
+    def read(self, record_id, limit):
+        fd = os.open(
+            self.path(record_id).name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=self.fd,
+        )
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("Expected a regular bundle file")
+            return stream.read(limit + 1)
 
     def old_entries(self, cutoff: float, limit: int):
         # Keep the iterator between passes so fresh entries cannot starve old ones.
         if self._entries is None:
-            self._entries = os.scandir(self.root)
+            self._entries = os.scandir(self.fd)
         result = []
         for _ in range(limit):
             entry = next(self._entries, None)
@@ -114,6 +156,8 @@ class SupportLogFiles:
                 self._entries.close()
                 self._entries = None
                 break
+            if not STORE_FILE.fullmatch(entry.name):
+                continue
             try:
                 info = entry.stat(follow_symlinks=False)
                 if not stat.S_ISDIR(info.st_mode) and info.st_mtime < cutoff:
@@ -123,30 +167,46 @@ class SupportLogFiles:
         return result
 
     def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
         if self._entries is not None:
             self._entries.close()
             self._entries = None
 
 
 def _probe(root: Path):
-    if not root.is_dir():
-        raise NotADirectoryError
-    root.chmod(0o700)
-    os.close(_lock_directory(root, fcntl.LOCK_EX))
-    fd, path = tempfile.mkstemp(prefix=".probe-", dir=root)
-    os.close(fd)
-    os.unlink(path)
+    fd = _lock_directory(root, fcntl.LOCK_EX)
+    try:
+        try:
+            _verify_identity(fd)
+        except OSError as exc:
+            with os.scandir(fd) as entries:
+                if exc.errno != errno.ENODATA or next(entries, None) is not None:
+                    raise
+            os.fchmod(fd, 0o700)
+            os.setxattr(fd, STORE_ATTRIBUTE, STORE_VERSION, os.XATTR_CREATE)
+        # Probe writes only after verifying or establishing the identity.
+        name = f".upload-{uuid.uuid4()}.tmp"
+        probe = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=fd)
+        os.close(probe)
+        os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _store_root(directory):
+    if fcntl is None or not hasattr(os, "getxattr"):
+        raise OSError("Support storage requires file locks and directory attributes")
+    path = Path(directory)
+    root = path.resolve()
+    if not path.is_absolute() or path.is_symlink() or root.is_relative_to(checkout_root()):
+        raise OSError("Support directory must be absolute and outside checkout")
+    return root
 
 
 def _store(directory: str) -> SupportLogFiles:
-    if fcntl is None or not all(
-        hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "fchmod")
-    ):
-        raise OSError("support storage requires Unix file locking and permissions")
-    path = Path(directory)
-    root = path.resolve()
-    if not path.is_absolute() or root.is_relative_to(checkout_root()):
-        raise OSError("support directory must be absolute and outside checkout")
+    root = _store_root(directory)
     if not root.exists():
         root.parent.mkdir(parents=True, exist_ok=True)
         # Probe a new directory before publishing it at the configured path.
@@ -174,6 +234,19 @@ async def prepare_store() -> SupportLogFiles | None:
     except Exception:
         log.error("SPAWN D support log storage is unusable; sharing storage is off")
         return None
+
+
+def open_existing_store():
+    directory = get_settings().support_log_dir
+    if not directory:
+        raise OSError("Support log storage is not configured or usable.")
+    store = SupportLogFiles(_store_root(directory))
+    try:
+        _verify_identity(store.fd)
+        return store
+    except BaseException:
+        store.close()
+        raise
 
 
 def get_store(app) -> SupportLogFiles | None:

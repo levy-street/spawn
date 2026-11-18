@@ -216,12 +216,19 @@ a turn-off, the server can report only that it was sent. The host sends no
 receipt for applying it. A host can have one open request, with at least five
 minutes between dispatches. An account has a limit of ten requests in any 24
 hours, and at most ten can be dispatched in that period. Across the server at
-most two records can be dispatched and awaiting a result at once. A request
+most two collections occupy dispatch slots. An upload body still being read
+occupies its slot even after its request closes. A request
 is sent at most once, even if the connection breaks during that send.
 
 When collection is later enabled, the server stores the **plain log bundle,
 not encrypted at rest**, on its disk outside database backups. Only the
-operator with access to that server can read it; no download route exists.
+operator with access to that server can read the
+whole bundle as the machine reported it. The server checks its form and
+cannot guarantee what the events contain. Before display, the command
+verifies its size, SHA-256 and JSON object framing. Default `show` prints one
+object per line with terminal controls escaped. `show --raw` writes the stored
+bytes unchanged to a pipe or file. Metadata commands omit tokens, keys and
+signatures. An account-scoped lookup exposes no other account's data.
 Bundles expire after seven days and a bounded sweep runs at startup and every
 15 minutes, so deletion can follow the expiry time. Turning sharing off deletes
 collected files and cancels open requests; deleting an account deletes its files.

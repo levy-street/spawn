@@ -49,6 +49,10 @@ async def _send_or_disconnect(websocket: WebSocket, text: str) -> None:
 log = logging.getLogger(__name__)
 
 
+def daemon_wire(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+
+
 @dataclass(eq=False)
 class DaemonConn:
     host_id: str
@@ -73,22 +77,14 @@ class DaemonConn:
     session_ice_policy: bool = False
     supports_device_connections: bool = False
     supports_support_log: bool = False
-    support_registered_sent: bool = False
-    support_oversized_frame_sent: bool = False
+    support_delivery_ready: bool = False
     # Only an enabled statement can authorize dispatch. Off wins timestamp ties.
     support_enabled_sent_ms: int | None = None
     durable_owner_valid_until: float = 0.0
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            wire = json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
-            await _send_or_disconnect(self.websocket, wire)
-            # Both support statement frames are ASCII-escaped. The daemon's
-            # 64 KiB extension limit counts the whole frame, including pins.
-            if self.supports_support_log and len(wire) > 65536 and (
-                "support_log_consent" in payload or payload.get("type") == "host.support_log_consent"
-            ):
-                self.support_oversized_frame_sent = True
+            await _send_or_disconnect(self.websocket, daemon_wire(payload))
 
 
 @dataclass(eq=False)
