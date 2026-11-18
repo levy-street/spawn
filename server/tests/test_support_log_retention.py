@@ -31,6 +31,7 @@ from spawn_server.support_log_retention import (
     start_sweeps,
     sweep_once,
 )
+from spawn_server.ws.broker import Broker, DaemonConn
 from tests.test_support_consent import seed_statement, sign
 from tests.test_support_log_uploads import (
     BODY,
@@ -185,9 +186,16 @@ async def linked_user(owner):
     return user
 
 
+@pytest.fixture
+def broker(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
+    return broker
+
+
 @pytest.mark.parametrize("failure", [None, "unlink", "marker", "lock", "mode", "lookup", "timeout"])
 async def test_account_deletion_removes_files_and_cascades(
-    client, storage, monkeypatch, caplog, failure
+    client, storage, broker, monkeypatch, caplog, failure
 ):
     record_id, token, statement, _key, host = await setup_request()
     assert (await post(client, record_id, token)).status_code == 204
@@ -195,8 +203,7 @@ async def test_account_deletion_removes_files_and_cascades(
     assert (await post(client, other, other_token)).status_code == 204
     user = await linked_user(statement["account_id"])
     socket = Mock(close=AsyncMock())
-    broker = Mock(get_daemon_for_host=Mock(return_value=socket))
-    monkeypatch.setattr("spawn_server.routes.auth.get_broker", lambda: broker)
+    await broker.register_daemon(DaemonConn(host.id, user.id, socket))
     with monkeypatch.context() as m:
         if failure == "unlink":
             m.setattr(support_log_files, "_unlink", Mock(side_effect=OSError))
@@ -258,8 +265,7 @@ async def test_account_deletion_removes_files_and_cascades(
                 os.fchmod(storage.fd, 0o700)
             elif failure == "lock":
                 support_log_files.fcntl.flock(storage.fd, support_log_files.fcntl.LOCK_UN)
-    broker.get_daemon_for_host.assert_called_once_with(host.id)
-    socket.close.assert_awaited_once()
+    socket.close.assert_awaited_once_with(code=4001, reason="host revoked")
     assert await get_collection(record_id) is None
     assert await get_statement(user.id) is None
     assert storage.path(record_id).exists() == bool(failure)
@@ -272,6 +278,41 @@ async def test_account_deletion_removes_files_and_cascades(
         await sweep_once(storage, now=datetime.now(UTC) + timedelta(minutes=11))
         assert not storage.path(record_id).exists()
         assert storage.path(other).exists()
+
+
+@pytest.mark.parametrize("first_close", ["succeeds", "raises", "hangs"])
+async def test_account_deletion_closes_both_daemons_best_effort(client, broker, first_close):
+    statement, _ = await seed_statement()
+    user = await linked_user(statement["account_id"])
+    hosts = [Host(owner_user_id=user.id, name="") for _ in range(2)]
+    async with get_sessionmaker()() as session:
+        session.add_all(hosts)
+        await session.commit()
+
+    async def hang(**kwargs):
+        await asyncio.Event().wait()
+
+    sockets = [Mock(close=AsyncMock()), Mock(close=AsyncMock())]
+    if first_close == "raises":
+        sockets[0].close.side_effect = RuntimeError
+    elif first_close == "hangs":
+        sockets[0].close.side_effect = hang
+    for host, socket in zip(hosts, sockets, strict=True):
+        await broker.register_daemon(DaemonConn(host.id, user.id, socket))
+
+    response = await asyncio.wait_for(
+        client.post(
+            "/api/account/delete",
+            json={"confirm_email": user.email},
+            headers={"authorization": f"Bearer {auth.issue_access_token(user.id)}"},
+        ),
+        30,
+    )
+    assert response.status_code == 204 and response.content == b""
+    assert 'spawn_session=""' in response.headers["set-cookie"]
+    assert "Max-Age=0" in response.headers["set-cookie"]
+    for socket in sockets:
+        socket.close.assert_awaited_once_with(code=4001, reason="host revoked")
 
 
 async def test_stalled_cleanup_leaves_later_deletions_to_the_orphan_sweep(client, storage, monkeypatch):

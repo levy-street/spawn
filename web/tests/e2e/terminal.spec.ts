@@ -985,13 +985,13 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   await expect(page.getByTestId("upload-reconciliation")).toContainText(
     "Check the endpoint destination before retrying",
   );
-  await page.clock.install();
+  await page.clock.install({ time: new Date(0) });
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
   );
   expect(uploads).toHaveLength(1);
 
-  await page.clock.fastForward(3_500);
+  await page.clock.pauseAt(new Date(86_400_000));
   await expect(page.getByTestId("upload-reconciliation")).toContainText(
     "Check the endpoint destination before retrying",
   );
@@ -1006,6 +1006,7 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   await expect(page.getByText(/larger than 20 MB/i)).toBeVisible();
   await page.clock.fastForward(3_500);
   await expect(page.getByText(/larger than 20 MB/i)).toHaveCount(0);
+  await page.clock.resume();
   await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
 
   // Navigation fully unmounts this terminal; the session-scoped record
