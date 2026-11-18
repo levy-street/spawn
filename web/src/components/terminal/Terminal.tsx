@@ -28,7 +28,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
-import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
+import { ConnectingOverlay, RESTART_HINT } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import {
   LiveTerminalWriteBuffer,
@@ -1690,11 +1690,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Surface the live transport for connection indicators without forcing the
   // callback identity into effect deps (workspace panes pass inline closures).
+  const notRunningNotice =
+    socket.sessionNotRunning && sessionIdentityQuery.data?.status === "running"
+      ? `This session is no longer running on ${hostIdentityQuery.data?.name ?? sessionIdentityQuery.data.host_name ?? "this host"}.`
+      : null;
   const onConnectionInfoRef = useRef(onConnectionInfo);
   onConnectionInfoRef.current = onConnectionInfo;
   useEffect(() => {
     onConnectionInfoRef.current?.({
       socketState: socket.state,
+      notRunningNotice,
       v3: socket.v3,
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
@@ -1705,6 +1710,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
   }, [
     socket.state,
+    notRunningNotice,
     socket.v3,
     socket.dcOpen,
     socket.signedRtcRefusal,
@@ -3732,7 +3738,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       aria-label="Session terminal"
       data-session-id={sessionId}
       data-input-ready={socket.dcOpen && controlState?.owner === true}
-      aria-busy={!socket.dcOpen}
+      aria-busy={!socket.dcOpen && !notRunningNotice}
       onFocusCapture={() => {
         focusViewRef.current();
         // The terminal being typed in is the one the GPU renderer is for.
@@ -3793,6 +3799,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         v3={socket.v3}
         dcOpen={socket.dcOpen}
         refusal={socket.signedRtcRefusal}
+        notRunningNotice={notRunningNotice}
         painted={painted}
         hostName={hostIdentityQuery.data?.name ?? null}
         hostOffline={hostIdentityQuery.data?.status === "offline"}
@@ -3994,7 +4001,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         aria-live="polite"
       >
         {[
-          socket.state !== "open" ? SOCKET_STATE_COPY[socket.state] : null,
+          notRunningNotice
+            ? `${notRunningNotice} ${RESTART_HINT}`
+            : socket.state !== "open"
+              ? SOCKET_STATE_COPY[socket.state]
+              : null,
           channelPending ? "connecting direct channel…" : null,
           exitBanner,
           uploadStatus,

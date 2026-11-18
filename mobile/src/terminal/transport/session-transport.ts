@@ -47,6 +47,21 @@ type ConnectionInfoListener = (info: ConnectionInfo) => void;
 type PairEvent = Extract<WorkerToNativeMessage, { type: "pair-command" | "pair-event" }>;
 const MAX_PENDING_VIEW_EVENTS = 512;
 const MAX_PENDING_VIEW_EVENT_BYTES = 2 * 1024 * 1024;
+function isNotRunningFrame(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 16 * 1024) return false;
+  try {
+    const frame = JSON.parse(data);
+    return (
+      frame?.version === 1 &&
+      frame.kind === "event" &&
+      frame.event === "attach_refused" &&
+      frame.reason === "session_not_running"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function newUuid(): string {
   const bytes = randomBytes(16);
   bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
@@ -62,6 +77,8 @@ class WebViewSessionTransport implements SessionTransport {
   #state: TransportState = "idle";
   #lease: HostTransportLease | null = null;
   #attachmentId: string | null = null;
+  #reportAttachResult: ((notRunning: boolean) => void) | undefined;
+  #attemptRefused = false;
   #workerStarted = false;
   #pendingViewEvents: PairEvent[] = [];
   #pendingViewBytes = 0;
@@ -115,6 +132,16 @@ class WebViewSessionTransport implements SessionTransport {
       shared.bridge.onMessage((message) => {
         if (activeDeviceIdentityAccount() !== this.#accountId) return;
         if (message.type === "pair-event" && message.attachmentId === this.#attachmentId) {
+          if (
+            this.#state !== "ready" &&
+            message.event === "data" &&
+            message.binary === false &&
+            (message.channel === "pty" || message.channel === "ctl") &&
+            isNotRunningFrame(message.data)
+          ) {
+            this.#attemptRefused = true;
+            this.#reportAttachResult?.(true);
+          }
           if (!this.#workerStarted) {
             // Open the channels while the terminal document loads. Receive
             // credits stay outstanding until that document consumes the data;
@@ -195,6 +222,7 @@ class WebViewSessionTransport implements SessionTransport {
   close(): void {
     if (this.#state === "closed") return;
     this.#workerStarted = false;
+    this.options.attachResultListener?.()?.(false);
     this.#detach();
     for (const unsubscribe of this.#subscriptions.splice(0)) unsubscribe();
     try {
@@ -319,6 +347,7 @@ class WebViewSessionTransport implements SessionTransport {
       return;
     }
     if (this.#lease.shared.transport.state !== "ready") {
+      this.options.attachResultListener?.()?.(false);
       this.#detach();
       if (this.#lease.shared.transport.state === "failed") {
         const error = this.#lease.shared.transport.lastError ?? this.#lastError;
@@ -340,6 +369,8 @@ class WebViewSessionTransport implements SessionTransport {
     if (this.#attachmentId || this.#retry) return;
     const attachment = { attachmentId: newUuid(), sessionId: this.sessionId, viewId: this.#viewId };
     this.#attachmentId = attachment.attachmentId;
+    this.#attemptRefused = false;
+    this.#reportAttachResult = this.options.attachResultListener?.();
     this.#setState("connecting");
     try {
       if (this.#workerStarted) this.#startView();
@@ -385,6 +416,8 @@ class WebViewSessionTransport implements SessionTransport {
     this.#displayOwner = false;
     this.#uploadCoordinator.close();
     if (!id) return;
+    if (!this.#attemptRefused) this.#reportAttachResult?.(false);
+    this.#reportAttachResult = undefined;
     try {
       this.#lease?.shared.bridge.send({
         v: TERMINAL_BRIDGE_VERSION,
@@ -446,6 +479,7 @@ class WebViewSessionTransport implements SessionTransport {
         ) {
           clearTimeout(this.#deadline ?? undefined);
           this.#deadline = null;
+          this.#reportAttachResult?.(false);
           this.#setState("ready");
           this.#resolveOpen?.();
           this.#settleOpening();

@@ -7,6 +7,7 @@ import {
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
   SessionTransport,
+  SessionTransportOptions,
   TransportError,
   TransportState,
   UploadProgress,
@@ -75,7 +76,7 @@ function state(next: TransportState) {
   mockState = next;
   for (const listener of mockListeners) listener(next);
 }
-function view() {
+function view(optionsForView: Pick<SessionTransportOptions, "attachResultListener"> = {}) {
   const bridge = new FakeBridge();
   const transport = createSessionTransport({
     ...options,
@@ -83,6 +84,7 @@ function view() {
     initialSize: { cols: 80, rows: 24 },
     theme: terminalDark,
     bridge,
+    ...optionsForView,
   });
   views.push(transport);
   return { bridge, transport };
@@ -474,4 +476,35 @@ test("reopening a reconnecting view does not duplicate bridge subscriptions", as
   state("ready");
   bridge.emit({ v: 1, type: "state", state: "ready" });
   await opening;
+});
+
+test("readiness clears the previous attach result", async () => {
+  jest.useFakeTimers();
+  const report = jest.fn();
+  const { transport, bridge } = view({ attachResultListener: () => report });
+  const opening = transport.open();
+  const attempt = commands.find((f) => f.type === "pair-attach");
+  if (!attempt) throw new Error("Missing attachment");
+  root.shared.bridge.receive(
+    JSON.stringify({
+      v: 1,
+      type: "pair-event",
+      attachmentId: attempt.attachmentId,
+      channel: "ctl",
+      event: "data",
+      binary: false,
+      data: JSON.stringify({
+        version: 1,
+        kind: "event",
+        event: "attach_refused",
+        reason: "session_not_running",
+      }),
+    }),
+  );
+  bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+  jest.advanceTimersByTime(500);
+  expect(report.mock.calls).toEqual([[true]]);
+  bridge.emit({ v: 1, type: "state", state: "ready" });
+  await opening;
+  expect(report.mock.calls).toEqual([[true], [false]]);
 });

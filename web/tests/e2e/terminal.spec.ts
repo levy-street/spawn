@@ -1643,3 +1643,181 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
   await expect(liveTerminalRows(page)).toContainText("new 01");
   await expect(liveTerminalRows(page)).not.toContainText("old 1");
 });
+
+const notRunningFrame = {
+  version: 1,
+  kind: "event",
+  event: "attach_refused",
+  reason: "session_not_running",
+};
+
+async function openWaitingTerminal(page: Page, route: string) {
+  await page.clock.install({ time: new Date(0) });
+  await page.clock.pauseAt(new Date(86_400_000));
+  await page.goto(route);
+  const overlay = page.getByTestId("terminal-opening-status");
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50);
+      return (
+        (await overlay.isVisible()) &&
+        (await page.evaluate(() => window.attachProbe.trace.length === 2))
+      );
+    })
+    .toBe(true);
+  return overlay;
+}
+
+for (const route of [`/sessions/${SESSION_ID}`, `/w/${WORKSPACE_ID}`]) {
+  test(`a refusal changes only the waiting copy on ${route.split("/")[1]}`, async ({
+    browser,
+    baseURL,
+  }) => {
+    async function trace(typed: boolean) {
+      const page = await browser.newPage({ baseURL });
+      try {
+        const messages: Array<string | Buffer> = [];
+        await installSessionRtcMock(page, messages, { sendReady: false });
+        const store = await mockApp(page, {
+          sessions: [session()],
+          workspaces: [
+            workspace({
+              layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
+            }),
+          ],
+        });
+        await page.routeWebSocket(/\/ws\/alerts/, () => {});
+        const overlay = await openWaitingTerminal(page, route);
+        messages.length = 0;
+        const start = await page.evaluate(() => Date.now());
+        const requests: string[] = [];
+        page.on("request", (req) => {
+          const url = new URL(req.url());
+          if (url.pathname.startsWith("/api/"))
+            requests.push(`${req.method()} ${url.pathname}${url.search}`);
+        });
+        const send = (channel: string, frame: unknown) =>
+          page.evaluate(([label, data]) => window.attachProbe.receive(label, data), [
+            channel,
+            JSON.stringify(frame),
+          ] as const);
+        const terminal = page.getByLabel("Session terminal");
+        const title = `This session is no longer running on ${store.hosts[0].name}.`;
+        const hint = "Choose Restart from the window menu to start it again.";
+        for (const [index, channel] of ["spawn.pty", "spawn.ctl", "spawn.pty"].entries()) {
+          if (typed) await send(channel, notRunningFrame);
+          await page.clock.runFor(25);
+          await page.evaluate((label) => window.attachProbe.close(label), channel);
+          if (typed) {
+            await expect(overlay).toContainText(title);
+            await expect(overlay).toContainText(hint);
+            await expect(terminal).toHaveAttribute("aria-busy", "false");
+            if (route.startsWith("/sessions")) {
+              const chip = page
+                .getByRole("button", { name: "Connection details: session stopped" })
+                .last();
+              await expect(chip).toBeVisible();
+              await expect(chip.locator(".animate-pulse")).toHaveCount(0);
+            }
+          } else {
+            await expect(overlay).toHaveText("Opening terminal");
+            await expect(terminal).toHaveAttribute("aria-busy", "true");
+          }
+          if (index === 2) await page.evaluate(() => window.attachProbe.acceptNext());
+          await page.clock.runFor(500 * 2 ** index - 1);
+          expect(
+            await page.evaluate(
+              () =>
+                window.attachProbe.trace.filter(({ event }) => event === "attach spawn.pty").length,
+            ),
+          ).toBe(index + 1);
+          await page.clock.runFor(1);
+        }
+        await page.clock.runFor(100);
+        await expect(overlay).toHaveCount(0);
+        await expect(terminal).toHaveAttribute("data-input-ready", "true");
+        await expect(terminal).not.toContainText(title);
+        const events = await page.evaluate(
+          (start) =>
+            window.attachProbe.trace.map(({ event, at }, i) => ({
+              event,
+              at: i < 2 ? 0 : at - start,
+            })),
+          start,
+        );
+        expect(
+          events.filter((item) => item.event === "attach spawn.pty").map((item) => item.at),
+        ).toEqual([0, 525, 1550, 3575]);
+        const commands = messages.map((message) => {
+          if (typeof message !== "string") return message.toString("base64");
+          const { request_id: _id, ...command } = JSON.parse(message);
+          return command;
+        });
+        expect(commands.filter((c) => c.operation === "take_control")).toHaveLength(1);
+        return { events, requests, commands };
+      } finally {
+        await page.close();
+      }
+    }
+    const closes = await trace(false);
+    expect(await trace(true)).toEqual(closes);
+  });
+}
+
+test("the waiting overlay uses the in-hand row and clears after an unanswered retry", async ({
+  page,
+}) => {
+  await installSessionRtcMock(page, [], { sendReady: false });
+  const store = await mockApp(page, { sessions: [session({ status: "starting" })] });
+  await page.routeWebSocket(/\/ws\/alerts/, () => {});
+  const overlay = await openWaitingTerminal(page, `/sessions/${SESSION_ID}`);
+  await expect(overlay).toHaveText("Opening terminal");
+  await page.evaluate((data) => {
+    window.attachProbe.receive("spawn.ctl", data);
+    window.attachProbe.close("spawn.ctl");
+  }, JSON.stringify(notRunningFrame));
+  await expect(overlay).toHaveText("Opening terminal");
+  store.sessions[0].status = "running";
+  const poll = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === `/api/sessions/${SESSION_ID}`,
+  );
+  await page.clock.fastForward(5_000);
+  await poll;
+  await page.clock.runFor(20);
+  await expect(overlay).toContainText("Choose Restart from the window menu to start it again.");
+  await page.clock.fastForward(10_000);
+  await expect(overlay).toHaveText("Opening terminal is taking longer than usual.");
+  await expect(page.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "true");
+});
+
+test("a host connection lost between attempts clears the restart notice", async ({ page }) => {
+  await installSessionRtcMock(page, [], { sendReady: false });
+  const store = await mockApp(page, { sessions: [session()] });
+  await page.routeWebSocket(/\/ws\/alerts/, () => {});
+  const overlay = await openWaitingTerminal(page, `/sessions/${SESSION_ID}`);
+  await page.evaluate((frame) => {
+    window.attachProbe.receive("spawn.ctl", JSON.stringify(frame));
+    window.attachProbe.close("spawn.ctl");
+  }, notRunningFrame);
+  const title = `This session is no longer running on ${store.hosts[0].name}.`;
+  const hint = "Choose Restart from the window menu to start it again.";
+  await expect(overlay).toContainText(title);
+  await expect(overlay).toContainText(hint);
+  await page.evaluate(() =>
+    (
+      window as unknown as { __spawnHostMock: { closeSignaling(code: number): void } }
+    ).__spawnHostMock.closeSignaling(1002),
+  );
+  const status = page.getByTestId("terminal-connecting");
+  await expect(status).toContainText("The link dropped. SPAWN D is retrying automatically.");
+  await page.clock.runFor(501);
+  await expect(status).toHaveAttribute("data-stage", "dropped");
+  await expect(page.getByText(title, { exact: false })).toHaveCount(0);
+  await expect(page.getByText(hint, { exact: false })).toHaveCount(0);
+  expect(await page.evaluate(() => window.attachProbe.trace.map(({ event }) => event))).toEqual([
+    "attach spawn.pty",
+    "attach spawn.ctl",
+    "close spawn.ctl",
+    "close spawn.pty",
+  ]);
+});

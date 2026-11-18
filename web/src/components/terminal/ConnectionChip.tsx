@@ -20,6 +20,7 @@ export interface SessionConnectionInfo extends ConnInfo {
   socketState: SocketState;
   v3: boolean;
   dcOpen: boolean;
+  notRunningNotice?: string | null;
   /** Set when the connection was refused because the host identity could not
    * be verified against a local pin. A refusal is terminal, not a retry. */
   signedRtcRefusal?: SignedRtcRefusalReason | null;
@@ -106,6 +107,9 @@ function viewFor(info: SessionConnectionInfo): ChipView {
       label: info.rttMs != null ? `${KIND_LABEL[kind]} · ${info.rttMs} ms` : KIND_LABEL[kind],
       detail: KIND_DETAIL[kind],
     };
+  }
+  if (info.notRunningNotice) {
+    return { dot: "bg-muted-foreground", label: "session stopped", detail: info.notRunningNotice };
   }
   if (info.socketState === "closed" || info.socketState === "error") {
     return { dot: "bg-destructive", label: "offline", detail: "Control connection lost" };

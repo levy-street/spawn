@@ -611,7 +611,7 @@
     {
       "target": "spawnd::rtc",
       "file": "src/rtc.rs",
-      "line": 4850,
+      "line": 4857,
       "field": "error",
       "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
       "why": "Direct tokio::fs::write io::Error, not a parser or a worker spawn error; path is a separate allowed field."
@@ -690,35 +690,35 @@
     },
     {
       "file": "src/rtc.rs",
-      "line": 4849,
+      "line": 4856,
       "field": "path",
       "source": "tracing::debug!(path = %path.display(), \"replay dumped for diagnostics\")",
       "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."
     },
     {
       "file": "src/rtc.rs",
-      "line": 4850,
+      "line": 4857,
       "field": "path",
       "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
       "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."
     },
     {
       "file": "src/run.rs",
-      "line": 4267,
+      "line": 4278,
       "field": "shell",
       "source": "tracing::warn!(\n                shell = %shell.display(),\n                mode,\n                \"the user's shell did not say its PATH in time and was stopped; what it would have added is not used\"\n            )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4514,
+      "line": 4525,
       "field": "path",
       "source": "tracing::info!(path = %path.display(), \"created the user's Codex home\")",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."
     },
     {
       "file": "src/run.rs",
-      "line": 4516,
+      "line": 4527,
       "field": "path",
       "source": "tracing::warn!(\n            path = %path.display(),\n            %error,\n            \"could not create the user's Codex home; this window's Codex keeps its own\"\n        )",
       "why": "Local Codex home path, or existing absolute shell executable selected separately from arguments."

@@ -20,9 +20,13 @@ pub struct SessionRegistry {
     /// One-shot guard for startup worker discovery. The first WS session of
     /// the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
-    /// Serializes lazy worker adoption so concurrent snapshot/input bursts do
-    /// not create competing connections to the same worker.
-    attach_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The validated directory used by the completed startup scan.
+    discovered_dir: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// Preserve serialization of the existing lazy adoption path.
+    attach_lock: Arc<AsyncMutex<()>>,
+    /// Launch, lazy adoption and the whole restart have gaps outside the
+    /// generation transition. A device may inspect only between those jobs.
+    worker_gates: Arc<Mutex<HashMap<Uuid, Weak<tokio::sync::RwLock<()>>>>>,
     /// Serializes the linearization point between a concrete backend
     /// generation and RTC peer insertion/teardown for its UUID. The registry
     /// entry itself remains behind the small synchronous lock above; this
@@ -101,9 +105,27 @@ impl SessionRegistry {
         !self.discovery_done.swap(true, Ordering::SeqCst)
     }
 
-    /// Guard held for the duration of a lazy worker adoption.
     pub async fn lock_attach(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.attach_lock.lock().await
+    }
+
+    pub fn finish_discovery(&self, dir: std::path::PathBuf) {
+        let _ = self.discovered_dir.set(dir);
+    }
+
+    pub fn discovered_dir(&self) -> Option<&std::path::PathBuf> {
+        self.discovered_dir.get()
+    }
+
+    pub fn worker_gate(&self, id: Uuid) -> Arc<tokio::sync::RwLock<()>> {
+        let mut gates = self.worker_gates.lock().expect("worker gates");
+        if let Some(gate) = gates.get(&id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        gates.insert(id, Arc::downgrade(&gate));
+        gate
     }
 
     /// Lock one session UUID's backend-generation transition.

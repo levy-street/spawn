@@ -388,7 +388,15 @@ updater knew about variants.
 
 - Shared device RTC lives in `rtc_pair.rs`: signed host-v2 admission owns
   the peer; local registry attachments reuse the session protocol and own only
-  channels. Fence every effect by parent trust/binding and worker generation.
+  channels. After peer admission checks, a missing window can receive a
+  device-only `session_not_running` text event on each channel before close.
+  Discovery must have finished, with no launch, adoption, restart or removal
+  under way for the id. Check only metadata in the discovered directory,
+  outside admission. Any endpoint marker, lock file, socket or error gets
+  the ordinary close. This check never contacts a worker or changes a session.
+  Devices keep retrying and point to Restart in the window menu. The server
+  can continue listing the session as running.
+  Fence every effect by parent trust/binding and worker generation.
   `session_ctl.rs` retains the controlling device's lease until explicit take
   or session removal; `focus_view` only moves control within that device.
   Both clients send the take when a session is opened, never on reconnect.
@@ -950,8 +958,7 @@ of one device connection's channels wait at once (every channel the pair
 could hold together: two per terminal attachment, its host consumers, its
 root), and one past that is refused there and then. A terminal label
 naming a session the daemon neither runs nor has a transition in progress
-for is refused before the transition is taken, so a device cannot mint a
-lock per made-up id.
+for takes no generation transition and never waits on daemon-wide admission.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed

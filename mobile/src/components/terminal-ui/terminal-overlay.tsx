@@ -150,6 +150,16 @@ export function TerminalOverlay({
   const fontSize = sessionUi?.fontSize ?? DEFAULT_SESSION_UI.fontSize;
   const lastKnownTitle = sessionUi?.lastKnownTitle ?? null;
   const [surfaceGeneration, setSurfaceGeneration] = useState(0);
+  const run = useMemo(
+    () => ({
+      session: session.id,
+      host: host.id,
+      rowHost: session.host_id,
+      start: session.started_at,
+    }),
+    [session.id, host.id, session.host_id, session.started_at],
+  );
+  const [refusedRun, setRefusedRun] = useState<typeof run | null>(null);
   const [connectionState, setConnectionState] = useState<TransportState>("idle");
   const [connectionError, setConnectionError] = useState<TransportError | null>(null);
   const [diagnostic, setDiagnostic] = useState<WorkerDiagnostic | null>(null);
@@ -560,6 +570,7 @@ export function TerminalOverlay({
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
           <View style={styles.surface}>
             <TerminalSurface
+              onAttachResult={(notRunning) => setRefusedRun(notRunning ? run : null)}
               claimDisplay={incarnation.claimOwed}
               fontSize={fontSize}
               hostId={incarnation.hostId}
@@ -596,6 +607,11 @@ export function TerminalOverlay({
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
         <ConnectionStateOverlay
+          notRunningNotice={
+            refusedRun === run && session.status === "running" && host.id === session.host_id
+              ? `This session is no longer running on ${host.name ?? session.host_name ?? "this host"}.`
+              : null
+          }
           awaitingApproval={awaitingApproval}
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}

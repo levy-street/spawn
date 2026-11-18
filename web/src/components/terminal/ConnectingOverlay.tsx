@@ -16,6 +16,8 @@ const LEAVE_MS = 260;
 /** A connect that has not landed by here is not "about to" — say so. */
 const SLOW_AFTER_MS = 8_000;
 
+export const RESTART_HINT = "Choose Restart from the window menu to start it again.";
+
 type Stage =
   | "blocked"
   | "disabled"
@@ -178,6 +180,7 @@ export function ConnectingOverlay({
   dcOpen,
   refusal,
   painted,
+  notRunningNotice,
   hostName = null,
   hostOffline = false,
   sharedConnectionReady = false,
@@ -189,6 +192,7 @@ export function ConnectingOverlay({
   refusal?: SignedRtcRefusalReason | null;
   /** True once anything at all has been written into the terminal buffer. */
   painted: boolean;
+  notRunningNotice?: string | null;
   hostName?: string | null;
   hostOffline?: boolean;
   sharedConnectionReady?: boolean;
@@ -236,7 +240,13 @@ export function ConnectingOverlay({
         className="pointer-events-none absolute inset-x-0 bottom-0 z-[6] flex items-center gap-2 border-t border-border bg-popover px-3 py-2 text-xs text-muted-foreground"
       >
         <LoaderCircle className="size-3.5 animate-spin" />
-        <span>{slow ? "Opening terminal is taking longer than usual." : "Opening terminal"}</span>
+        {notRunningNotice ? (
+          <span>
+            {notRunningNotice} {RESTART_HINT}
+          </span>
+        ) : (
+          <span>{slow ? "Opening terminal is taking longer than usual." : "Opening terminal"}</span>
+        )}
       </div>
     );
   }
@@ -279,9 +289,9 @@ export function ConnectingOverlay({
           <Endpoint />
         </div>
         <div className="space-y-1.5">
-          <p className="text-sm font-medium text-foreground">{view.title}</p>
+          <p className="text-sm font-medium text-foreground">{notRunningNotice ?? view.title}</p>
           <p className="mx-auto max-w-[42ch] text-xs leading-5 text-muted-foreground">
-            {view.body}
+            {notRunningNotice ? RESTART_HINT : view.body}
           </p>
         </div>
       </div>

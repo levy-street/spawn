@@ -845,8 +845,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       const sessionMock = () =>
         (globalThis as typeof globalThis & { __spawnSessionMock?: SessionMock }).__spawnSessionMock;
       const peers: MockHostPeerConnection[] = [];
+      let hostSocket: MockHostWebSocket;
       (globalThis as typeof globalThis & { __spawnHostMock: unknown }).__spawnHostMock = {
         count: () => peers.length,
+        closeSignaling: (code: number) => hostSocket.close(code),
         disconnect: () => peers.find((peer) => peer.connectionState === "connected")?.close(),
       };
       class MockHostPeerConnection {
@@ -910,6 +912,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         onclose: ((event: CloseEvent) => void) | null = null;
         readonly hostId: string;
         constructor(url: string | URL) {
+          hostSocket = this;
           this.hostId = new URL(String(url), location.href).searchParams.get("host_id") ?? "";
           setTimeout(() => {
             this.readyState = MockHostWebSocket.OPEN;
@@ -950,10 +953,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
               });
           }
         }
-        close() {
+        close(code?: number) {
           if (this.readyState === MockHostWebSocket.CLOSED) return;
           this.readyState = MockHostWebSocket.CLOSED;
-          this.onclose?.(new CloseEvent("close"));
+          this.onclose?.(new CloseEvent("close", { code }));
         }
         private emit(values: Record<string, unknown>) {
           setTimeout(() => {

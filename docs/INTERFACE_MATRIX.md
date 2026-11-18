@@ -66,9 +66,21 @@ its tiles before deleting the workspace.
 | Browser session signaling | `/ws/browser?session_id=<session UUID>` | WS subprotocol `spawn.v3` | RTC signaling and disclosed `session.status` / `session.exit`; no terminal-content fallback |
 | Daemon control | `/ws/daemon` | WS subprotocol `spawn.control.v3` | registration, lifecycle, disclosed activity, agent availability, and RTC signaling |
 | Browser host signaling | `/ws/host?host_id=<host UUID>` | WS subprotocol `spawn.host.v1` | RTC signaling for the host control channel |
-| Session PTY | DataChannel `spawn.pty` | protocol version 2 | raw PTY bytes |
+| Session PTY | DataChannel `spawn.pty` | protocol version 2 | raw PTY bytes on an admitted channel |
 | Session control | DataChannel `spawn.ctl` | locked protocol version 1 | replay, viewport/display ownership, and session uploads |
 | Host control | DataChannel `spawn.host.ctl` | protocol version 1 | host filesystem and host-scoped protected operations |
+
+On a shared host connection, either half of a refused terminal attachment can
+close first. After discovery and admission, a host that finds no worker or
+worker files for a window outside a lifecycle change can send one text event
+on each channel before closing, with `version: 1`, `kind: "event"`,
+`event: "attach_refused"` and `reason: "session_not_running"`. An ordinary
+close also occurs before discovery finishes, when admission refuses, when the
+filesystem check is uncertain, on timeout, or when the channel closes first.
+Older devices ignore PTY text and unknown control events and retry on close.
+Both apps keep retrying on close. For a running row, the waiting overlay
+explains the last refusal and points to Restart in the window menu. This
+exchange neither contacts a worker nor records a session change on the server.
 
 `spawn.host.ctl` advertises what a daemon can do in its `hello`. A new
 operation family is one versioned capability for the whole family (`conv.v1`

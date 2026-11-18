@@ -43,7 +43,12 @@ import type { DisplayControlState } from "@/lib/ws";
 export interface UseSessionSocketOptions {
   connection?: DaemonConnection | null;
   sessionId: string;
-  sessionStatus?: { status: string; exit_code: number | null } | null;
+  sessionStatus?: {
+    status: string;
+    exit_code: number | null;
+    host_id: string;
+    started_at: string;
+  } | null;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
@@ -139,6 +144,21 @@ const UPLOAD_READY_WAIT_MS = 20_000;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const MAX_PENDING_INPUT_AGE_MS = 30_000;
 
+function isNotRunningFrame(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 16 * 1024) return false;
+  try {
+    const frame = JSON.parse(data);
+    return (
+      frame?.version === 1 &&
+      frame.kind === "event" &&
+      frame.event === "attach_refused" &&
+      frame.reason === "session_not_running"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function newRtcSessionId(): string {
   return crypto.randomUUID();
 }
@@ -157,6 +177,15 @@ export function useSessionSocket({
   onSnapshot,
   onSnapshotError,
 }: UseSessionSocketOptions) {
+  const run = useMemo(
+    () => ({ sessionId, host: sessionStatus?.host_id, start: sessionStatus?.started_at }),
+    [sessionId, sessionStatus?.host_id, sessionStatus?.started_at],
+  );
+  const currentRun = useRef(run);
+  currentRun.current = run;
+  const [refusedRun, setRefusedRun] = useState<typeof run | null>(null);
+  const sessionNotRunning = refusedRun === run;
+
   const [state, setState] = useState<SocketState>("idle");
   // True after the one supported signaling protocol is negotiated.
   const [v3, setV3] = useState(false);
@@ -290,11 +319,13 @@ export function useSessionSocket({
     setQueuedInputCount(0);
     setV3(Boolean(connection));
     setDcOpen(false);
+    setRefusedRun(null);
     if (!enabled || !sessionId || !connection) {
       setState("idle");
       return;
     }
     let cancelled = false;
+    let refusedGeneration: number | undefined;
     let rtcRetryAttempts = 0;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -316,6 +347,7 @@ export function useSessionSocket({
         (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
       )
         return;
+      if (rtc.rtcGeneration !== refusedGeneration) setRefusedRun(null);
       clearRtcConnectTimer();
       rtcRef.current = {
         sessionId: null,
@@ -366,6 +398,7 @@ export function useSessionSocket({
         connection.getSnapshot().state !== "ready"
       )
         return;
+      const attemptedRun = currentRun.current;
       const rtcGeneration = ++rtcGenerationRef.current;
       const rtcSessionId = newRtcSessionId();
       const suffix = `${sessionId}/${viewId.current}/${rtcSessionId}`;
@@ -380,6 +413,7 @@ export function useSessionSocket({
           throw error;
         }
       } catch {
+        setRefusedRun(null);
         scheduleRtcRetry();
         return;
       }
@@ -794,6 +828,14 @@ export function useSessionSocket({
       ptyDc.bufferedAmountLowThreshold = 64 * 1024;
       ptyDc.onbufferedamountlow = flushPendingInput;
 
+      // The daemon also closes the channels. Only that ordinary close drives retry.
+      const observeReply = (data: unknown) => {
+        if (!serverReady && isNotRunningFrame(data)) {
+          refusedGeneration = rtcGeneration;
+          setRefusedRun(attemptedRun);
+        }
+      };
+
       const markReady = () => {
         const current = rtcRef.current;
         if (
@@ -808,6 +850,7 @@ export function useSessionSocket({
         }
         rtcRef.current = { ...current, open: true };
         clearRtcConnectTimer();
+        setRefusedRun(null);
         rtcRetryAttempts = 0;
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
@@ -1047,6 +1090,7 @@ export function useSessionSocket({
       ptyDc.onmessage = (event) => {
         if (!isCurrentRtcGeneration()) return;
         const data = event.data;
+        observeReply(data);
         if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
         void ptyMessages
           .enqueue(
@@ -1084,6 +1128,7 @@ export function useSessionSocket({
         ctlDc.onmessage = (event) => {
           if (!isCurrentRtcGeneration()) return;
           const data = event.data;
+          observeReply(data);
           if (
             typeof data !== "string" &&
             !(data instanceof ArrayBuffer) &&
@@ -1173,6 +1218,7 @@ export function useSessionSocket({
       setSignalingTrust(snapshot.trust);
       setConnInfo(snapshot.info ?? EMPTY_CONN_INFO);
       if (snapshot.state !== "ready") {
+        setRefusedRun(null);
         pendingInputRef.current.clear();
         updateQueuedInputState();
         setDcOpen(false);
@@ -1302,6 +1348,7 @@ export function useSessionSocket({
       v3,
       dcOpen,
       queuedInputCount,
+      sessionNotRunning,
       connInfo,
       signedRtcRefusal,
       signalingTrust,
@@ -1314,6 +1361,7 @@ export function useSessionSocket({
       v3,
       dcOpen,
       queuedInputCount,
+      sessionNotRunning,
       connInfo,
       signedRtcRefusal,
       signalingTrust,

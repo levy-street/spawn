@@ -3936,6 +3936,17 @@ async fn handle_session_create(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
+    let gate = registry.worker_gate(create.session_id);
+    let _change = gate.write().await;
+    launch_session(create, registry, rtc_sessions, out_tx).await;
+}
+
+async fn launch_session(
+    create: SessionCreate,
+    registry: &SessionRegistry,
+    rtc_sessions: &RtcSessions,
+    out_tx: &mpsc::Sender<WsOutbound>,
+) {
     let session_id = create.session_id;
     tracing::info!(%session_id, "session.create");
 
@@ -8192,6 +8203,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_device_cannot_read_absence_during_a_window_change() {
+        let registry = SessionRegistry::new();
+        let rtc = RtcSessions::new();
+        let temp = tempfile::tempdir().unwrap();
+        registry.finish_discovery(temp.path().to_owned());
+        rtc.bind_registered_host_id(Uuid::new_v4()).await;
+        let pc = crate::rtc::connect_terminal_pair(&rtc, &registry, temp.path()).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let create = skilled_create(temp.path().to_str().unwrap());
+        let id = create.session_id;
+        let gate = registry.worker_gate(id);
+        let hold = gate.read().await;
+        // These operations are parked at their first await, before any
+        // endpoint or registry entry exists. A queued writer excludes probes.
+        {
+            let launch = handle_session_create(create.clone(), &registry, &rtc, &tx);
+            tokio::pin!(launch);
+            assert!(futures_util::poll!(&mut launch).is_pending());
+            assert!(crate::rtc::refusal_frames(&pc, id, "pty").await.is_empty());
+        }
+        {
+            let adoption = ensure_session_attached(id, &registry, &rtc, &tx);
+            tokio::pin!(adoption);
+            assert!(futures_util::poll!(&mut adoption).is_pending());
+            assert!(crate::rtc::refusal_frames(&pc, id, "pty").await.is_empty());
+        }
+        {
+            let restart = handle_session_restart(create, &registry, &rtc, &tx);
+            tokio::pin!(restart);
+            assert!(futures_util::poll!(&mut restart).is_pending());
+            assert!(crate::rtc::refusal_frames(&pc, id, "pty").await.is_empty());
+        }
+        assert_eq!(crate::rtc::refusal_frames(&pc, id, "pty").await.len(), 1);
+        drop(hold);
+        let stalled = rtc.stall_refusal_send(id).await;
+        let refusal = crate::rtc::refusal_frames(&pc, id, "pty");
+        tokio::pin!(refusal);
+        tokio::select! {
+            _ = stalled.wait_entered() => {}
+            _ = &mut refusal => panic!("refusal closed before send"),
+        }
+        // Dispatch can acquire the lifecycle writer for both windows while the
+        // send is stalled. Park each handler at its next lock, before any action.
+        for window in [id, Uuid::new_v4()] {
+            let mut command = skilled_create(temp.path().to_str().unwrap());
+            command.session_id = window;
+            let _before_replacement = registry.lock_generation_transition(window).await;
+            let dispatch = handle_session_restart(command, &registry, &rtc, &tx);
+            tokio::pin!(dispatch);
+            assert!(futures_util::poll!(&mut dispatch).is_pending());
+            assert_eq!(registry.generation_transition_holders(window), 2);
+        }
+        assert!(
+            refusal.await.is_empty(),
+            "stalled send ends in an ordinary close"
+        );
+        rtc.close_all().await;
+        pc.close().await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
     fn skilled_create(cwd: &str) -> SessionCreate {
         SessionCreate {
             session_id: Uuid::new_v4(),
@@ -8579,6 +8652,8 @@ async fn handle_session_restart(
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let session_id = create.session_id;
+    let gate = registry.worker_gate(session_id);
+    let _change = gate.write().await;
     let daemon_pid = std::process::id();
     tracing::info!(daemon_pid, %session_id, "session.restart");
 
@@ -8659,7 +8734,7 @@ async fn handle_session_restart(
         return;
     }
     tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
-    handle_session_create(create, registry, rtc_sessions, out_tx).await;
+    launch_session(create, registry, rtc_sessions, out_tx).await;
     // The replacement is registered (or its failure is on the wire): a device
     // re-offering on this word is not refused for a session that is gone.
     if let Some(announcements) = announcements {
@@ -8822,7 +8897,7 @@ async fn send_spawn_failed_exit(session_id: Uuid, out_tx: &mpsc::Sender<WsOutbou
     }
 }
 
-async fn spawn_exit_forwarder(
+pub(crate) async fn spawn_exit_forwarder(
     session_id: Uuid,
     generation: u64,
     exit_rx: tokio::sync::oneshot::Receiver<pty::ExitReason>,
@@ -8960,6 +9035,8 @@ async fn ensure_session_attached(
     }
     // Serialize lazy adoption: snapshot bursts and stdin dispatch racing here
     // would double-connect and displace each other's worker connections.
+    let gate = registry.worker_gate(session_id);
+    let _change = gate.write().await;
     let _guard = registry.lock_attach().await;
     if registry.contains(session_id) {
         return AttachOutcome::Attached;
@@ -8987,7 +9064,11 @@ async fn rediscover_existing_sessions(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    for session_id in worker_backend::discover_ids() {
+    let Ok(dir) = worker_backend::worker_dir() else {
+        return;
+    };
+    use spawnd::sessiond::endpoint;
+    for session_id in endpoint::discover_ids(&dir, &endpoint::config_root_tag()) {
         if registry.contains(session_id) {
             continue;
         }
@@ -8999,4 +9080,5 @@ async fn rediscover_existing_sessions(
             }
         }
     }
+    registry.finish_discovery(dir);
 }

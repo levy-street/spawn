@@ -121,6 +121,8 @@ export interface SignalChannelLike {
 }
 
 export interface SessionTransportOptions {
+  /** Capture the current run's notice callback when a channel pair is opened. */
+  attachResultListener?: () => ((notRunning: boolean) => void) | undefined;
   sessionId: string;
   hostIdentityPublicKey: string;
   initialSize: { cols: number; rows: number };

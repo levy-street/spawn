@@ -1,5 +1,16 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
 
+declare global {
+  interface Window {
+    attachProbe: {
+      trace: { event: string; at: number }[];
+      receive(channel: string, data: string): void;
+      close(channel: string): void;
+      acceptNext(): void;
+    };
+  }
+}
+
 type Capture = string | Buffer;
 
 export async function installSessionRtcMock(
@@ -185,6 +196,7 @@ export async function installSessionRtcMock(
 
         constructor(label: string, init?: RTCDataChannelInit) {
           this.label = label.split("/")[0];
+          window.attachProbe.trace.push({ event: `attach ${this.label}`, at: Date.now() });
           this.historyIndex = state.ptyChannels.length;
           this.ordered = init?.ordered ?? true;
           this.maxPacketLifeTime = init?.maxPacketLifeTime ?? null;
@@ -370,6 +382,7 @@ export async function installSessionRtcMock(
 
         close() {
           if (this.readyState === "closed") return;
+          window.attachProbe.trace.push({ event: `close ${this.label}`, at: Date.now() });
           this.readyState = "closed";
           this.onclose?.();
         }
@@ -423,6 +436,14 @@ export async function installSessionRtcMock(
           state.connections++;
         },
         openChannels: state.openChannels,
+      };
+      window.attachProbe = {
+        trace: [],
+        receive: (channel, data) => state.channels.get(channel)!.receive(data),
+        close: (channel) => state.channels.get(channel)!.close(),
+        acceptNext: () => {
+          state.sendReady = true;
+        },
       };
       class FakePeerConnection {
         localDescription: RTCSessionDescriptionInit | null = null;
