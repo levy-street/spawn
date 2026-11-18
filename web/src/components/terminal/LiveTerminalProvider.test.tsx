@@ -9,7 +9,7 @@
  * under bun with no DOM, so a small one is put in place below: enough of
  * Node, Element and Document for React DOM to mount <div>s and portals.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import {
   forwardRef,
   type ReactNode,
@@ -519,6 +519,8 @@ describe("a terminal that missed the move's data frame", () => {
 });
 
 test("an attach reply belongs to the exact attempt and run that received it", async () => {
+  jest.useFakeTimers();
+  const settle = (work: () => void) => m.act(work);
   let session = row(DREAM);
   let refused = false;
   let sync = () => {};
@@ -626,5 +628,6 @@ test("an attach reply belongs to the exact attempt and run that received it", as
     }
   } finally {
     await settle(() => root.unmount());
+    jest.useRealTimers();
   }
 });

@@ -319,6 +319,7 @@ export function useSessionSocket({
     setQueuedInputCount(0);
     setV3(Boolean(connection));
     setDcOpen(false);
+    setRefusedRun(null);
     if (!enabled || !sessionId || !connection) {
       setState("idle");
       return;
@@ -1217,6 +1218,7 @@ export function useSessionSocket({
       setSignalingTrust(snapshot.trust);
       setConnInfo(snapshot.info ?? EMPTY_CONN_INFO);
       if (snapshot.state !== "ready") {
+        setRefusedRun(null);
         pendingInputRef.current.clear();
         updateQueuedInputState();
         setDcOpen(false);

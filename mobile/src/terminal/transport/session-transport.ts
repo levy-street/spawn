@@ -346,6 +346,7 @@ class WebViewSessionTransport implements SessionTransport {
       return;
     }
     if (this.#lease.shared.transport.state !== "ready") {
+      this.options.attachResultListener?.()?.(false);
       this.#detach();
       if (this.#lease.shared.transport.state === "failed") {
         const error = this.#lease.shared.transport.lastError ?? this.#lastError;

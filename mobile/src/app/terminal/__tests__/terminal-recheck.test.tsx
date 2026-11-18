@@ -14,6 +14,7 @@ import {
 import { qk } from "@/data/queryKeys";
 import type { NativeToWorkerMessage, WorkerBridge } from "@/terminal/transport/bridge";
 import { CONNECT_TIMEOUT_MS, type HostTransportOptions } from "@/terminal/transport/types";
+import { sessionWorkerSource, spctFrame } from "@/terminal/worker/__tests__/worker-harness";
 import { FIXTURE_IDS, makeHost, makeSession } from "../../../../tests/factories";
 import { renderWithProviders } from "../../../../tests/render";
 
@@ -38,25 +39,50 @@ jest.mock("expo-keep-awake", () => ({
   deactivateKeepAwake: jest.fn(async () => {}),
 }));
 
-const mockAttachments: { id: string; root: WorkerBridge; at: number }[] = [];
+const mockAttachments: { id: string; root: WorkerBridge; hostId: string; at: number }[] = [];
+let mockFailHost: () => void;
 const mockRootCommands: NativeToWorkerMessage[] = [];
 jest.mock("@/terminal/transport/host-transport", () => ({
-  createHostTransport: ({ bridge }: HostTransportOptions) => {
+  createHostTransport: ({ bridge, hostId }: HostTransportOptions) => {
     const root = bridge as WorkerBridge;
     root.attach((raw) => {
       const frame: NativeToWorkerMessage = JSON.parse(raw);
       mockRootCommands.push(frame);
       if (frame.type === "pair-attach")
-        mockAttachments.push({ id: frame.attachmentId, root, at: Date.now() });
+        mockAttachments.push({ id: frame.attachmentId, root, hostId, at: Date.now() });
     });
-    return { state: "ready", on: () => () => {}, close: jest.fn() };
+    const transport = {
+      state: "ready",
+      on(event: string, listener: () => void) {
+        if (event === "state") {
+          mockFailHost = () => {
+            transport.state = "failed";
+            listener();
+          };
+        }
+        return () => {};
+      },
+      close: jest.fn(),
+    };
+    return transport;
   },
 }));
 
-// Run the real terminal worker's channel proxy. A daemon close has to travel
-// through the WebView and back before the native transport schedules a retry.
-const mockPairSource = readFileSync(require.resolve("@/terminal/worker/worker-pair.js"), "utf8");
-const mockPost = jest.fn();
+// Run the WebView's message dispatcher, session worker and channel proxy together.
+const workerScript = (name: string) =>
+  readFileSync(require.resolve(`@/terminal/worker/worker-${name}.js`), "utf8");
+const mockLoadWorker = new Function(
+  "globalThis",
+  "window",
+  "document",
+  [
+    workerScript("runtime"),
+    sessionWorkerSource(),
+    workerScript("pair"),
+    workerScript("transport"),
+    "return globalThis.spawnWorker.state;",
+  ].join("\n"),
+);
 jest.mock("react-native-webview", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
@@ -72,22 +98,30 @@ jest.mock("react-native-webview", () => {
         const latest = React.useRef(props);
         latest.current = props;
         React.useImperativeHandle(ref, () => {
-          const api = {
-            state: { mode: "session", rtcSessionId: "" },
-            post(frame: object) {
-              const data = JSON.stringify({ v: 1, attachmentId: api.state.rtcSessionId, ...frame });
-              void Promise.resolve().then(() =>
-                latest.current.onMessage({ nativeEvent: { data } }),
-              );
+          const window = new EventTarget();
+          const document = { documentElement: { style: {} }, body: { style: {} } };
+          const state = mockLoadWorker(
+            {
+              ReactNativeWebView: {
+                postMessage(data: string) {
+                  void Promise.resolve().then(() =>
+                    latest.current.onMessage({ nativeEvent: { data } }),
+                  );
+                },
+              },
             },
-            handlePairMessage: (_frame: NativeToWorkerMessage) => false,
+            window,
+            document,
+          );
+          state.term = {
+            options: {},
+            buffer: { active: { baseY: 0, viewportY: 0 } },
+            write: (_bytes: Uint8Array, done: () => void) => done(),
+            scrollToBottom: () => {},
           };
-          new Function("globalThis", mockPairSource)({ spawnWorker: api });
           return {
-            postMessage(raw: string) {
-              const frame = JSON.parse(raw) as NativeToWorkerMessage;
-              mockPost(frame);
-              api.handlePairMessage(frame);
+            postMessage(data: string) {
+              window.dispatchEvent(new MessageEvent("message", { data }));
             },
           };
         }, []);
@@ -146,11 +180,28 @@ async function openTerminal() {
           attachmentId: attachment.id,
           channel,
           event,
-          ...(data === undefined ? {} : { data: JSON.stringify(data), binary: false, sequence: 1 }),
+          ...(data === undefined
+            ? {}
+            : {
+                data:
+                  data instanceof Uint8Array
+                    ? Buffer.from(data).toString("base64")
+                    : JSON.stringify(data),
+                binary: data instanceof Uint8Array,
+                sequence: 1,
+              }),
         }),
       );
     });
   return { screen, session, element, advance, notice, pair };
+}
+
+// A control send at the host bridge carries the text written by the worker's channel.
+function controlFrame(command: NativeToWorkerMessage) {
+  if (command.type !== "pair-command" || command.channel !== "ctl" || command.event !== "send")
+    return null;
+  expect(command.binary).toBe(false);
+  return JSON.parse(command.data ?? "") as { request_id: string; operation: string };
 }
 
 test("typed and plain closes produce identical attempts, teardown, requests and control", async () => {
@@ -166,16 +217,33 @@ test("typed and plain closes produce identical attempts, teardown, requests and 
       expect(Boolean(screen.queryByText(hint))).toBe(typed);
       await advance(500);
     }
-    await fireEvent(screen.getByTestId("worker"), "message", {
-      nativeEvent: {
-        data: JSON.stringify({
-          v: 1,
-          type: "state",
-          state: "ready",
-          attachmentId: mockAttachments.at(-1)?.id,
-        }),
-      },
+    await pair("open", "pty");
+    await pair("open", "ctl");
+    await pair("data", "ctl", {
+      version: 1,
+      kind: "event",
+      event: "ready",
+      upload_capability: "test",
+      agent_generation: 1,
+      upload_max_bytes: 20 * 1024 * 1024,
+      upload_chunk_bytes: 48 * 1024,
     });
+    const sent = () => mockRootCommands.map(controlFrame);
+    const history = sent().find((request) => request?.operation === "history");
+    if (!history) throw new Error("Missing history request");
+    await pair("data", "ctl", {
+      version: 1,
+      kind: "response",
+      operation: "history",
+      request_id: history.request_id,
+      ok: true,
+      plain: false,
+      pty_offset: 0,
+      total_bytes: 1,
+      chunks: 1,
+    });
+    expect(sent().some((request) => request?.operation === "take_control")).toBe(false);
+    await pair("data", "ctl", spctFrame(history.request_id, 0, true, Uint8Array.of(32)));
     expect(notice()).toBeNull();
     expect(screen.queryByText(hint)).toBeNull();
     const attempts = mockAttachments.map((a, i) => (i === 0 ? 0 : a.at - start));
@@ -184,11 +252,24 @@ test("typed and plain closes produce identical attempts, teardown, requests and 
       if (f.type === "pair-attach") return ["attach"];
       // Receive credits acknowledge incoming frames inside the local bridge.
       if (f.type === "pair-command" && f.event === "received") return [];
+      const control = controlFrame(f);
+      if (control) {
+        const { request_id: _id, ...request } = control;
+        return [JSON.stringify(request)];
+      }
       if (f.type === "pair-command") return [[f.channel, f.event, f.data].join(" ")];
       return [f.type];
     });
-    const claims = mockPost.mock.calls.filter(([f]) => f.type === "take-control");
-    expect(claims).toHaveLength(1);
+    expect(sent().filter((request) => request?.operation === "take_control")).toEqual([
+      {
+        version: 1,
+        kind: "request",
+        request_id: expect.any(String),
+        operation: "take_control",
+        cols: 80,
+        rows: 24,
+      },
+    ]);
     const requests = [
       getSession,
       getHost,
@@ -198,10 +279,49 @@ test("typed and plain closes produce identical attempts, teardown, requests and 
       restartSession,
     ].map((fn) => [...jest.mocked(fn).mock.calls]);
     await screen.unmount();
-    return { attempts, commands, requests, claims };
+    return { attempts, commands, requests };
   }
   const plain = await trace(false);
   expect(await trace(true)).toEqual(plain);
+});
+
+test("a host failure between attempts replaces the restart notice", async () => {
+  const { screen, advance, notice, pair } = await openTerminal();
+  await pair("open", "ctl");
+  await pair("data", "ctl", frame);
+  await pair("close");
+  expect(notice()).toBeOnTheScreen();
+  expect(screen.getByText(hint)).toBeOnTheScreen();
+  await act(mockFailHost);
+  expect(screen.getByText("Connection failed")).toBeOnTheScreen();
+  await advance(501);
+  expect(mockAttachments).toHaveLength(1);
+  expect(notice()).toBeNull();
+  expect(screen.queryByText(hint)).toBeNull();
+});
+
+test("refusals from the previous host stay hidden while the new host is loading", async () => {
+  const { screen, session, advance, notice, pair } = await openTerminal();
+  jest.mocked(getHost).mockImplementationOnce(() => new Promise(() => {}));
+  await act(() =>
+    screen.queryClient.setQueryData(qk.session(session.id), {
+      ...session,
+      host_id: FIXTURE_IDS.workspace,
+    }),
+  );
+  await waitFor(() => expect(getHost).toHaveBeenCalledWith(FIXTURE_IDS.workspace));
+  // Close the pre-move pair. Both retries below start after the row has moved.
+  await pair("close");
+  for (const attempt of [2, 3]) {
+    await advance(500);
+    expect(mockAttachments).toHaveLength(attempt);
+    expect(mockAttachments.at(-1)?.hostId).toBe(session.host_id);
+    await pair("open", "ctl");
+    await pair("data", "ctl", frame);
+    await pair("close");
+    expect(notice()).toBeNull();
+    expect(screen.queryByText(hint)).toBeNull();
+  }
 });
 
 test("only the current pair's exact refusal explains a running row", async () => {

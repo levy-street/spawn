@@ -608,7 +608,7 @@ export function TerminalOverlay({
         <UploadProgressBar ratio={transfers.progressRatio} />
         <ConnectionStateOverlay
           notRunningNotice={
-            refusedRun === run && session.status === "running"
+            refusedRun === run && session.status === "running" && host.id === session.host_id
               ? `This session is no longer running on ${host.name ?? session.host_name ?? "this host"}.`
               : null
           }
