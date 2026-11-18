@@ -89,17 +89,6 @@ pub fn active_connected(sessions: usize, rtc_peers: RtcPeerGauge) {
     }
 }
 
-pub fn active_disconnected(
-    kind: &str,
-    detail: &str,
-    sessions: usize,
-    retry_after: Option<Duration>,
-) {
-    if let Some(store) = ACTIVE_STATE.get() {
-        store.disconnected(kind, detail, sessions, retry_after, SystemTime::now());
-    }
-}
-
 pub fn active_heartbeat(sessions: usize) {
     if let Some(store) = ACTIVE_STATE.get() {
         store.heartbeat(sessions, None);
@@ -135,7 +124,11 @@ impl StateStore {
         Self::at_path(state_path(config_dir), server, task_breakaway_denied)
     }
 
-    fn at_path(path: PathBuf, server: &str, task_breakaway_denied: Option<bool>) -> Self {
+    pub(super) fn at_path(
+        path: PathBuf,
+        server: &str,
+        task_breakaway_denied: Option<bool>,
+    ) -> Self {
         let provenance = crate::install::provenance();
         Self {
             path,
@@ -184,29 +177,50 @@ impl StateStore {
         }
     }
 
-    fn disconnected(
+    pub fn disconnected(
         &self,
         kind: &str,
         detail: &str,
         sessions: usize,
         retry_after: Option<Duration>,
-        now: SystemTime,
-    ) {
+    ) -> Option<tokio::time::Instant> {
         let mut state = self.state.lock().expect("state heartbeat lock");
-        let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        // Sample both clocks together, before the heartbeat write. Status and
+        // the supervisor use the UTC and monotonic forms of the same deadline.
+        let (deadline, next_attempt_at) = retry_after
+            .map(|delay| {
+                (
+                    tokio::time::Instant::now() + delay,
+                    unix_seconds_rfc3339((now + delay).as_secs()),
+                )
+            })
+            .unzip();
         state.connected = false;
         state.connected_at = None;
         state.last_error = Some(LastError {
             kind: kind.to_owned(),
             detail: detail.to_owned(),
-            at: unix_seconds_rfc3339(seconds),
-            next_attempt_at: retry_after
-                .map(|delay| unix_seconds_rfc3339(seconds + delay.as_secs())),
+            at: unix_seconds_rfc3339(now.as_secs()),
+            next_attempt_at,
         });
         state.sessions = sessions;
         state.support_runtime = crate::support::runtime_status();
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
+        }
+        deadline
+    }
+
+    pub fn clear_pending_retry(&self) {
+        let mut state = self.state.lock().expect("state heartbeat lock");
+        if let Some(error) = &mut state.last_error {
+            error.next_attempt_at = None;
+            if let Err(error) = write_atomic(&self.path, &state) {
+                tracing::warn!(%error, "could not write SPAWN D heartbeat state");
+            }
         }
     }
 
@@ -608,7 +622,9 @@ mod tests {
     fn state_json_has_the_stable_contract_shape_and_writes_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::at_path(dir.path().join("state.json"), "", None);
-        store.disconnected("auth", "token_invalid", 2, None, UNIX_EPOCH);
+        assert!(store
+            .disconnected("auth", "token_invalid", 2, None)
+            .is_none());
         let state = read_path(&store.path).unwrap().unwrap();
         let value = serde_json::to_value(&state).unwrap();
         assert_eq!(value["pid"], std::process::id());
@@ -639,19 +655,12 @@ mod tests {
     fn revoked_login_heartbeat_keeps_the_scheduled_retry_time() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::at_path(dir.path().join("state.json"), "", None);
-        let now = UNIX_EPOCH + Duration::from_secs(23 * 3600 + 45 * 60);
-        store.disconnected(
-            "auth",
-            "token_revoked",
-            0,
-            Some(Duration::from_secs(1800)),
-            now,
-        );
+        store.disconnected("auth", "token_revoked", 0, Some(Duration::from_secs(1800)));
         store.heartbeat(0, None);
         let error = read_path(&store.path).unwrap().unwrap().last_error.unwrap();
         assert_eq!(
-            error.next_attempt_at.as_deref(),
-            Some("1970-01-02T00:15:00Z")
+            parse_rfc3339_seconds(error.next_attempt_at.as_ref().unwrap()).unwrap(),
+            parse_rfc3339_seconds(&error.at).unwrap() + 1800
         );
     }
 

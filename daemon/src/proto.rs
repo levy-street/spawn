@@ -1809,4 +1809,21 @@ mod ordinary_parity {
             }
         }
     }
+
+    #[test]
+    fn positional_registration_preserves_the_ordinary_frame_across_the_cap() {
+        // The absence guarantee covers the objects the server sends. At or
+        // below the cap, arrays keep master's map-only extension result. Above
+        // it an array has no named consent field, so it can safely keep local
+        // consent without parsing an unsupported wire form a second time.
+        let mut wire = serde_json::json!(["registered", Uuid::nil()]).to_string();
+        wire.push_str(&" ".repeat(64 * 1024 - wire.len()));
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Invalid))
+        );
+        wire.push(' ');
+        assert!(
+            matches!(parse_inbound(&wire).unwrap(), Inbound::Registered { support, .. } if matches!(support.consent, ConsentInput::Absent))
+        );
+    }
 }

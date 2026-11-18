@@ -65,10 +65,15 @@ statement exists, cleanup does not create a lock file.
 - `register` adds `supports_support_log:true` (capability, not availability).
 - The daemon accepts a statement or null in `registered.support_log_consent`
   or in a later `{"type":"host.support_log_consent","consent":…}` frame.
-  An absent field in `registered` keeps local consent at any frame size.
+  An absent field in a `registered` object keeps local consent at any frame size.
   Null disables sharing. The daemon verifies a statement before persistence.
-  The server sends ordinary trust data in `registered`, then delivers the
-  statement or null in the separate frame before any collection request.
+- The current server delivers the statement or null in the separate frame,
+  always before any collection request on that connection. If its ordinary
+  `registered` frame exceeded 64,512 bytes, it sends neither the separate
+  consent frame nor a collection request on that connection. Such a machine
+  cannot share on that connection until the server lifts this limit for daemons
+  with the fix. The limit is `SUPPORT_LIMIT = 65536 - 1024` in
+  `server/spawn_server/support_log_dispatch.py`.
 - `{"type":"support_log.collect","request_id":"<uuid>","since_seconds":N}`
   requests collection. UUID parsing and signed-integer parsing happen before
   dispatch. N is clamped to 60–259200. Malformed support extensions deny support only; malformed ordinary frames

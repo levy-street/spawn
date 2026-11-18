@@ -684,6 +684,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let rtc_sessions = RtcSessions::new();
     let state_registry = registry.clone();
     let state_rtc_sessions = rtc_sessions.clone();
+    let heartbeat_store = Arc::clone(&state_store);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await;
@@ -693,7 +694,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             // here, on the daemon's own clock and off the offer path: peers
             // keep opening and closing through a server outage, and the
             // state file write is an fsync.
-            state_store.heartbeat(
+            heartbeat_store.heartbeat(
                 state_registry.ids().len(),
                 Some(state_rtc_sessions.admission_gauge().await),
             );
@@ -750,7 +751,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut unauthorized_logged = false;
     let mut revoked_login = RevokedLoginBackoff::default();
 
-    'supervisor: loop {
+    loop {
         // A session close or backoff timer can become ready in the same
         // scheduler turn as a credential write. Never let that select race
         // carry the stale snapshot into another socket: reread the whole
@@ -829,21 +830,18 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         let refusal = res.as_ref().err().and_then(ws::auth_refusal);
         let revoked_delay =
             revoked_login.after_session(live_credentials.generation, ended.registered_for, refusal);
-        if let Err(error) = &res {
+        let (kind, detail) = if let Err(error) = &res {
             let class = ws::failure_class(error);
             let (kind, default_detail) = crate::state::connection_error_class(class);
             let detail = refusal
                 .map(ws::AuthRefusal::as_str)
                 .unwrap_or(default_detail);
-            crate::state::active_disconnected(kind, detail, registry.ids().len(), revoked_delay);
+            (kind, detail)
         } else {
-            crate::state::active_disconnected(
-                "protocol",
-                "socket_closed",
-                registry.ids().len(),
-                None,
-            );
-        }
+            ("protocol", "socket_closed")
+        };
+        let revoked_deadline =
+            state_store.disconnected(kind, detail, registry.ids().len(), revoked_delay);
         let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
         let reconnect_now = res.as_ref().err().and_then(ws::close_disposition)
             == Some(ws::CloseDisposition::ImmediateReconnect);
@@ -896,7 +894,17 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 Some(ws::CloseDisposition::Unauthorized) => {
                     if !unauthorized_logged {
                         unauthorized_logged = true;
-                        tracing::error!(class = "unauthorized", "token expired — run spawnd login");
+                        if refusal == Some(ws::AuthRefusal::Revoked) {
+                            tracing::error!(
+                                class = "unauthorized",
+                                "the server revoked this machine's token — see spawnd status"
+                            );
+                        } else {
+                            tracing::error!(
+                                class = "unauthorized",
+                                "token expired — run spawnd login"
+                            );
+                        }
                     }
                     revoked_delay.unwrap_or(Duration::from_secs(60))
                 }
@@ -951,47 +959,64 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         if reconnect_now {
             attempt = 0;
         }
-        let reloaded = {
-            let sleep_fut = tokio::time::sleep(delay);
-            let reload_fut = wait_for_credential_change(
-                &live_credentials,
-                &mut credential_loader,
-                support.as_ref(),
-            );
-            tokio::pin!(sleep_fut);
-            tokio::pin!(reload_fut);
-            tokio::select! {
-                _ = &mut sleep_fut => None,
-                reloaded = &mut reload_fut => Some(reloaded),
-                _ = sighup_signal() => {
-                    attempt = 0;
-                    None
-                }
-                r = tokio::signal::ctrl_c() => {
-                    r.context("ctrl-c handler")?;
-                    tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
-                    return Ok(());
-                }
-                _ = shutdown_signal() => {
-                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
-                    return Ok(());
-                }
+        match wait_for_retry(
+            &state_store,
+            revoked_deadline,
+            delay,
+            wait_for_credential_change(&live_credentials, &mut credential_loader, support.as_ref()),
+            sighup_signal(),
+        )
+        .await?
+        {
+            RetryWake::Timer => {}
+            RetryWake::Reconnect => attempt = 0,
+            RetryWake::Shutdown => return Ok(()),
+            RetryWake::Credentials(reloaded) => {
+                rtc_sessions.invalidate_trust_and_close_all().await;
+                live_credentials = reloaded?;
+                attempt = 0;
             }
-        };
-        if let Some(reloaded) = reloaded {
-            let reloaded = match reloaded {
-                Ok(reloaded) => reloaded,
-                Err(error) => {
-                    rtc_sessions.invalidate_trust_and_close_all().await;
-                    return Err(error);
-                }
-            };
-            rtc_sessions.invalidate_trust_and_close_all().await;
-            live_credentials = reloaded;
-            attempt = 0;
-            continue 'supervisor;
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWake<T> {
+    Timer,
+    Reconnect,
+    Credentials(T),
+    Shutdown,
+}
+
+async fn wait_for_retry<T>(
+    store: &crate::state::StateStore,
+    revoked_deadline: Option<tokio::time::Instant>,
+    delay: Duration,
+    credentials: impl Future<Output = T>,
+    reconnect: impl Future<Output = ()>,
+) -> Result<RetryWake<T>> {
+    let sleep = match revoked_deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline),
+        None => tokio::time::sleep(delay),
+    };
+    let wake = tokio::select! {
+        _ = sleep => RetryWake::Timer,
+        reloaded = credentials => RetryWake::Credentials(reloaded),
+        _ = reconnect => RetryWake::Reconnect,
+        r = tokio::signal::ctrl_c() => {
+            r.context("ctrl-c handler")?;
+            tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+            RetryWake::Shutdown
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
+            RetryWake::Shutdown
+        }
+    };
+    if revoked_deadline.is_some() {
+        store.clear_pending_retry();
+    }
+    Ok(wake)
 }
 
 fn reconnect_notify() -> &'static tokio::sync::Notify {
@@ -4665,6 +4690,100 @@ mod tests {
                 expected_seconds.map(Duration::from_secs),
             );
         }
+    }
+
+    async fn check_revoked_retry(expected: RetryWake<u64>) {
+        use crate::state::{parse_rfc3339_seconds, read_path, StateStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = StateStore::at_path(path.clone(), "", None);
+        let last_error = || read_path(&path).unwrap().unwrap().last_error.unwrap();
+        let hour = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let deadline = store.disconnected("auth", "token_revoked", 0, Some(hour));
+        let error = last_error();
+        let refused_at = parse_rfc3339_seconds(&error.at).unwrap();
+        let advertised = parse_rfc3339_seconds(error.next_attempt_at.as_ref().unwrap()).unwrap();
+        assert_eq!(advertised, refused_at + 3600);
+
+        // Charge time between recording the deadline and entering the select,
+        // as would happen with a slow heartbeat write.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let origin = config::server_url(None).unwrap();
+        let host = Uuid::new_v4();
+        let record = |generation| {
+            credential_record(
+                generation,
+                generation.into(),
+                "token",
+                host,
+                origin.as_str(),
+                1,
+                &[],
+            )
+        };
+        let active = LiveCredentialSnapshot::initial(record(1), &origin).unwrap();
+        // Answer the real monitor's read in memory, at a chosen clock tick.
+        let (requests, reads) = std_mpsc::sync_channel(1);
+        let mut loader = CredentialLoader {
+            requests: Some(requests),
+            pending: None,
+            load_deadline: hour,
+            failed: false,
+        };
+        let generation = async {
+            wait_for_credential_change(&active, &mut loader, None)
+                .await
+                .unwrap()
+                .generation
+        };
+        let reconnect = tokio::sync::Notify::new();
+        let wait = wait_for_retry(&store, deadline, hour, generation, reconnect.notified());
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+
+        // Both early wakes arrive well inside the hour. For the timer, also
+        // check that the supervisor is still waiting one second before it.
+        let elapsed = match expected {
+            RetryWake::Timer => hour,
+            _ => Duration::from_secs(15),
+        };
+        tokio::time::advance(elapsed - start.elapsed() - Duration::from_secs(1)).await;
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(last_error().next_attempt_at, error.next_attempt_at);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        match expected {
+            RetryWake::Credentials(next) => assert!(reads
+                .try_recv()
+                .unwrap()
+                .reply
+                .send(CredentialLoadReply::Loaded(record(next)))
+                .is_ok()),
+            RetryWake::Reconnect => reconnect.notify_one(),
+            RetryWake::Timer => {}
+            RetryWake::Shutdown => unreachable!(),
+        }
+        assert_eq!(wait.await.unwrap(), expected);
+        assert_eq!(start.elapsed(), elapsed);
+        if expected == RetryWake::Timer {
+            assert_eq!(refused_at + start.elapsed().as_secs() as i64, advertised);
+        }
+        assert!(last_error().next_attempt_at.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revoked_retry_starts_at_its_advertised_time() {
+        check_revoked_retry(RetryWake::Timer).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_credentials_interrupt_the_hourly_retry() {
+        check_revoked_retry(RetryWake::Credentials(2)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_signal_interrupts_the_hourly_retry() {
+        check_revoked_retry(RetryWake::Reconnect).await;
     }
 
     /// A program that hangs past a capture's timeout is stopped with
