@@ -137,13 +137,19 @@ export interface SessionTransportOptions {
 
 export type WindowRun = Pick<SessionOut, "host_id" | "started_at" | "status">;
 
+export function sameWindowRun(a: WindowRun | null, b: WindowRun | null): boolean {
+  return a?.host_id === b?.host_id && a?.status === b?.status && a?.started_at === b?.started_at;
+}
+
 export interface SessionTransport {
   observeWindow?(
     row: WindowRun | null,
     visible: boolean,
-    refreshDetail?: () => Promise<boolean>,
+    refreshDetail?: () => Promise<WindowRun | null>,
   ): void;
-  recheckNotRunning?(): void;
+  /** Present while this window is checking a refusal. A failed GET clears the checked row. */
+  readonly refusedWindow?: { readonly checked: WindowRun | null } | null;
+  recheckNotRunning?(): Promise<void> | undefined;
   readonly sessionId: string;
   /** The host this view attaches to the window on, fixed for its life. */
   readonly hostId: string;

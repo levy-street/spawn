@@ -168,6 +168,7 @@ mock.module("./Terminal", () => {
             sendInput: (bytes: Uint8Array | string) =>
               typed.push(typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes)),
             focus: () => {},
+            recheckNotRunning: () => undefined,
           }) as unknown as TerminalHandle,
         [],
       );

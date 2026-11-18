@@ -71,7 +71,7 @@ describe("RealtimeProvider socket auth", () => {
     useConnectionStore.getState().reset();
   });
 
-  test("alerts recovery refreshes the open session detail without a list screen", async () => {
+  test("alerts recovery leaves an unaffected session detail alone", async () => {
     const read = jest.fn<Promise<string>, []>().mockResolvedValueOnce("1").mockResolvedValue("2");
     function WindowDetail() {
       const { data } = useQuery({ queryKey: ["session", "window"], queryFn: read });
@@ -87,7 +87,8 @@ describe("RealtimeProvider socket auth", () => {
     await act(() => mockStateListener?.("open"));
     await act(() => mockStateListener?.("failed"));
     await act(() => mockStateListener?.("open"));
-    await waitFor(() => expect(screen.getByText("2")).toBeOnTheScreen());
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("1")).toBeOnTheScreen();
   });
 
   test("retires without a token, connects after sign-in, and exposes persistent retry", async () => {

@@ -41,8 +41,8 @@ test("first open has session and host immediately, with no serial detail request
   const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
   expect(result.current).toMatchObject({ session, host, isLoading: false, error: null });
   expect(result.current.detailLoaded).toBe(false);
-  expect(getSession).toHaveBeenCalledWith(session.id);
-  expect(getHost).not.toHaveBeenCalled();
+  expect(getSession).toHaveBeenCalledTimes(0);
+  expect(getHost).toHaveBeenCalledTimes(0);
   expect(client.getQueryState(qk.session(session.id))?.dataUpdatedAt).toBe(updatedAt);
 });
 
@@ -67,15 +67,15 @@ test("invalidated and removed account data cannot seed a terminal", async () => 
 });
 
 test.each([{ status: "starting" as const }, { started_at: new Date(0).toISOString() }])(
-  "a newer list refreshes a replacement run on the same host",
+  "a same-host list update adds no detail request to an unaffected window",
   async (change) => {
     const replacement = { ...session, ...change };
     client.setQueryData(qk.session(session.id), session, { updatedAt: Date.now() - 1000 });
     client.setQueryData(qk.sessions(), [replacement]);
     jest.mocked(getSession).mockResolvedValue(replacement);
     const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
-    await waitFor(() => expect(result.current.session).toEqual(replacement));
-    expect(result.current.detailLoaded).toBe(true);
+    expect(result.current.session).toEqual(session);
+    expect(getSession).toHaveBeenCalledTimes(0);
   },
 );
 

@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
@@ -18,7 +18,9 @@ import { cachedListItem } from "@/data/cached-list-item";
 import { restartConversationHooks } from "@/data/queries/conversation";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
+import { useConnectionStore } from "@/data/stores/connection";
 import type { AgentDef } from "@/data/types/domain";
+import { type SessionTransport, sameWindowRun } from "@/terminal/transport/types";
 
 /** Definitions change when someone edits them in Settings, not per keystroke. */
 const AGENTS_STALE_MS = 60_000;
@@ -32,22 +34,18 @@ export interface TerminalData {
   agents: readonly AgentDef[];
   isLoading: boolean;
   error: Error | null;
-  /** True when a fresh detail GET confirms the run this terminal shows. */
-  refreshDetail: () => Promise<boolean>;
+  windowTransport: { current: SessionTransport | null };
+  refreshDetail: () => Promise<SessionOut | null>;
   refetch: () => Promise<void>;
-}
-
-function sameSessionRun(a: SessionOut, b: SessionOut): boolean {
-  return a.host_id === b.host_id && a.status === b.status && a.started_at === b.started_at;
 }
 
 export function useTerminalData(sessionId: string): TerminalData {
   const queryClient = useQueryClient();
+  const windowTransport = useRef<SessionTransport | null>(null);
   const sessionQuery = useQuery({
     queryKey: qk.session(sessionId),
     queryFn: () => getSession(sessionId),
     enabled: sessionId.length > 0,
-    refetchOnMount: (query) => (query.state.dataUpdateCount === 0 ? "always" : true),
     ...cachedListItem<SessionOut>(queryClient, qk.sessions(), sessionId),
   });
   const hostId = sessionQuery.data?.host_id ?? "";
@@ -60,12 +58,23 @@ export function useTerminalData(sessionId: string): TerminalData {
     enabled: false,
   });
   const listed = listQuery.data?.find((item) => item.id === sessionId);
-  const rowChanged = listed && sessionQuery.data && !sameSessionRun(listed, sessionQuery.data);
+  const rowChanged = listed && sessionQuery.data && !sameWindowRun(listed, sessionQuery.data);
   const listIsNewer = listQuery.dataUpdatedAt > sessionQuery.dataUpdatedAt;
   useEffect(() => {
     if (!listIsNewer || !rowChanged) return;
-    void queryClient.invalidateQueries({ queryKey: qk.session(sessionId), exact: true });
-  }, [listIsNewer, rowChanged, queryClient, sessionId]);
+    if (windowTransport.current?.recheckNotRunning?.()) return;
+    if (listed?.host_id !== hostId)
+      void queryClient.invalidateQueries(
+        { queryKey: qk.session(sessionId), exact: true },
+        { cancelRefetch: false },
+      );
+  }, [listIsNewer, rowChanged, listed?.host_id, hostId, queryClient, sessionId]);
+  useEffect(() => {
+    return useConnectionStore.subscribe((state, previous) => {
+      if (state.alertSocket === "open" && previous.alertSocket !== "open")
+        void windowTransport.current?.recheckNotRunning?.();
+    });
+  }, []);
   const hostQuery = useQuery({
     queryKey: qk.host(hostId),
     queryFn: () => getHost(hostId),
@@ -92,7 +101,8 @@ export function useTerminalData(sessionId: string): TerminalData {
 
   return {
     session: sessionQuery.data,
-    detailLoaded: sessionQuery.isFetched && sessionQuery.isSuccess,
+    detailLoaded: sessionQuery.isFetched && sessionQuery.isSuccess && !(listIsNewer && rowChanged),
+    windowTransport,
     host: hostQuery.data,
     agents: agentsQuery.data ?? [],
     isLoading: sessionQuery.isLoading || (hostId.length > 0 && hostQuery.isLoading),
@@ -104,9 +114,7 @@ export function useTerminalData(sessionId: string): TerminalData {
           : null,
     refreshDetail: async () => {
       const result = await sessionQuery.refetch({ cancelRefetch: false });
-      return (
-        !!sessionQuery.data && result.isSuccess && sameSessionRun(sessionQuery.data, result.data)
-      );
+      return result.isSuccess ? result.data : null;
     },
     refetch: async () => {
       const sessionResult = await sessionQuery.refetch();

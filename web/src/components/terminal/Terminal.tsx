@@ -23,7 +23,6 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
-  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -200,7 +199,7 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
-  recheckNotRunning(): void;
+  recheckNotRunning(): Promise<void> | undefined;
   /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
   /** Tell the daemon the new TTY size. */
@@ -1220,27 +1219,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   };
 
   const queryClient = useQueryClient();
-  const [detailRun, setDetailRun] = useState<Session | null>(null);
-  useLayoutEffect(() => {
-    const cache = queryClient.getQueryCache();
-    const detail = cache.find<Session>({ queryKey: ["session", sessionId], exact: true });
-    // A manual foreground edit can make a list-seeded query successful.
-    // Only a completed detail GET vouches for the run that supplied it.
-    return cache.subscribe((event) => {
-      if (
-        event.type === "updated" &&
-        event.query === detail &&
-        event.action.type === "success" &&
-        !event.action.manual
-      ) {
-        setDetailRun(detail.state.data ?? null);
-      }
-    });
-  }, [queryClient, sessionId]);
   const sessionIdentityQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
-    refetchOnMount: "always",
     staleTime: 30_000,
     ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
   });
@@ -1426,22 +1407,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     connection: daemonConnection,
     sessionId,
     sessionStatus: sessionIdentityQuery.data,
-    observedRun: JSON.stringify([
-      displayedRow?.status,
-      displayedRow?.host_id,
-      displayedRow?.started_at,
-      sessionIdentityQuery.data?.status,
-      sessionIdentityQuery.data?.host_id,
-      sessionIdentityQuery.data?.started_at,
-    ]),
+    hostId: signalingHostId,
+    refreshDetail: async () => {
+      const result = await sessionIdentityQuery.refetch({ cancelRefetch: false });
+      return result.isSuccess ? result.data : null;
+    },
     canShowNotRunning:
-      detailRun?.id === sessionId &&
       sessionIdentityQuery.isSuccess &&
       displayedRow?.status === "running" &&
       displayedRow.host_id === signalingHostId &&
-      sessionIdentityQuery.data?.status === "running" &&
-      sameSessionRun(detailRun, sessionIdentityQuery.data) &&
-      sessionIdentityQuery.data.host_id === signalingHostId,
+      sameSessionRun(displayedRow, sessionIdentityQuery.data),
     onNotRunning: () => {
       reattachingAfterRefusal.current = true;
       displayClaimOwedRef.current = false;
@@ -1450,8 +1425,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     enabled:
       socketWanted &&
       daemonConnection !== null &&
-      sessionIdentityQuery.data?.status !== "exited" &&
-      sessionIdentityQuery.data?.status !== "killed",
+      (reattachingAfterRefusal.current ||
+        (sessionIdentityQuery.data?.status !== "exited" &&
+          sessionIdentityQuery.data?.status !== "killed")),
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {

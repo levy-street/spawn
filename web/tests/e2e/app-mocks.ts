@@ -845,10 +845,12 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       const sessionMock = () =>
         (globalThis as typeof globalThis & { __spawnSessionMock?: SessionMock }).__spawnSessionMock;
       const peers: MockHostPeerConnection[] = [];
-      let rebound: (() => void) | undefined;
+      const rebounds = new Map<string, () => void>();
+      const attachments: string[] = [];
       (globalThis as typeof globalThis & { __spawnHostMock: unknown }).__spawnHostMock = {
         count: () => peers.length,
-        rebound: () => rebound?.(),
+        rebound: (id: string) => rebounds.get(id)?.(),
+        attachments: () => attachments,
         disconnect: () => peers.find((peer) => peer.connectionState === "connected")?.close(),
       };
       class MockHostPeerConnection {
@@ -866,6 +868,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           sessionMock()?.peerCreated();
         }
         createDataChannel(label: string, options?: RTCDataChannelInit) {
+          if (label.startsWith("spawn.pty/")) attachments.push(this.hostId);
           const channel = label.startsWith("spawn.host.ctl")
             ? new MockHostDataChannel(() => this.hostId, label)
             : sessionMock()?.makeChannel(label, options);
@@ -927,8 +930,9 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         send(encoded: string) {
           const message = JSON.parse(encoded) as Record<string, unknown>;
           if (message.type === "rtc.offer") {
-            rebound = () =>
-              this.emit({ type: "rtc.status", session_id: message.session_id, status: "rebound" });
+            rebounds.set(this.hostId, () =>
+              this.emit({ type: "rtc.status", session_id: message.session_id, status: "rebound" }),
+            );
             void (
               globalThis as typeof globalThis & {
                 __spawnRecordRtcTestMessage?: (label: string, value: string) => Promise<void>;

@@ -228,7 +228,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       let displayClaimOwed = claimsOnOpen.current;
       const unsubscribers = [
         transport.on("state", (state) => {
-          if (state === "not-running") {
+          if (state === "not-running" || transport.refusedWindow) {
             claimsOnOpen.current = false;
             displayClaimOwed = false;
           }

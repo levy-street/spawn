@@ -248,7 +248,10 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
  * Refetch the detail because the list itself may have been in flight
  * while the window was changing.
  */
-function useIncarnationHost(sessionId: string): string | null {
+function useIncarnationHost(
+  sessionId: string,
+  handleRef: { current: TerminalHandle | null },
+): string | null {
   const queryClient = useQueryClient();
   const row = useQuery({
     queryKey: ["session", sessionId],
@@ -266,11 +269,17 @@ function useIncarnationHost(sessionId: string): string | null {
   const hostId = row.data?.host_id ?? null;
   const listed = list.data?.find((item) => item.id === sessionId);
   const rowChanged = listed && row.data && !sameSessionRun(row.data, listed);
-  const listIsNewer = list.dataUpdatedAt > row.dataUpdatedAt;
+  const newerList = list.dataUpdatedAt > row.dataUpdatedAt ? list.dataUpdatedAt : 0;
+  const listedHostId = listed?.host_id;
   useEffect(() => {
-    if (!listIsNewer || !rowChanged) return;
-    void queryClient.invalidateQueries({ queryKey: ["session", sessionId], exact: true });
-  }, [listIsNewer, rowChanged, queryClient, sessionId]);
+    if (!newerList || !rowChanged) return;
+    if (handleRef.current?.recheckNotRunning()) return;
+    if (listedHostId !== hostId)
+      void queryClient.invalidateQueries(
+        { queryKey: ["session", sessionId], exact: true },
+        { cancelRefetch: false },
+      );
+  }, [newerList, rowChanged, handleRef, listedHostId, hostId, queryClient, sessionId]);
   return hostId;
 }
 
@@ -295,7 +304,7 @@ function PooledTerminal({
   onAgentNotice: (sessionId: string, notice: AgentNotice | null) => void;
   onIncarnationEnd: (sessionId: string) => void;
 }) {
-  const hostId = useIncarnationHost(sessionId);
+  const hostId = useIncarnationHost(sessionId, handleRef);
   // The incarnation this pool entry shows. Learning the first host is not a
   // move — the terminal mounted before the row loaded keeps going — but each
   // change from one known host to another is: a new generation, a new

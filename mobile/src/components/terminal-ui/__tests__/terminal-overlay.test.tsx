@@ -303,6 +303,7 @@ test("Try again only asks the current transport to attach", async () => {
     mockTerminalSurfaceProps.onTransport?.({
       on: () => () => undefined,
       hostId: session.host_id,
+      refusedWindow: { checked: session },
       recheckNotRunning: recheck,
     }),
   );

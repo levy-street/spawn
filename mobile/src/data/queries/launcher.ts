@@ -201,7 +201,14 @@ export function attachPendingLaunchDelivery(
       options.initialSessionStatus === undefined
         ? "unknown"
         : pendingSessionLifeFromStatus(options.initialSessionStatus),
-    getSessionLife: () => pendingSessionLife(transport.sessionId),
+    // A refused window owns the detail check, including while its old view closes.
+    getSessionLife: () => {
+      const refusal = transport.refusedWindow;
+      if (!refusal) return pendingSessionLife(transport.sessionId);
+      return Promise.resolve(
+        refusal.checked ? pendingSessionLifeFromStatus(refusal.checked.status) : "unknown",
+      );
+    },
     ...(options.hostIdentityPublicKey
       ? (() => {
           const host = {
