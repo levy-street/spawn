@@ -11,6 +11,7 @@ import json
 import time
 import uuid
 from enum import StrEnum
+from weakref import WeakValueDictionary
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -22,12 +23,25 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from .browser_registration import decode_ed25519_signature
 from .db import get_sessionmaker
 from .host_identity import _decode_strict_ed25519_point, decode_ed25519_public_key
-from .models import BrowserDevice, SupportLogConsent
+from .models import BrowserDevice, SupportLogCollection, SupportLogConsent, User
 from .ws.signed_signal_relay import sanitize_carried_endorsements
 
 MAGIC = b"SPAWN-SUPPORT-LOG-CONSENT-V1"
 U64_MAX = (1 << 64) - 1
 FUTURE_MS = 86_400_000
+
+
+# A device statement commit and a support send for that account must have a
+# definite order. Only in-flight work retains a lock. No database transaction
+# is held while a socket is sending.
+_delivery_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def delivery_lock(user_id: str) -> asyncio.Lock:
+    lock = _delivery_locks.get(user_id)
+    if lock is None:
+        lock = _delivery_locks[user_id] = asyncio.Lock()
+    return lock
 
 
 class ConsentReason(StrEnum):
@@ -164,19 +178,21 @@ def live_signer(user_id, device_id, public_key):
     )
 
 
-def sharing_on(user_id):
-    """SQL predicate: removal takes effect on every fresh check, without rewriting history."""
-    return exists(
-        select(SupportLogConsent.owner_user_id).where(
-            SupportLogConsent.owner_user_id == user_id,
-            SupportLogConsent.enabled.is_(True),
-            live_signer(
-                SupportLogConsent.owner_user_id,
-                SupportLogConsent.signer_device_id,
-                SupportLogConsent.signer_public_key,
-            ),
-        )
+def enabled_statement_time(user_id):
+    """Query the enabled statement only while the roster still admits its signer."""
+    return select(SupportLogConsent.issued_at_ms).where(
+        SupportLogConsent.owner_user_id == user_id,
+        SupportLogConsent.enabled.is_(True),
+        live_signer(
+            SupportLogConsent.owner_user_id,
+            SupportLogConsent.signer_device_id,
+            SupportLogConsent.signer_public_key,
+        ),
     )
+
+
+def sharing_on(user_id):
+    return enabled_statement_time(user_id).exists()
 
 
 async def is_sharing_on(user_id: str) -> bool:
@@ -187,18 +203,62 @@ async def is_sharing_on(user_id: str) -> bool:
 async def get_statement(user_id: str) -> dict | None:
     async with get_sessionmaker()() as session:
         row = await session.get(SupportLogConsent, user_id)
-        if row is None:
-            return None
-        return {
-            "version": 1,
-            "account_id": row.owner_user_id,
-            "enabled": row.enabled,
-            "issued_at_ms": row.issued_at_ms,
-            "signer_device_id": row.signed_device_id,
-            "signer_public_key": row.signer_public_key,
-            "signature": row.signature,
-            "carried_endorsements": row.carried_endorsements,
-        }
+        return _envelope(row)
+
+
+def _envelope(row: SupportLogConsent | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "version": 1,
+        "account_id": row.owner_user_id,
+        "enabled": row.enabled,
+        "issued_at_ms": row.issued_at_ms,
+        "signer_device_id": row.signed_device_id,
+        "signer_public_key": row.signer_public_key,
+        "signature": row.signature,
+        "carried_endorsements": row.carried_endorsements,
+    }
+
+
+def enabled_timestamp(statement: dict | None) -> int | None:
+    return statement["issued_at_ms"] if statement and statement["enabled"] else None
+
+
+async def delivery_snapshot(session, user_id: str, *, registering: bool = False):
+    # The outer join returns the wake decision even without a deliverable
+    # statement. A signed off remains deliverable after removal of its signer.
+    consent = SupportLogConsent
+    query = (
+        select(consent)
+        .select_from(User)
+        .outerjoin(
+            consent,
+            and_(
+                consent.owner_user_id == User.id,
+                or_(
+                    consent.enabled.is_(False),
+                    live_signer(
+                        consent.owner_user_id,
+                        consent.signer_device_id,
+                        consent.signer_public_key,
+                    ),
+                ),
+            ),
+        )
+        .where(User.id == user_id)
+    )
+    if registering:
+        query = query.add_columns(
+            exists().where(
+                SupportLogCollection.owner_user_id == user_id,
+                SupportLogCollection.state.in_(("requested", "dispatched")),
+            )
+        )
+    row = (await session.execute(query)).one_or_none()
+    if row is None:
+        return None, False
+    return _envelope(row[0]), registering and row[1]
 
 
 async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | None = None):
@@ -222,7 +282,7 @@ async def store_statement(user_id: str, value: dict | bytes, *, clock_ms: int | 
         updated_at=_utcnow(),
     )
     table = SupportLogConsent.__table__
-    async with get_sessionmaker()() as session:
+    async with delivery_lock(user_id), get_sessionmaker()() as session:
         insert = sqlite_insert if session.bind.dialect.name == "sqlite" else pg_insert
         # One conditional upsert covers both first-write races and monotonic updates.
         stmt = insert(table).from_select(

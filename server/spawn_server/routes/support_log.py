@@ -1,4 +1,4 @@
-"""Daemon-only bounded uploads. Nothing in this change dispatches a request."""
+"""Daemon-only bounded uploads for dispatched collections."""
 
 from __future__ import annotations
 

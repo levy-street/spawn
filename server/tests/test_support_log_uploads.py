@@ -19,7 +19,7 @@ from spawn_server.db import get_sessionmaker
 from spawn_server.models import BrowserDevice, Host, SupportLogCollection
 from spawn_server.routes import support_log as route
 from spawn_server.support_consent import store_statement
-from spawn_server.support_log import create_request, get_collection, mark_dispatched, transition
+from spawn_server.support_log import get_collection, mark_dispatched, transition
 from spawn_server.support_log_files import file_status, get_store
 from spawn_server.support_log_retention import sweep_once
 from tests.test_support_consent import seed_statement, sign
@@ -51,10 +51,25 @@ async def app(app, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "dispose_engine", AsyncMock())
     monkeypatch.setattr(get_settings(), "support_log_dir", str(tmp_path / "bundles"))
     monkeypatch.setattr(support_log_retention, "sweep_once", AsyncMock())
+    monkeypatch.setattr(main.SupportLogPump, "run_once", AsyncMock())
     upload_app = main.create_app()
     async with upload_app.router.lifespan_context(upload_app):
         yield upload_app
     assert not route._inflight and not route._reading
+
+
+async def seed_request(host):
+    # Upload and retention must handle arbitrary stored states, including more
+    # simultaneous uploads than the operator is allowed to request.
+    async with get_sessionmaker()() as session:
+        record = SupportLogCollection(
+            owner_user_id=host.owner_user_id, host_id=host.id, host_name=host.name,
+            state="requested", reason="Connection diagnosis", requested_by="operator",
+            window_seconds=60, requested_at=datetime.now(UTC),
+        )
+        session.add(record)
+        await session.commit()
+        return record.id
 
 
 async def setup_request(*, state="dispatched", enabled=True):
@@ -63,13 +78,7 @@ async def setup_request(*, state="dispatched", enabled=True):
         host = Host(owner_user_id=statement["account_id"], name="")
         session.add(host)
         await session.commit()
-    record_id = await create_request(
-        owner_user_id=statement["account_id"],
-        host_id=host.id,
-        reason="Connection diagnosis",
-        requested_by="operator",
-        window_seconds=60,
-    )
+    record_id = await seed_request(host)
     if state != "requested":
         # An off-arrival test starts with a genuinely dispatched request, then withdraws.
         assert await mark_dispatched(record_id)

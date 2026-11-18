@@ -72,14 +72,23 @@ class DaemonConn:
     keeps_peers_across_reconnect: bool = False
     session_ice_policy: bool = False
     supports_device_connections: bool = False
+    supports_support_log: bool = False
+    support_registered_sent: bool = False
+    support_oversized_frame_sent: bool = False
+    # Only an enabled statement can authorize dispatch. Off wins timestamp ties.
+    support_enabled_sent_ms: int | None = None
     durable_owner_valid_until: float = 0.0
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await _send_or_disconnect(
-                self.websocket,
-                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload),
-            )
+            wire = json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            await _send_or_disconnect(self.websocket, wire)
+            # Both support statement frames are ASCII-escaped. The daemon's
+            # 64 KiB extension limit counts the whole frame, including pins.
+            if self.supports_support_log and len(wire) > 65536 and (
+                "support_log_consent" in payload or payload.get("type") == "host.support_log_consent"
+            ):
+                self.support_oversized_frame_sent = True
 
 
 @dataclass(eq=False)
@@ -542,6 +551,12 @@ class Broker:
 
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
+
+    def support_daemons_for_account(self, user_id: str) -> list[DaemonConn]:
+        return [
+            conn for conn in self._daemons_by_host.values()
+            if conn.user_id == user_id and conn.supports_support_log
+        ]
 
     def get_daemon_for_session(self, session_id: str) -> DaemonConn | None:
         return self._daemon_by_session.get(session_id)

@@ -31,8 +31,17 @@ from spawn_server.support_log_retention import (
     start_sweeps,
     sweep_once,
 )
-from tests.test_support_consent import sign
-from tests.test_support_log_uploads import BODY, app, post, raw_request, setup_request, storage, url
+from tests.test_support_consent import seed_statement, sign
+from tests.test_support_log_uploads import (
+    BODY,
+    app,
+    post,
+    raw_request,
+    seed_request,
+    setup_request,
+    storage,
+    url,
+)
 
 # Re-export this shared fixture without introducing a global test dependency.
 __all__ = ["app", "storage"]
@@ -144,20 +153,8 @@ async def test_deletion_failure_keeps_record_retryable(client, storage, monkeypa
 async def test_turning_off_cancels_open_and_deletes_collected(client, storage):
     record_id, token, statement, key, host = await setup_request()
     assert (await post(client, record_id, token)).status_code == 204
-    requested = await create_request(
-        owner_user_id=statement["account_id"],
-        host_id=host.id,
-        reason="Connection diagnosis",
-        requested_by="operator",
-        window_seconds=60,
-    )
-    dispatched = await create_request(
-        owner_user_id=statement["account_id"],
-        host_id=host.id,
-        reason="Connection diagnosis",
-        requested_by="operator",
-        window_seconds=60,
-    )
+    requested = await seed_request(host)
+    dispatched = await seed_request(host)
     assert await mark_dispatched(dispatched)
     other, other_token, *_ = await setup_request()
     assert (await post(client, other, other_token)).status_code == 204
@@ -442,7 +439,15 @@ async def test_startup_and_periodic_sweep(lifespan_db, tmp_path, monkeypatch):
 
 
 async def test_collection_functions_validate_and_compare_state(app):
-    record_id, _token, statement, key, host = await setup_request(state="requested")
+    statement, _ = await seed_statement()
+    async with get_sessionmaker()() as session:
+        host = Host(owner_user_id=statement["account_id"], name="", support_log_capable=True)
+        session.add(host)
+        await session.commit()
+    record_id = await create_request(
+        owner_user_id=host.owner_user_id, host_id=host.id, reason="Connection diagnosis",
+        requested_by="operator", window_seconds=60,
+    )
     record = await get_collection(record_id)
     assert record.reason and record.requested_by and record.host_name == host.name
     assert await mark_dispatched(record_id)

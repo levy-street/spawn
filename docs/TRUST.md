@@ -201,16 +201,23 @@ on a host it no longer owns.
 | Agent commands, paths, installed/latest versions, output, and detailed errors | current checks: REST plus `host.agents.check`; install definitions and historical policy/errors remain stored | installation is refused and automation disabled; checks remain server-readable and execute server-selected binaries; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
-### Optional support log sharing: storage foundation
+### Optional support log sharing
 
-**This is an exception that can disclose diagnostic information to the server
-operator. It is off for everyone until the apps ship a sharing switch.** This
-server foundation stores signed statements and collection records and has a
-daemon upload route. No app signs a statement and no server code creates or
-dispatches a collection request. Owner-facing collection history is not built.
-The route therefore cannot accept a collection in production yet. Storage is
-also off unless `SPAWN_SUPPORT_LOG_DIR` names an absolute private directory
-outside the checkout; an unusable directory leaves it off.
+**Only the operator on the server can request a diagnostic log. Sharing is
+off for everyone until the apps can sign a statement.** The local command
+requires a reason and an operator label. Both are recorded with the request
+and will be shown to the owner in collection history. The host decides whether
+it can send a bundle. Storage requires a usable private directory outside the
+checkout, configured with `SPAWN_SUPPORT_LOG_DIR`.
+
+The server sends the account's current statement to each capable host at
+registration and sends changes on its control connection. For a statement or
+a turn-off, the server can report only that it was sent. The host sends no
+receipt for applying it. A host can have one open request, with at least five
+minutes between dispatches. An account has a limit of ten requests in any 24
+hours, and at most ten can be dispatched in that period. Across the server at
+most two records can be dispatched and awaiting a result at once. A request
+is sent at most once, even if the connection breaks during that send.
 
 When collection is later enabled, the server stores the **plain log bundle,
 not encrypted at rest**, on its disk outside database backups. Only the

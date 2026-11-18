@@ -29,6 +29,7 @@ from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Ses
 from ..pin_liveness import live_browser_device_id_set
 from ..push import send_alert_push
 from ..redis import get_backend, session_event_channel, user_alert_channel
+from ..support_consent import delivery_lock, delivery_snapshot, enabled_timestamp
 from ..trust_events import pin_undelivered_payload, publish_trust_event
 from .alerts import (
     ALERT_QUIET_SECONDS,
@@ -320,6 +321,8 @@ async def _prepare_host_activation(
         # daemon clears a stale mismatch rather than inheriting it.
         "worker_mismatch": registration.get("worker_mismatch") is True,
     }
+    if "supports_support_log" in registration:
+        values["support_log_capable"] = registration["supports_support_log"] is True
     if current.daemon_connection_id is not None and current.daemon_connection_id != connection_id:
         values["last_disconnect_at"] = _utcnow()
         values["last_disconnect_reason"] = "superseded"
@@ -1296,6 +1299,11 @@ async def _live_browser_device_ids(host_id: str) -> list[str]:
 
 
 async def _revoked_browser_keys(account_id: str) -> list[str]:
+    async with _bounded_host_ownership_session() as session:
+        return await _read_revoked_browser_keys(session, account_id)
+
+
+async def _read_revoked_browser_keys(session: AsyncSession, account_id: str) -> list[str]:
     """Public keys of the account's revoked browser devices — the deny-list a
     host subtracts from acceptance (device mesh §3). Account-scoped, not
     host-scoped: a revoked device must be denied even where it would connect via
@@ -1308,24 +1316,38 @@ async def _revoked_browser_keys(account_id: str) -> list[str]:
     belt-and-braces for any stamp that has not (yet) been mirrored. The daemon
     can only reject with this list, never admit."""
 
-    async with _bounded_host_ownership_session() as session:
-        rows = await session.execute(
-            select(BrowserDevice.public_key)
-            .where(
-                BrowserDevice.owner_user_id == account_id,
-                BrowserDevice.revoked_at.is_not(None),
-            )
-            .union(
-                select(RevokedBrowserKey.public_key).where(
-                    RevokedBrowserKey.owner_user_id == account_id
-                )
+    rows = await session.execute(
+        select(BrowserDevice.public_key)
+        .where(
+            BrowserDevice.owner_user_id == account_id,
+            BrowserDevice.revoked_at.is_not(None),
+        )
+        .union(
+            select(RevokedBrowserKey.public_key).where(
+                RevokedBrowserKey.owner_user_id == account_id
             )
         )
-        return sorted(row[0] for row in rows)
+    )
+    return sorted(row[0] for row in rows)
 
 
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
     await asyncio.wait_for(target.send_text(payload), timeout=HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS)
+
+
+async def _send_support_registration(conn: DaemonConn, payload: dict, wake: asyncio.Event):
+    async with delivery_lock(conn.user_id):
+        # Reuse the ordinary read-only revocation session after host activation.
+        # End it before sending or waking the pump.
+        async with _bounded_host_ownership_session() as session:
+            payload["revoked_browser_keys"] = await _read_revoked_browser_keys(session, conn.user_id)
+            statement, has_open = await delivery_snapshot(session, conn.user_id, registering=True)
+        payload["support_log_consent"] = statement
+        await _bounded_send_text(conn, payload)
+        conn.support_enabled_sent_ms = enabled_timestamp(statement)
+        conn.support_registered_sent = True
+        if has_open:
+            wake.set()
 
 
 async def _route_rtc_payload_if_owner(
@@ -2315,6 +2337,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     conn.supports_device_connections = (
                         obj.get("supports_device_connections") is True
                     )
+                    app = websocket.scope.get("app")
+                    pump = getattr(app.state, "support_log_pump", None) if app else None
+                    if pump is None:
+                        obj.pop("supports_support_log", None)
+                    else:
+                        conn.supports_support_log = obj.get("supports_support_log") is True
+                        obj["supports_support_log"] = conn.supports_support_log
                     live_bindings = _validated_live_bindings(obj.get("live_bindings"))
                     # Reserve a durable generation without touching the active
                     # database or Redis owner. Only the later CAS promotion is
@@ -2430,8 +2459,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "account_id": host.owner_user_id,
                             "browser_device_ids": await _live_browser_device_ids(host.id),
                             "browser_pins": await _live_browser_pins(host.id),
-                            "revoked_browser_keys": await _revoked_browser_keys(host.owner_user_id),
                         }
+                        if not conn.supports_support_log:
+                            registered_payload["revoked_browser_keys"] = await _revoked_browser_keys(
+                                host.owner_user_id
+                            )
                         if _daemon_token_needs_rotation(daemon_token_payload):
                             registered_payload["access_token"] = auth_mod.issue_daemon_token(
                                 host.id, host.owner_user_id
@@ -2443,7 +2475,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         async with _decide_workers_to_stop(
                             conn, host, reported_existing, known_existing
                         ) as left_running:
-                            await _bounded_send_text(conn, registered_payload)
+                            if conn.supports_support_log:
+                                await _send_support_registration(conn, registered_payload, pump.wake)
+                            else:
+                                await _bounded_send_text(conn, registered_payload)
                             registered = True
                             await _stop_workers_left_running(conn, host, left_running)
                         await publish_data_changed(host.owner_user_id, "hosts", host.id)
