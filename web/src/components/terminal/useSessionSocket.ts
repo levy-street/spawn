@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DaemonChannel } from "@/lib/daemon-channel";
 import type { DaemonConnection } from "@/lib/daemon-connection";
 import {
@@ -44,12 +44,9 @@ export interface UseSessionSocketOptions {
   connection?: DaemonConnection | null;
   sessionId: string;
   active?: boolean;
-  sessionStatus?: {
-    status: string;
-    exit_code: number | null;
-    host_id?: string;
-    started_at?: string;
-  } | null;
+  observedRun?: string;
+  canShowNotRunning?: boolean;
+  sessionStatus?: { status: string; exit_code: number | null } | null;
   enabled?: boolean;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
@@ -171,6 +168,8 @@ export function useSessionSocket({
   sessionStatus = null,
   enabled = true,
   active = true,
+  observedRun,
+  canShowNotRunning = false,
   initialSize = null,
   onData,
   onHistory,
@@ -305,24 +304,19 @@ export function useSessionSocket({
       lastExit.current = null;
     }
   }, [sessionId, sessionStatus?.status, sessionStatus?.exit_code]);
-  const recheckRef = useRef<(onRefused?: () => void) => void>(() => {});
-  const activeRef = useRef(active);
-  activeRef.current = active;
-  const recheckNotRunning = useCallback(
-    (onRefused?: () => void) => recheckRef.current(onRefused),
-    [],
-  );
-  const sessionRow = JSON.stringify([
-    sessionStatus?.host_id,
-    sessionStatus?.status,
-    sessionStatus?.started_at,
-  ]);
-  const previousRow = useRef(sessionRow);
-  useEffect(() => {
-    const changed = previousRow.current !== sessionRow;
-    previousRow.current = sessionRow;
-    if (changed || active) recheckNotRunning();
-  }, [active, recheckNotRunning, sessionRow]);
+  const recheckRef = useRef<(invalidatePending?: boolean) => void>(() => {});
+  const recheckNotRunning = useCallback(() => recheckRef.current(), []);
+  const currentView = useRef({ active, observedRun, canShowNotRunning });
+  useLayoutEffect(() => {
+    const previous = currentView.current;
+    currentView.current = { active, observedRun, canShowNotRunning };
+    if (
+      previous.observedRun !== observedRun ||
+      previous.canShowNotRunning !== canShowNotRunning ||
+      (active && !previous.active)
+    )
+      recheckRef.current(true);
+  }, [active, observedRun, canShowNotRunning]);
 
   useEffect(() => {
     const sessionGeneration = ++sessionGenerationRef.current;
@@ -338,7 +332,8 @@ export function useSessionSocket({
     }
     let cancelled = false;
     let notRunning = false;
-    let restartIfRefused: (() => void) | undefined;
+    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+    let rebound = connection.getSnapshot().rebound;
     let hostGeneration = connection.getSnapshot().generation;
     let rtcRetryAttempts = 0;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -362,7 +357,6 @@ export function useSessionSocket({
       )
         return;
       clearRtcConnectTimer();
-      restartIfRefused = undefined;
       rtcRef.current = {
         sessionId: null,
         sessionGeneration: 0,
@@ -399,7 +393,6 @@ export function useSessionSocket({
         connection.getSnapshot().state !== "ready"
       )
         return;
-      restartIfRefused = undefined;
       const delay = Math.min(10_000, 500 * 2 ** rtcRetryAttempts++);
       setState("connecting");
       rtcRetryTimer = setTimeout(() => {
@@ -845,11 +838,20 @@ export function useSessionSocket({
 
       const acceptRefusal = (data: unknown) => {
         if (serverReady || !isSessionNotRunning(data)) return false;
-        const restart = restartIfRefused;
+        if (!currentView.current.canShowNotRunning) {
+          cleanupRtc(true, true, rtcGeneration);
+          return true;
+        }
         notRunning = true;
         cleanupRtc(true, false, rtcGeneration);
         setState("not-running");
-        if (activeRef.current && document.visibilityState === "visible") restart?.();
+        clearTimeout(noticeTimer);
+        if (currentView.current.active && document.visibilityState === "visible") {
+          noticeTimer = setTimeout(() => {
+            if (currentView.current.active && document.visibilityState === "visible")
+              recheckNotRunning();
+          }, 30_000);
+        }
         return true;
       };
 
@@ -868,7 +870,6 @@ export function useSessionSocket({
         rtcRef.current = { ...current, open: true };
         clearRtcConnectTimer();
         rtcRetryAttempts = 0;
-        restartIfRefused = undefined;
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
         settleUploadReadiness(true);
@@ -1231,10 +1232,14 @@ export function useSessionSocket({
     const sync = () => {
       if (!isActiveSessionGeneration()) return;
       const snapshot = connection.getSnapshot();
-      if (snapshot.state !== "ready" || snapshot.generation !== hostGeneration) {
+      if (
+        snapshot.state !== "ready" ||
+        snapshot.generation !== hostGeneration ||
+        snapshot.rebound !== rebound
+      ) {
         notRunning = false;
-        restartIfRefused = undefined;
       }
+      rebound = snapshot.rebound;
       hostGeneration = snapshot.generation;
       setSignedRtcRefusal(snapshot.refusal);
       setSignalingTrust(snapshot.trust);
@@ -1255,30 +1260,36 @@ export function useSessionSocket({
         startRtc();
       }
     };
-    recheckRef.current = (onRefused) => {
-      // A new view or row cancels a pending button press. Only this fresh
-      // attachment may authorize Restart. A plain close forgets the press.
-      if (!onRefused && restartIfRefused) {
-        cleanupRtc();
-        notRunning = true;
-      }
-      if (!notRunning || connection.getSnapshot().state !== "ready") return;
+    recheckRef.current = (invalidatePending = false) => {
+      const rtc = rtcRef.current;
+      if (!notRunning && !(invalidatePending && !rtc.open && (rtc.ptyDc || rtcRetryTimer))) return;
+      clearTimeout(noticeTimer);
+      if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
+      rtcRetryTimer = null;
+      cleanupRtc();
       notRunning = false;
-      restartIfRefused = onRefused;
+      if (connection.getSnapshot().state !== "ready") return;
       setState("connecting");
       startRtc();
     };
     const visibility = () => {
-      restartIfRefused = undefined;
-      if (document.visibilityState === "visible") recheckRef.current();
+      if (document.visibilityState === "visible" && currentView.current.active)
+        recheckRef.current(true);
+      else clearTimeout(noticeTimer);
     };
+    const focus = () => {
+      if (currentView.current.active && document.visibilityState === "visible") recheckNotRunning();
+    };
+    window.addEventListener("focus", focus);
     document.addEventListener("visibilitychange", visibility);
     const unsubscribe = connection.subscribe(sync);
     sync();
     return () => {
       cancelled = true;
       unsubscribe();
+      clearTimeout(noticeTimer);
       recheckRef.current = () => {};
+      window.removeEventListener("focus", focus);
       document.removeEventListener("visibilitychange", visibility);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
       clearRtcConnectTimer();
@@ -1294,6 +1305,7 @@ export function useSessionSocket({
     settleUploadReadiness,
     updateQueuedInputState,
     armPendingInputExpiry,
+    recheckNotRunning,
   ]);
 
   const sendBinary = useCallback(

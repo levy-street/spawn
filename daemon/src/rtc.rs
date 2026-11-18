@@ -1099,7 +1099,7 @@ impl RtcSessions {
     /// arrived on, so nothing a peer says later may go through a sender
     /// captured at admission — after a reconnect that is a socket nobody
     /// reads.
-    pub(crate) fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+    fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
         if !self.deferred_pruned.load(Ordering::Acquire) {
             return None;
         }
@@ -5553,6 +5553,9 @@ async fn send_json_dynamic(signaling: &RtcWsSender, frame: Outbound) {
         let _ = sender.send(WsOutbound::json(serialized)).await;
     }
 }
+
+#[cfg(test)]
+pub(crate) use pair::tests::{connect_pair, refusal_frames};
 
 #[cfg(test)]
 mod tests {

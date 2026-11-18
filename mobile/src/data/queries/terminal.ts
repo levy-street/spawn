@@ -24,6 +24,7 @@ const AGENTS_STALE_MS = 60_000;
 
 export interface TerminalData {
   session: SessionOut | undefined;
+  detailLoaded: boolean;
   host: HostOut | undefined;
   /** Every agent definition, for naming what a restart of this window brings
    *  back. Empty until loaded; the screen never waits on it. */
@@ -43,6 +44,7 @@ export function useTerminalData(sessionId: string): TerminalData {
     queryKey: qk.session(sessionId),
     queryFn: () => getSession(sessionId),
     enabled: sessionId.length > 0,
+    refetchOnMount: (query) => (query.state.dataUpdateCount === 0 ? "always" : true),
     ...cachedListItem<SessionOut>(queryClient, qk.sessions(), sessionId),
   });
   const hostId = sessionQuery.data?.host_id ?? "";
@@ -81,6 +83,7 @@ export function useTerminalData(sessionId: string): TerminalData {
 
   return {
     session: sessionQuery.data,
+    detailLoaded: sessionQuery.isFetched && sessionQuery.isSuccess,
     host: hostQuery.data,
     agents: agentsQuery.data ?? [],
     isLoading: sessionQuery.isLoading || (hostId.length > 0 && hostQuery.isLoading),
@@ -115,13 +118,9 @@ export function useRenameTerminalSession(sessionId: string) {
  */
 export function useRestartTerminalSession(sessionId: string) {
   const queryClient = useQueryClient();
-  return useMutation<AgentRestartResult | null, Error, SessionOut | undefined>({
-    mutationFn: async (confirmed) => {
+  return useMutation<AgentRestartResult, Error, void>({
+    mutationFn: async () => {
       const session = await getSession(sessionId);
-      if (confirmed && !sameSessionRun(session, confirmed)) {
-        queryClient.setQueryData(qk.session(sessionId), session);
-        return null;
-      }
       const agents = await queryClient
         .ensureQueryData({ queryKey: qk.agents(), queryFn: listAgents })
         .catch(() => []);

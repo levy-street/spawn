@@ -579,7 +579,7 @@
     {
       "target": "spawnd::worker_backend",
       "file": "src/worker_backend.rs",
-      "line": 800,
+      "line": 735,
       "field": "error",
       "source": "tracing::debug!(%session_id, error = %message, \"worker error\")",
       "why": "Only the unreadable_history branch: local worker segment-path/OS-not-found or fixed disabled-history explanation. Other frame causes use the unlisted WARN callsite."

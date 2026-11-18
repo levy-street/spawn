@@ -1,3 +1,4 @@
+import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { DeviceHostTrust, DeviceHostTrustResult } from "@/data/trust/device-trust";
 import type { TerminalTheme } from "@/theme";
@@ -134,7 +135,11 @@ export interface SessionTransportOptions {
   connectTimeoutMs?: number;
 }
 
+export type WindowRun = Pick<SessionOut, "host_id" | "started_at" | "status">;
+
 export interface SessionTransport {
+  observeWindow?(row: WindowRun | null, visible: boolean): void;
+  recheckNotRunning?(): void;
   readonly sessionId: string;
   /** The host this view attaches to the window on, fixed for its life. */
   readonly hostId: string;
@@ -145,7 +150,6 @@ export interface SessionTransport {
   readonly displayOwner?: boolean;
   /** Retains the app-owned daemon connection before the terminal WebView loads. */
   prepare?(): void;
-  recheckNotRunning?(onRefused?: () => void): void;
   networkChanged?(): void;
   open(): Promise<void>;
   close(): void;
@@ -331,13 +335,13 @@ export interface HostTransportOptions {
 }
 
 export interface HostTransport {
+  onRebound?(listener: () => void): () => void;
   readonly hostId: string;
   readonly lastError?: TransportError | null;
   readonly state: TransportState;
   /** Null until this RTC generation's hello frame is decoded. */
   readonly capabilities?: HostCapabilities | null;
   prepare?(): void;
-  recheckNotRunning?(onRefused?: () => void): void;
   networkChanged?(): void;
   open(): Promise<void>;
   close(): void;

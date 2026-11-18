@@ -198,7 +198,7 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
-  recheckNotRunning(onRefused?: () => void): void;
+  recheckNotRunning(): void;
   /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
   /** Tell the daemon the new TTY size. */
@@ -260,6 +260,7 @@ export interface TerminalProps {
    *  takes control, so it can't disturb another client. Re-activating it
    *  focuses its view within the owning device and fits its container. Default true. */
   active?: boolean;
+  displayedRow?: Session | null;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
@@ -286,6 +287,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onDisplayControl,
     onConnectionInfo,
     active = true,
+    displayedRow,
     onExit,
     onAgentNotice,
   },
@@ -1218,6 +1220,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const sessionIdentityQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
+    refetchOnMount: (query) => (query.state.dataUpdateCount === 0 ? "always" : true),
     staleTime: 30_000,
     ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
   });
@@ -1403,6 +1406,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     connection: daemonConnection,
     sessionId,
     sessionStatus: sessionIdentityQuery.data,
+    observedRun: JSON.stringify([
+      displayedRow?.status,
+      displayedRow?.host_id,
+      displayedRow?.started_at,
+      sessionIdentityQuery.data?.status,
+      sessionIdentityQuery.data?.host_id,
+      sessionIdentityQuery.data?.started_at,
+    ]),
+    canShowNotRunning:
+      sessionIdentityQuery.isFetched &&
+      sessionIdentityQuery.isSuccess &&
+      displayedRow?.status === "running" &&
+      displayedRow.host_id === signalingHostId &&
+      sessionIdentityQuery.data?.status === "running" &&
+      sessionIdentityQuery.data.host_id === signalingHostId,
     active,
     enabled:
       socketWanted &&
@@ -3384,7 +3402,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   useImperativeHandle(
     ref,
     () => ({
-      recheckNotRunning: (onRefused) => socketRef.current.recheckNotRunning(onRefused),
       sendInput: (data) => {
         snapToLiveEdge();
         socket.sendBinary(data);
@@ -3637,6 +3654,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           endUploadTrack(uploadId);
         }
       },
+      recheckNotRunning: () => socketRef.current.recheckNotRunning(),
       focus: () => {
         focusViewRef.current();
         termRef.current?.focus();
@@ -3736,7 +3754,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       aria-label="Session terminal"
       data-session-id={sessionId}
       data-input-ready={socket.dcOpen && controlState?.owner === true}
-      aria-busy={!socket.dcOpen}
+      aria-busy={!socket.dcOpen && socket.state !== "not-running"}
       onFocusCapture={() => {
         focusViewRef.current();
         // The terminal being typed in is the one the GPU renderer is for.
@@ -3790,17 +3808,38 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       {/* Before the first byte lands there is nothing under here but the
           terminal's own black: the overlay explains the wait, and gets out of
           the way the moment output arrives. */}
-      <ConnectingOverlay
-        sharedConnectionReady={daemonReady}
-        rebuilding={daemonRebuilding}
-        socketState={socket.state}
-        v3={socket.v3}
-        dcOpen={socket.dcOpen}
-        refusal={socket.signedRtcRefusal}
-        painted={painted}
-        hostName={hostIdentityQuery.data?.name ?? null}
-        hostOffline={hostIdentityQuery.data?.status === "offline"}
-      />
+      {socket.state === "not-running" ? (
+        <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 p-3 text-center backdrop-blur-[2px]">
+          <div className="flex max-w-xs flex-col items-center gap-2 rounded-lg border border-border bg-popover p-4 text-sm shadow-lg">
+            <p role="status">
+              This session is no longer running on{" "}
+              {displayedRow?.host_name ?? hostIdentityQuery.data?.name ?? "this host"}.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Choose Restart from the window menu to start it again.
+            </p>
+            <button
+              type="button"
+              className="rounded-md bg-primary px-3 py-2 font-medium text-primary-foreground"
+              onClick={socket.recheckNotRunning}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      ) : (
+        <ConnectingOverlay
+          sharedConnectionReady={daemonReady}
+          rebuilding={daemonRebuilding}
+          socketState={socket.state}
+          v3={socket.v3}
+          dcOpen={socket.dcOpen}
+          refusal={socket.signedRtcRefusal}
+          painted={painted}
+          hostName={hostIdentityQuery.data?.name ?? null}
+          hostOffline={hostIdentityQuery.data?.status === "offline"}
+        />
+      )}
       {tooSmallPlaceholder && (
         // A pane too small for any terminal, before it knows the session's
         // own size: said quietly, in the pane's own ground, rather than left
@@ -3826,15 +3865,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           Transport disabled by this server.
         </div>
       )}
-      {showReconnectBanner && socket.state !== "unauthorized" && socket.state !== "disabled" && (
-        <div
-          role="status"
-          data-testid="terminal-reconnect-banner"
-          className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
-        >
-          Connection paused. Your terminal output is still available to copy.
-        </div>
-      )}
+      {showReconnectBanner &&
+        socket.state !== "not-running" &&
+        socket.state !== "unauthorized" &&
+        socket.state !== "disabled" && (
+          <div
+            role="status"
+            data-testid="terminal-reconnect-banner"
+            className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
+          >
+            Connection paused. Your terminal output is still available to copy.
+          </div>
+        )}
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
           data-testid="upload-reconciliation"

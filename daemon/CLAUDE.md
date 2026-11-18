@@ -388,13 +388,14 @@ updater knew about variants.
 
 - Shared device RTC lives in `rtc_pair.rs`: signed host-v2 admission owns
   the peer; local registry attachments reuse the session protocol and own only
-  channels. After startup discovery a missing window is checked in this
-  instance's worker directory, outside the admission lock. A running worker
-  that answers is adopted. With no endpoint, no held reservation and no
-  launch, adoption, restart or removal under way for that window, both refused
-  channels send the device a `session_not_running` text event before closing.
-  An unresolved endpoint gets the ordinary close. A device check never shuts
-  down a worker waiting for Start or announces a session change to the server.
+  channels. After peer admission checks, a missing window can receive a
+  device-only `session_not_running` text event on each channel before close.
+  Discovery must have finished, with no launch, adoption, restart or removal
+  under way for the id. Check only metadata in the discovered directory,
+  outside admission. Any endpoint marker, lock file, socket or error gets
+  the ordinary close. This check never contacts a worker or changes a session.
+  Devices offer Try again and point to Restart in the window menu. The server
+  can continue listing the session as running.
   Fence every effect by parent trust/binding and worker generation.
   `session_ctl.rs` retains the controlling device's lease until explicit take
   or session removal; `focus_view` only moves control within that device.
@@ -957,8 +958,7 @@ of one device connection's channels wait at once (every channel the pair
 could hold together: two per terminal attachment, its host consumers, its
 root), and one past that is refused there and then. A terminal label
 naming a session the daemon neither runs nor has a transition in progress
-for is checked before the transition is taken. Only a worker marker calls for
-adoption under the transition. An absent id never waits on daemon-wide admission.
+for takes no generation transition and never waits on daemon-wide admission.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed

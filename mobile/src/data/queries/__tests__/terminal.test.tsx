@@ -5,7 +5,7 @@ import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession } from "@/data/api/endpoints/sessions";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
-import { useRestartTerminalSession, useTerminalData } from "@/data/queries/terminal";
+import { useTerminalData } from "@/data/queries/terminal";
 import { qk } from "@/data/queryKeys";
 
 jest.mock("@/data/api/endpoints/hosts", () => ({ getHost: jest.fn() }));
@@ -40,7 +40,8 @@ test("first open has session and host immediately, with no serial detail request
   expect(client.getQueryData(qk.host(host.id))).toBeUndefined();
   const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
   expect(result.current).toMatchObject({ session, host, isLoading: false, error: null });
-  expect(getSession).not.toHaveBeenCalled();
+  expect(result.current.detailLoaded).toBe(false);
+  expect(getSession).toHaveBeenCalledWith(session.id);
   expect(getHost).not.toHaveBeenCalled();
   expect(client.getQueryState(qk.session(session.id))?.dataUpdatedAt).toBe(updatedAt);
 });
@@ -66,19 +67,14 @@ test("invalidated and removed account data cannot seed a terminal", async () => 
 });
 
 test.each([{ status: "starting" as const }, { started_at: new Date(0).toISOString() }])(
-  "a newer list and the Restart detail check both notice a replacement on the same host",
+  "a newer list refreshes a replacement run on the same host",
   async (change) => {
     const replacement = { ...session, ...change };
     client.setQueryData(qk.session(session.id), session, { updatedAt: Date.now() - 1000 });
     client.setQueryData(qk.sessions(), [replacement]);
     jest.mocked(getSession).mockResolvedValue(replacement);
-    const { result } = await renderHook(
-      () => ({ data: useTerminalData(session.id), restart: useRestartTerminalSession(session.id) }),
-      { wrapper },
-    );
-    await waitFor(() => expect(result.current.data.session).toEqual(replacement));
-    await act(async () => {
-      expect(await result.current.restart.mutateAsync(session)).toBeNull();
-    });
+    const { result } = await renderHook(() => useTerminalData(session.id), { wrapper });
+    await waitFor(() => expect(result.current.session).toEqual(replacement));
+    expect(result.current.detailLoaded).toBe(true);
   },
 );

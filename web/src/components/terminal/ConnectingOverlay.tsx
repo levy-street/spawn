@@ -225,7 +225,7 @@ export function ConnectingOverlay({
     return () => clearTimeout(timer);
   }, [done, entered]);
 
-  if (!entered || gone || socketState === "not-running") return null;
+  if (!entered || gone) return null;
   if (sharedConnectionReady && done) return null;
 
   if (sharedConnectionReady && (stage === "reaching" || stage === "securing")) {

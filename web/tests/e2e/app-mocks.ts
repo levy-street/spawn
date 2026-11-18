@@ -845,8 +845,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       const sessionMock = () =>
         (globalThis as typeof globalThis & { __spawnSessionMock?: SessionMock }).__spawnSessionMock;
       const peers: MockHostPeerConnection[] = [];
+      let rebound: (() => void) | undefined;
       (globalThis as typeof globalThis & { __spawnHostMock: unknown }).__spawnHostMock = {
         count: () => peers.length,
+        rebound: () => rebound?.(),
         disconnect: () => peers.find((peer) => peer.connectionState === "connected")?.close(),
       };
       class MockHostPeerConnection {
@@ -925,6 +927,8 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         send(encoded: string) {
           const message = JSON.parse(encoded) as Record<string, unknown>;
           if (message.type === "rtc.offer") {
+            rebound = () =>
+              this.emit({ type: "rtc.status", session_id: message.session_id, status: "rebound" });
             void (
               globalThis as typeof globalThis & {
                 __spawnRecordRtcTestMessage?: (label: string, value: string) => Promise<void>;

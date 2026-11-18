@@ -1,6 +1,6 @@
 import * as Clipboard from "expo-clipboard";
 import * as Linking from "expo-linking";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
@@ -82,11 +82,12 @@ export interface TerminalOverlayProps {
   session: SessionOut;
   host: HostOut;
   focused: boolean;
+  detailLoaded?: boolean;
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
   /** Restart the window as what it was opened as: a fresh shell, with the
    *  agent's resume command queued for it. */
-  onRestart: (confirmed?: SessionOut) => Promise<AgentRestartResult | null>;
+  onRestart: () => Promise<AgentRestartResult>;
   /** What restarting brings back, for the menu row. */
   restartDetail?: string;
   /** Agent definitions, for naming which agent's transcript this is. */
@@ -134,11 +135,14 @@ export function TerminalOverlay({
   restartDetail,
   agents = [],
   onKill,
+  detailLoaded = false,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
   const appActive = useAppActive();
-  const visibleRef = useRef(focused && appActive);
-  visibleRef.current = focused && appActive;
+  const visible = focused && appActive;
+  const row = detailLoaded ? session : null;
+  const windowRef = useRef({ row, visible });
+  windowRef.current = { row, visible };
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
@@ -306,6 +310,7 @@ export function TerminalOverlay({
       scrollUnsubscribeRef.current?.();
       pendingLaunchUnsubscribeRef.current?.();
       transportRef.current = transport;
+      transport.observeWindow?.(windowRef.current.row, windowRef.current.visible);
       scrollUnsubscribeRef.current = transport.on("scroll", (scroll) => {
         updateFollow({ type: "scroll", scroll });
         if (scroll.newOutputWhileAway) updateFollow({ type: "output-while-away" });
@@ -327,13 +332,9 @@ export function TerminalOverlay({
     [armLaunchFocus, host.host_public_key, session.status, transfers.setNotice, updateFollow],
   );
 
-  const sessionRow = JSON.stringify([session.host_id, session.status, session.started_at]);
-  const previousRow = useRef(sessionRow);
-  useEffect(() => {
-    const changed = previousRow.current !== sessionRow;
-    previousRow.current = sessionRow;
-    if (changed || (focused && appActive)) transportRef.current?.recheckNotRunning?.();
-  }, [focused, appActive, sessionRow]);
+  useLayoutEffect(() => {
+    transportRef.current?.observeWindow?.(row, visible);
+  }, [row, visible]);
 
   const handleConnectionState = (next: TransportState): void => {
     const previous = previousConnectionState.current;
@@ -460,12 +461,11 @@ export function TerminalOverlay({
    * restarted and the agent's resume command waits for the fresh shell, which
    * the transport has to be reopened for.
    */
-  const restart = (confirmed?: SessionOut): void => {
+  const restartFromHere = (): void => {
     if (restarting) return;
     setRestarting(true);
-    void onRestart(confirmed)
+    void onRestart()
       .then((result) => {
-        if (!result) return;
         const agent = result.plan.kind === "agent" ? result.plan.agent.name : null;
         transfers.setNotice(
           agent
@@ -480,17 +480,12 @@ export function TerminalOverlay({
       .finally(() => setRestarting(false));
   };
 
-  const notRunning = connectionState === "not-running";
-  const restartFromHere = () => {
-    if (notRunning) {
-      const transport = transportRef.current;
-      if (transport?.hostId === session.host_id) {
-        transport.recheckNotRunning?.(() => {
-          if (visibleRef.current && transportRef.current === transport) restart(session);
-        });
-      }
-    } else restart();
-  };
+  const notRunning =
+    connectionState === "not-running" &&
+    detailLoaded &&
+    session.status === "running" &&
+    session.host_id === host.id &&
+    transportRef.current?.hostId === host.id;
 
   const takeDisplayControl = (): void => {
     surfaceRef.current?.takeControl();
@@ -634,9 +629,10 @@ export function TerminalOverlay({
             ]}
           >
             <Text variant="label">{`This session is no longer running on ${session.host_name ?? host.name}.`}</Text>
-            <Button disabled={restarting} onPress={restartFromHere}>
-              {restarting ? "Restarting…" : "Restart"}
-            </Button>
+            <Text color="mutedForeground">
+              Choose Restart from the window menu to start it again.
+            </Text>
+            <Button onPress={() => transportRef.current?.recheckNotRunning?.()}>Try again</Button>
           </View>
         ) : (
           <ConnectionStateOverlay

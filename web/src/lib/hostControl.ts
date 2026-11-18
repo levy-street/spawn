@@ -436,6 +436,7 @@ export class HostControlClient {
   // `failed` or `disabled` (a host that has not approved this device answers
   // so, without a reason): it retries, but it has been told no.
   private offerFailedAt = 0;
+  rebound = 0;
   // A wire-version refusal is terminal too, but it is not a trust refusal and
   // must never be surfaced as one. The release watcher owns its recovery UI.
   private terminalReason: HostControlTerminalReason | null = null;
@@ -1821,6 +1822,10 @@ export class HostControlClient {
         }
         this.captureBindingMetadata(message);
         if (["resumed", "rebound", "signalling_lost", "connected"].includes(message.status)) {
+          if (message.status === "rebound") {
+            this.rebound++;
+            for (const listener of this.listeners) listener(this.state);
+          }
           if (message.status === "resumed") this.clearRtcResumeTimer();
           return;
         }

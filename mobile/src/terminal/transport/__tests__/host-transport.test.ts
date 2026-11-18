@@ -464,6 +464,20 @@ describe("HostTransport signalling", () => {
     }
   });
 
+  test("only a rebound for the current host peer notifies its views", async () => {
+    const { transport, signal, bridge } = await readyTransport();
+    const rebound = jest.fn();
+    transport.onRebound?.(rebound);
+    const first = bridge.sent.find((message) => message.type === "connect");
+    if (!first) throw new Error("Missing initial peer");
+    signal.emit({ type: "rtc.status", session_id: "other", status: "rebound" });
+    expect(rebound).not.toHaveBeenCalled();
+    signal.emit({ type: "rtc.status", session_id: first.rtcSessionId, status: "rebound" });
+    expect(rebound).toHaveBeenCalledTimes(1);
+    expect(transport.state).toBe("ready");
+    transport.close();
+  });
+
   test("a refused resume rebuilds immediately once, then ordinary refusal tears down", async () => {
     const { transport, signal, bridge } = await readyTransport();
     jest.useFakeTimers();

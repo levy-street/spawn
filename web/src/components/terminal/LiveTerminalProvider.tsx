@@ -7,6 +7,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -50,7 +51,7 @@ const EMPTY_SESSION_LIVE: SessionLive = {
 /** Stable actions — this context value never changes, so a placeholder's
  *  `attach` ref callback (which depends on it) never re-fires spuriously. */
 type Actions = {
-  claim: (sessionId: string, container: HTMLElement, token: symbol) => void;
+  claim: (sessionId: string, container: HTMLElement, token: symbol, row: Session | null) => void;
   release: (sessionId: string, token: symbol) => void;
   getHandle: (sessionId: string) => TerminalHandle | null;
 };
@@ -75,7 +76,13 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   const entriesRef = useRef<Map<string, PoolEntry>>(new Map());
   const parkRef = useRef<HTMLDivElement | null>(null);
   const [warmIds, setWarmIds] = useState<string[]>([]);
-  const [claimed, setClaimed] = useState<Record<string, boolean>>({});
+  const [claims, setClaims] = useState<Record<string, { visible: boolean; row: Session | null }>>(
+    {},
+  );
+  const claimed = useMemo(
+    () => Object.fromEntries(Object.entries(claims).map(([id, claim]) => [id, claim.visible])),
+    [claims],
+  );
   const [live, setLive] = useState<Record<string, SessionLive>>({});
   // Monotonic clock without Date.now in render; bumped per claim for LRU order.
   const clockRef = useRef(0);
@@ -90,7 +97,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     entriesRef.current.delete(sessionId);
     entry.host.parentElement?.removeChild(entry.host);
     setWarmIds((ids) => ids.filter((id) => id !== sessionId));
-    setClaimed((m) => {
+    setClaims((m) => {
       if (!(sessionId in m)) return m;
       const { [sessionId]: _drop, ...rest } = m;
       return rest;
@@ -117,7 +124,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   }, [evict]);
 
   const claim = useCallback(
-    (sessionId: string, container: HTMLElement, token: symbol) => {
+    (sessionId: string, container: HTMLElement, token: symbol, row: Session | null) => {
       let entry = entriesRef.current.get(sessionId);
       if (!entry) {
         const host = document.createElement("div");
@@ -129,7 +136,11 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       entry.token = token;
       entry.lastAt = nextClock();
       if (entry.host.parentElement !== container) container.appendChild(entry.host);
-      setClaimed((m) => (m[sessionId] ? m : { ...m, [sessionId]: true }));
+      setClaims((m) =>
+        m[sessionId]?.visible && m[sessionId].row === row
+          ? m
+          : { ...m, [sessionId]: { visible: true, row } },
+      );
       enforceLimit();
     },
     [enforceLimit, nextClock],
@@ -141,7 +152,9 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
     entry.token = null;
     const park = parkRef.current;
     if (park && entry.host.parentElement !== park) park.appendChild(entry.host);
-    setClaimed((m) => (m[sessionId] ? { ...m, [sessionId]: false } : m));
+    setClaims((m) =>
+      m[sessionId]?.visible ? { ...m, [sessionId]: { ...m[sessionId], visible: false } } : m,
+    );
   }, []);
 
   const getHandle = useCallback(
@@ -212,6 +225,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               key={id}
               sessionId={id}
               active={!!claimed[id]}
+              displayedRow={claims[id]?.row ?? null}
               host={entry.host}
               handleRef={entry.handleRef}
               onInfo={onInfo}
@@ -263,6 +277,7 @@ function useIncarnationHost(sessionId: string): string | null {
 function PooledTerminal({
   sessionId,
   active,
+  displayedRow,
   host,
   handleRef,
   onInfo,
@@ -272,6 +287,7 @@ function PooledTerminal({
 }: {
   sessionId: string;
   active: boolean;
+  displayedRow: Session | null;
   host: HTMLDivElement;
   handleRef: { current: TerminalHandle | null };
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
@@ -322,6 +338,7 @@ function PooledTerminal({
         mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
         imagePasteMode="bracketed-path"
         active={active}
+        displayedRow={displayedRow}
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
         onAgentNotice={(notice) => onAgentNotice(sessionId, notice)}
@@ -360,25 +377,29 @@ export function useTerminalHandles(): (sessionId: string) => TerminalHandle | nu
 
 /** Claim the shared warm terminal for `sessionId` into a placeholder. Attach the
  *  returned `attach` ref to the div where the terminal body should render. */
-export function useLiveTerminal(sessionId: string | null) {
+export function useLiveTerminal(sessionId: string | null, row: Session | null = null) {
   const actions = useContext(ActionsCtx);
   if (!actions) throw new Error("useLiveTerminal must be used within LiveTerminalProvider");
   const tokenRef = useRef<symbol | null>(null);
   if (!tokenRef.current) tokenRef.current = Symbol("live-terminal");
   const containerRef = useRef<HTMLElement | null>(null);
 
+  const rowRef = useRef(row);
+  rowRef.current = row;
   const attach = useCallback(
     (el: HTMLElement | null) => {
       containerRef.current = el;
-      if (el && sessionId) actions.claim(sessionId, el, tokenRef.current as symbol);
+      if (el && sessionId) actions.claim(sessionId, el, tokenRef.current as symbol, rowRef.current);
     },
     [sessionId, actions],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (sessionId && containerRef.current) {
-      actions.claim(sessionId, containerRef.current, tokenRef.current as symbol);
+      actions.claim(sessionId, containerRef.current, tokenRef.current as symbol, row);
     }
+  }, [sessionId, actions, row]);
+  useEffect(() => {
     return () => {
       if (sessionId) actions.release(sessionId, tokenRef.current as symbol);
     };

@@ -20,23 +20,18 @@ pub struct SessionRegistry {
     /// One-shot guard for startup worker discovery. The first WS session of
     /// the process triggers discovery; reconnects skip.
     discovery_done: Arc<AtomicBool>,
-    discovery_finished: Arc<AtomicBool>,
+    /// The validated directory used by the completed startup scan.
+    discovered_dir: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// Preserve serialization of the existing lazy adoption path.
+    attach_lock: Arc<AsyncMutex<()>>,
     /// Launch, lazy adoption and the whole restart have gaps outside the
     /// generation transition. A device may inspect only between those jobs.
-    worker_gates: Arc<Mutex<HashMap<Uuid, Weak<WorkerGate>>>>,
+    worker_gates: Arc<Mutex<HashMap<Uuid, Weak<tokio::sync::RwLock<()>>>>>,
     /// Serializes the linearization point between a concrete backend
     /// generation and RTC peer insertion/teardown for its UUID. The registry
     /// entry itself remains behind the small synchronous lock above; this
     /// async lock is held only across replacement lifecycle awaits.
     generation_transitions: Arc<Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>>,
-}
-
-#[derive(Default)]
-pub struct WorkerGate {
-    pub change: tokio::sync::RwLock<()>,
-    // A reservation check can briefly take the OS lock. Two halves of a
-    // device attachment must not mistake each other's check for a worker.
-    pub inspection: AsyncMutex<()>,
 }
 
 struct RegistryEntry {
@@ -110,21 +105,25 @@ impl SessionRegistry {
         !self.discovery_done.swap(true, Ordering::SeqCst)
     }
 
-    pub fn finish_discovery(&self) {
-        self.discovery_finished.store(true, Ordering::Release);
+    pub async fn lock_attach(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.attach_lock.lock().await
     }
 
-    pub fn discovery_finished(&self) -> bool {
-        self.discovery_finished.load(Ordering::Acquire)
+    pub fn finish_discovery(&self, dir: std::path::PathBuf) {
+        let _ = self.discovered_dir.set(dir);
     }
 
-    pub fn worker_gate(&self, id: Uuid) -> Arc<WorkerGate> {
+    pub fn discovered_dir(&self) -> Option<&std::path::PathBuf> {
+        self.discovered_dir.get()
+    }
+
+    pub fn worker_gate(&self, id: Uuid) -> Arc<tokio::sync::RwLock<()>> {
         let mut gates = self.worker_gates.lock().expect("worker gates");
         if let Some(gate) = gates.get(&id).and_then(Weak::upgrade) {
             return gate;
         }
         gates.retain(|_, gate| gate.strong_count() > 0);
-        let gate = Arc::new(WorkerGate::default());
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
         gates.insert(id, Arc::downgrade(&gate));
         gate
     }

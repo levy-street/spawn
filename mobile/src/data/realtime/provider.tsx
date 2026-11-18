@@ -90,6 +90,7 @@ export function RealtimeProvider({
     const refetchRecoveryQueries = async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: qk.sessions() }),
+        queryClient.invalidateQueries({ queryKey: ["session"], type: "active" }),
         queryClient.invalidateQueries({ queryKey: qk.workspaces() }),
         queryClient.invalidateQueries({ queryKey: qk.hosts() }),
         queryClient.invalidateQueries({ queryKey: qk.agents() }),

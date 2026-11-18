@@ -209,6 +209,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   #rejectOpen: ((error: Error) => void) | null = null;
   readonly #pending = new Map<string, PendingRequest>();
   readonly #commands = new Map<string, PendingCommand>();
+  readonly #reboundListeners = new Set<() => void>();
   readonly #stateListeners = new Set<(state: TransportState) => void>();
   readonly #errorListeners = new Set<(error: TransportError) => void>();
   readonly #diagnosticListeners = new Set<(diagnostic: WorkerDiagnostic) => void>();
@@ -936,6 +937,11 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
   }
 
+  onRebound(listener: () => void): () => void {
+    this.#reboundListeners.add(listener);
+    return () => this.#reboundListeners.delete(listener);
+  }
+
   on(ev: "state", fn: (state: TransportState) => void): () => void;
   on(ev: "error", fn: (error: TransportError) => void): () => void;
   on(ev: "diagnostic", fn: (diagnostic: WorkerDiagnostic) => void): () => void;
@@ -1206,6 +1212,9 @@ class WebViewHostTransport implements StreamingHostTransport {
       ) {
         clearTimeout(this.#resumeTimer ?? undefined);
         this.#resumeTimer = null;
+      }
+      if (matchesActiveBinding && frame["status"] === "rebound") {
+        for (const listener of this.#reboundListeners) listener();
       }
       if (matchesActiveBinding && frame["status"] === "failed") this.#handleRtcRefusal();
     }

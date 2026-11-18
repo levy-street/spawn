@@ -381,6 +381,7 @@ export async function installSessionRtcMock(
         open() {
           this.readyState = "open";
           this.onopen?.();
+          if (state.attachRefusal === "hold") return;
           if (state.attachRefusal !== undefined) {
             if (state.attachRefusal) {
               this.receive(
@@ -524,6 +525,7 @@ export async function installSessionRtcMock(
             ptyReady: () => boolean;
             setAttachRefusal(reason?: string): void;
             attachmentCount(): number;
+            deliverLateRefusal(index: number): void;
             sendPty: (text: string, connectionIndex?: number) => boolean;
             replyReplay: (text: string) => void;
             setControl: (next: typeof control) => void;
@@ -544,6 +546,16 @@ export async function installSessionRtcMock(
       ).__spawnRtcTest = {
         setAttachRefusal(reason) {
           state.attachRefusal = reason;
+        },
+        deliverLateRefusal(index) {
+          state.ptyChannels[index].receive(
+            JSON.stringify({
+              version: 1,
+              kind: "event",
+              event: "attach_refused",
+              reason: "session_not_running",
+            }),
+          );
         },
         attachmentCount() {
           return state.ptyChannels.length;

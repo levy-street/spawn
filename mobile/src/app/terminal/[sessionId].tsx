@@ -164,12 +164,13 @@ export default function TerminalScreen(): React.JSX.Element {
         fixed padding is what left a dead band under the key row. */}
       <TerminalOverlay
         agents={data.agents}
+        detailLoaded={data.detailLoaded}
         focused={focused}
         host={host}
         onDismiss={() => router.back()}
         onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
-        onRestart={(confirmed) => restart.mutateAsync(confirmed)}
+        onRestart={() => restart.mutateAsync()}
         restartDetail={restartDetail(data.session, data.agents)}
         session={data.session}
       />

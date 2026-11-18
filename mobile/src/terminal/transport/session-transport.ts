@@ -24,6 +24,7 @@ import type {
   TransportState,
   UploadHandle,
   UploadRequest,
+  WindowRun,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
 import { CONNECT_TIMEOUT_MS } from "@/terminal/transport/types";
@@ -78,7 +79,9 @@ class WebViewSessionTransport implements SessionTransport {
   #lease: HostTransportLease | null = null;
   #attachmentId: string | null = null;
   #workerStarted = false;
-  #restartIfRefused: (() => void) | undefined;
+  #row: WindowRun | null = null;
+  #visible = false;
+  #noticeTimer: ReturnType<typeof setTimeout> | undefined;
   #pendingViewEvents: PairEvent[] = [];
   #pendingViewBytes = 0;
   #displayOwner = false;
@@ -137,10 +140,14 @@ class WebViewSessionTransport implements SessionTransport {
             message.binary === false &&
             isSessionNotRunning(message.data)
           ) {
-            const restart = this.#restartIfRefused;
+            if (this.#row?.status !== "running" || this.#row.host_id !== this.hostId) {
+              this.#retryAttachment();
+              return;
+            }
             this.#detach();
             this.#setState("not-running");
-            restart?.();
+            if (this.#visible)
+              this.#noticeTimer = setTimeout(() => this.recheckNotRunning(), 30_000);
             return;
           }
           if (!this.#workerStarted) {
@@ -174,15 +181,29 @@ class WebViewSessionTransport implements SessionTransport {
         this.#emitError(error);
       }),
     );
+    const unsubscribe = shared.transport.onRebound?.(() => this.recheckNotRunning());
+    if (unsubscribe) this.#subscriptions.push(unsubscribe);
     this.#syncConnection();
   }
-  recheckNotRunning(onRefused?: () => void): void {
-    if (!onRefused && this.#restartIfRefused) {
-      this.#detach();
-      this.#setState("not-running");
+  observeWindow(row: WindowRun | null, visible: boolean): void {
+    const changed =
+      row?.host_id !== this.#row?.host_id ||
+      row?.status !== this.#row?.status ||
+      row?.started_at !== this.#row?.started_at;
+    const shown = visible && !this.#visible;
+    this.#row = row;
+    this.#visible = visible;
+    if (!visible) clearTimeout(this.#noticeTimer);
+    if (changed || shown) {
+      if (this.#state === "connecting" && this.#attachmentId) {
+        this.#detach();
+        this.#syncConnection();
+      } else this.recheckNotRunning();
     }
+  }
+  recheckNotRunning(): void {
     if (this.#state !== "not-running" || this.daemonState !== "ready") return;
-    this.#restartIfRefused = onRefused;
+    clearTimeout(this.#noticeTimer);
     this.#setState("connecting");
     this.#syncConnection();
   }
@@ -412,7 +433,7 @@ class WebViewSessionTransport implements SessionTransport {
     }
   }
   #detach(): void {
-    this.#restartIfRefused = undefined;
+    clearTimeout(this.#noticeTimer);
     clearTimeout(this.#retry ?? undefined);
     this.#retry = null;
     clearTimeout(this.#deadline ?? undefined);
@@ -485,7 +506,6 @@ class WebViewSessionTransport implements SessionTransport {
         ) {
           clearTimeout(this.#deadline ?? undefined);
           this.#deadline = null;
-          this.#restartIfRefused = undefined;
           this.#setState("ready");
           this.#resolveOpen?.();
           this.#settleOpening();

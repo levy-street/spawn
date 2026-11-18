@@ -257,6 +257,7 @@ const host: HostOut = {
 };
 
 interface OverlayOverrides {
+  onRestart?: () => Promise<never>;
   focused?: boolean;
   onDismiss?: () => void;
   onKill?: () => Promise<void>;
@@ -274,15 +275,19 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
     >
       <ThemeProvider>
         <TerminalOverlay
+          detailLoaded
           focused={options.focused ?? false}
           host={host}
           onDismiss={options.onDismiss ?? jest.fn()}
           onKill={options.onKill ?? jest.fn(async () => undefined)}
           onRename={jest.fn(async () => undefined)}
-          onRestart={jest.fn(async () => ({
-            kind: "restarted" as const,
-            plan: { kind: "shell" as const },
-          }))}
+          onRestart={
+            options.onRestart ??
+            jest.fn(async () => ({
+              kind: "restarted" as const,
+              plan: { kind: "shell" as const },
+            }))
+          }
           session={session}
         />
       </ThemeProvider>
@@ -290,8 +295,9 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
   );
 }
 
-test("the stopped notice keeps its transport and Restart asks that transport again", async () => {
-  await renderOverlay(true);
+test("Try again only asks the current transport to attach", async () => {
+  const restart = jest.fn();
+  await renderOverlay({ focused: true, onRestart: restart });
   const recheck = jest.fn();
   await act(() =>
     mockTerminalSurfaceProps.onTransport?.({
@@ -302,8 +308,10 @@ test("the stopped notice keeps its transport and Restart asks that transport aga
   );
   await act(() => mockTerminalSurfaceProps.onStateChange?.("not-running"));
   expect(screen.getByText(/This session is no longer running on/)).toBeTruthy();
-  await fireEvent.press(screen.getByText("Restart"));
-  expect(recheck).toHaveBeenCalledWith(expect.any(Function));
+  expect(screen.getByText("Choose Restart from the window menu to start it again.")).toBeTruthy();
+  await fireEvent.press(screen.getByText("Try again"));
+  expect(recheck).toHaveBeenCalledTimes(1);
+  expect(restart).not.toHaveBeenCalled();
 });
 
 describe("a window that moves to another host while its terminal is open", () => {
@@ -401,28 +409,6 @@ describe("Retry and the display", () => {
     mockTerminalSurfaceProps = {};
     mockConnectionProps = {};
     mockSurfaceMounts = 0;
-  });
-
-  test("refocusing a hidden screen and each change of run recheck a stopped window", async () => {
-    const view = await render(overlay(host, false));
-    const recheck = jest.fn();
-    await act(() =>
-      mockTerminalSurfaceProps.onTransport?.({
-        on: () => () => undefined,
-        recheckNotRunning: recheck,
-      }),
-    );
-    await act(() => mockTerminalSurfaceProps.onStateChange?.("not-running"));
-    await view.rerender(overlay(host));
-    expect(recheck).toHaveBeenCalledTimes(1);
-    const started = { ...session, started_at: new Date(0).toISOString() };
-    await view.rerender(overlay(host, true, started));
-    expect(recheck).toHaveBeenCalledTimes(2);
-    await view.rerender(overlay(host, true, { ...started, status: "starting" }));
-    expect(recheck).toHaveBeenCalledTimes(3);
-    await view.rerender(overlay(elsewhere));
-    expect(mockSurfaceMounts).toBe(2);
-    expect(mockTerminalSurfaceProps.hostId).toBe(elsewhere.id);
   });
 
   test("a Retry after this screen had the display reconnects without taking it back", async () => {

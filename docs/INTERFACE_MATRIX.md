@@ -75,7 +75,10 @@ close first. When the host finds no worker for that window, each channel sends
 one text event before closing, with `version: 1`, `kind: "event"`,
 `event: "attach_refused"` and `reason: "session_not_running"`. Older devices
 ignore PTY text and unknown control events and retry on close. Other reasons
-and closes without a reason keep that retry behavior.
+and closes without a reason keep that retry behavior. The notice applies to a
+running row on the answering host. Try again opens fresh channels, as does a
+visible notice after 30 seconds. Restart belongs to the window menu. This
+exchange neither contacts a worker nor records a session change on the server.
 
 `spawn.host.ctl` advertises what a daemon can do in its `hello`. A new
 operation family is one versioned capability for the whole family (`conv.v1`

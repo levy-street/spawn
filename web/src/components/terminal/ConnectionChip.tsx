@@ -107,6 +107,13 @@ function viewFor(info: SessionConnectionInfo): ChipView {
       detail: KIND_DETAIL[kind],
     };
   }
+  if (info.socketState === "not-running") {
+    return {
+      dot: "bg-muted-foreground",
+      label: "session stopped",
+      detail: "This session is no longer running on this host.",
+    };
+  }
   if (info.socketState === "closed" || info.socketState === "error") {
     return { dot: "bg-destructive", label: "offline", detail: "Control connection lost" };
   }
@@ -136,7 +143,9 @@ export function ConnectionChip({
   const TrustIcon = trust?.icon ?? null;
   const v3TrustDetail = info.dcOpen
     ? "spawn.v3 — terminal bytes and history are endpoint-to-endpoint; the server receives signaling and disclosed activity only"
-    : "spawn.v3 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
+    : info.socketState === "not-running"
+      ? null
+      : "spawn.v3 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
   const title = [
     view.detail,
     trust?.detail ?? null,
@@ -169,7 +178,7 @@ export function ConnectionChip({
               ? "disconnected"
               : "negotiating",
         ],
-        ["Protocol", v3TrustDetail],
+        ["Protocol", v3TrustDetail ?? "spawn.v3"],
       ];
 
   return (

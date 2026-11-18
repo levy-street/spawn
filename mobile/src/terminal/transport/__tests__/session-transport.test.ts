@@ -20,6 +20,7 @@ const mockListeners = new Set<(state: TransportState) => void>();
 let mockState: TransportState = "ready";
 let mockLastError: TransportError | null = null;
 let mockCounter = 0;
+let mockRebound: (() => void) | undefined;
 const mockCreateHostTransport = jest.fn(() => ({
   get state() {
     return mockState;
@@ -28,6 +29,12 @@ const mockCreateHostTransport = jest.fn(() => ({
     return mockLastError;
   },
   close: mockClose,
+  onRebound(fn: () => void) {
+    mockRebound = fn;
+    return () => {
+      mockRebound = undefined;
+    };
+  },
   on: (event: string, fn: (state: TransportState) => void) => {
     if (event === "state") mockListeners.add(fn);
     return () => mockListeners.delete(fn);
@@ -110,18 +117,23 @@ afterEach(() => {
 });
 
 describe("session channels on the shared daemon connection", () => {
-  test("a refusal before the renderer loads parks just this view; Restart rechecks one attachment", async () => {
+  test("only the current running window parks; visible notices recheck one attachment", async () => {
     jest.useFakeTimers();
     try {
       const { bridge, transport } = view();
-      transport.prepare?.();
+      const row = {
+        host_id: options.hostId,
+        status: "running" as const,
+        started_at: new Date(0).toISOString(),
+      };
       const attempts = () => commands.filter((frame) => frame.type === "pair-attach");
-      function refuse(reason: string, channel: "pty" | "ctl" = "ctl") {
+      const current = () => attempts().at(-1)?.attachmentId;
+      const refuse = (reason = "session_not_running", attachmentId = current(), channel = "ctl") =>
         root.shared.bridge.receive(
           JSON.stringify({
             v: 1,
             type: "pair-event",
-            attachmentId: attempts().at(-1)?.attachmentId,
+            attachmentId,
             channel,
             event: "data",
             sequence: 1,
@@ -129,39 +141,65 @@ describe("session channels on the shared daemon connection", () => {
             data: JSON.stringify({ version: 1, kind: "event", event: "attach_refused", reason }),
           }),
         );
+      transport.prepare?.();
+      for (const pending of [
+        null,
+        { ...row, status: "starting" as const },
+        { ...row, host_id: "elsewhere" },
+      ]) {
+        transport.observeWindow?.(pending, true);
+        const before = attempts().length;
+        refuse();
+        expect(transport.state).toBe("reconnecting");
+        jest.advanceTimersByTime(500);
+        expect(attempts()).toHaveLength(before + 1);
       }
-      refuse("session_not_running", "pty");
-      const opening = transport.open();
-      state("ready");
-      jest.advanceTimersByTime(30_000);
+      const old = current();
+      transport.observeWindow?.(row, true);
+      expect(current()).not.toBe(old);
+      refuse("session_not_running", old);
+      expect(transport.state).toBe("connecting");
+      transport.observeWindow?.(row, false);
+      const hidden = current();
+      transport.observeWindow?.(row, true);
+      expect(current()).not.toBe(hidden);
+      refuse("session_not_running", hidden);
+      expect(transport.state).toBe("connecting");
+      refuse("session_not_running", current(), "pty");
       expect(transport.state).toBe("not-running");
-      expect(attempts()).toHaveLength(1);
+      const parked = attempts().length;
+      jest.advanceTimersByTime(29_999);
+      expect(attempts()).toHaveLength(parked);
+      jest.advanceTimersByTime(1);
+      expect(attempts()).toHaveLength(parked + 1);
+      refuse();
+      transport.observeWindow?.(row, false);
+      jest.advanceTimersByTime(60_000);
+      expect(attempts()).toHaveLength(parked + 1);
+      transport.observeWindow?.(row, true);
+      expect(attempts()).toHaveLength(parked + 2);
+      refuse();
+      mockRebound?.();
+      expect(attempts()).toHaveLength(parked + 3);
+      refuse();
       state("connecting");
       state("ready");
-      expect(attempts()).toHaveLength(2);
-      const restart = jest.fn();
-      refuse("session_not_running");
-      transport.recheckNotRunning?.(restart);
-      bridge.emit({ v: 1, type: "state", state: "ready" });
-      await opening;
-      expect(restart).not.toHaveBeenCalled();
-      expect(transport.state).toBe("ready");
-
-      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
-      jest.advanceTimersByTime(500);
-      refuse("session_not_running");
-      transport.recheckNotRunning?.(restart);
+      expect(attempts()).toHaveLength(parked + 4);
+      refuse();
+      transport.recheckNotRunning?.();
+      transport.recheckNotRunning?.();
+      expect(attempts()).toHaveLength(parked + 5);
+      const opening = transport.open();
       refuse("unknown_reason");
       bridge.emit({ v: 1, type: "state", state: "reconnecting" });
-      const before = attempts().length;
       jest.advanceTimersByTime(500);
-      expect(attempts()).toHaveLength(before + 1);
-      refuse("session_not_running");
-      expect(restart).not.toHaveBeenCalled();
-      transport.recheckNotRunning?.(restart);
-      refuse("session_not_running");
-      expect(restart).toHaveBeenCalledTimes(1);
+      expect(attempts()).toHaveLength(parked + 6);
+      bridge.emit({ v: 1, type: "state", state: "ready" });
+      await opening;
+      mockRebound?.();
+      expect(attempts()).toHaveLength(parked + 6);
       expect(mockClose).not.toHaveBeenCalled();
+      expect(bridge.sent.some((frame) => frame.type === "input")).toBe(false);
     } finally {
       jest.useRealTimers();
     }

@@ -492,89 +492,53 @@ impl RtcSessions {
                 .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
     }
 
-    /// Check only this id, off admission. An error follows the ordinary
-    /// close-and-retry path. A confirmed running worker rejoins the registry
-    /// without announcing a launch or sending a lifecycle command.
-    async fn missing_pair_session(
-        &self,
-        parent_id: &str,
-        pc: &Arc<RTCPeerConnection>,
-        pair: &PairContext,
-        session_id: Uuid,
-    ) -> Result<bool> {
-        anyhow::ensure!(
-            pair.registry.discovery_finished(),
-            "worker discovery in progress"
-        );
-        let gate = pair.registry.worker_gate(session_id);
-        let _inspection = gate
-            .change
-            .try_read()
-            .context("worker change in progress")?;
-        let marker = crate::worker_backend::device_worker_marker(session_id, &gate).await?;
-        anyhow::ensure!(
-            self.pair_is_current(parent_id, pc, pair.trust_epoch).await
-                && !pair.retired.load(Ordering::Acquire),
-            "retired device connection"
-        );
-        if let Some(marker) = marker {
-            // Both halves can discover the same marker. Only the first
-            // connects: a second connection displaces the worker's reader.
-            let _transition = pair.registry.lock_generation_transition(session_id).await;
-            if !pair.registry.contains(session_id) {
-                let launched = crate::worker_backend::adopt_for_device(marker).await?;
-                if let Some(sink) = self.registered_sender() {
-                    launched.handle.control.set_sink((*sink).clone()).await;
-                }
-                let generation = pair.registry.insert_launched(launched.handle, None);
-                tokio::spawn(crate::run::spawn_exit_forwarder(
-                    session_id,
-                    generation,
-                    launched.exit_rx,
-                    pair.registry.clone(),
-                    self.clone(),
-                    None,
-                ));
-            }
-            return Ok(false);
-        }
-        Ok(!pair.registry.contains(session_id)
-            && !pair.registry.generation_transition_in_progress(session_id))
+    async fn has_pair_view_capacity(&self, pc: &Arc<RTCPeerConnection>) -> bool {
+        self.peers
+            .lock()
+            .await
+            .values()
+            .filter(|peer| Arc::ptr_eq(&peer.pc, pc) && !peer.close.is_claimed())
+            .count()
+            < MAX_PAIR_SESSIONS
     }
 
     fn refuse_missing_session(
         &self,
         parent_id: &str,
         pc: &Arc<RTCPeerConnection>,
-        pair: &PairContext,
+        pair: &Arc<PairContext>,
         session_id: Uuid,
         dc: &Arc<RTCDataChannel>,
     ) {
         // Both channels are independently ordered. A close on either
         // tears down the view, so each carries the answer before FIN.
         let weak_dc = Arc::downgrade(dc);
-        let registry = pair.registry.clone();
+        let pair = Arc::clone(pair);
         let sessions = self.clone();
-        let epoch = pair.trust_epoch;
         let parent = parent_id.to_owned();
         let peer = Arc::downgrade(pc);
         dc.on_open(Box::new(move || {
             Box::pin(async move {
                 let Some(dc) = weak_dc.upgrade() else { return };
                 if let Some(pc) = peer.upgrade() {
+                    let registry = &pair.registry;
                     let gate = registry.worker_gate(session_id);
                     // Keep a launch or restart from entering between this
                     // final marker check and sending the answer. Other
                     // windows and the connection's admission remain free.
-                    let inspection = gate.change.try_read();
+                    let inspection = gate.try_read();
                     if inspection.is_ok()
-                        && matches!(
-                            crate::worker_backend::device_worker_marker(session_id, &gate).await,
-                            Ok(None)
-                        )
-                        && sessions.pair_is_current(&parent, &pc, epoch).await
+                        && worker_files_absent(registry, session_id).await
+                        && sessions.has_pair_view_capacity(&pc).await
+                        && sessions
+                            .pair_is_current(&parent, &pc, pair.trust_epoch)
+                            .await
+                        && !pair.retired.load(Ordering::Acquire)
                         && !registry.generation_transition_in_progress(session_id)
                         && !registry.contains(session_id)
+                        // A handler may have queued for the writer during the
+                        // filesystem lookup. Tokio refuses new readers in that case.
+                        && gate.try_read().is_ok()
                     {
                         let _ = dc.send_text(SESSION_NOT_RUNNING).await;
                     }
@@ -588,7 +552,7 @@ impl RtcSessions {
         &self,
         parent_id: &str,
         pc: &Arc<RTCPeerConnection>,
-        pair: &PairContext,
+        pair: &Arc<PairContext>,
         label: AttachmentLabel,
         dc: Arc<RTCDataChannel>,
     ) -> Result<()> {
@@ -599,22 +563,26 @@ impl RtcSessions {
         // serializes on admission. Taken the other way round, one device
         // opening a restarting window held admission for all of that, and
         // every other device's channels and offers waited behind it.
-        if !pair.registry.contains(label.session)
-            && !pair
+        let known = pair.registry.contains(label.session)
+            || pair
                 .registry
-                .generation_transition_in_progress(label.session)
-            && self
-                .missing_pair_session(parent_id, pc, pair, label.session)
-                .await?
-        {
-            self.refuse_missing_session(parent_id, pc, pair, label.session, &dc);
-            return Ok(());
-        }
-        let transition = pair
-            .registry
-            .lock_generation_transition(label.session)
-            .await;
-        let _admission = self.admission.lock().await;
+                .generation_transition_in_progress(label.session);
+        let transition = if known {
+            Some(
+                pair.registry
+                    .lock_generation_transition(label.session)
+                    .await,
+            )
+        } else {
+            None
+        };
+        // Only inserting or joining a registered view needs admission. An
+        // absent id still passes the same peer, stale-view and capacity checks.
+        let _admission = if known {
+            Some(self.admission.lock().await)
+        } else {
+            None
+        };
         anyhow::ensure!(
             self.pair_is_current(parent_id, pc, pair.trust_epoch).await,
             "retired device connection"
@@ -654,7 +622,8 @@ impl RtcSessions {
             .cloned();
         let child = if let Some(child) = existing {
             anyhow::ensure!(
-                Arc::ptr_eq(&child.pc, pc)
+                known
+                    && Arc::ptr_eq(&child.pc, pc)
                     && attachment_parent_generation(&child.generation) == parent_generation
                     && child.active.load(Ordering::Acquire)
                     && pair.registry.is_current(child.session),
@@ -662,6 +631,23 @@ impl RtcSessions {
             );
             child
         } else {
+            anyhow::ensure!(
+                self.has_pair_view_capacity(pc).await,
+                "too many terminal views"
+            );
+            if transition.is_none() {
+                anyhow::ensure!(
+                    pair.registry.discovered_dir().is_some()
+                        && !pair.registry.contains(label.session)
+                        && pair.registry.worker_gate(label.session).try_read().is_ok()
+                        && !pair
+                            .registry
+                            .generation_transition_in_progress(label.session),
+                    "session not running on this daemon"
+                );
+                self.refuse_missing_session(parent_id, pc, pair, label.session, &dc);
+                return Ok(());
+            }
             // This attachment's own generation: its parent's, and a sequence
             // no other attachment has. The viewer id every registry keys on
             // — direct sinks, control viewers, uploads — derives from it, so
@@ -672,14 +658,6 @@ impl RtcSessions {
                 "{parent_generation}#{}",
                 ATTACHMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             );
-            let count = self
-                .peers
-                .lock()
-                .await
-                .values()
-                .filter(|peer| Arc::ptr_eq(&peer.pc, pc) && !peer.close.is_claimed())
-                .count();
-            anyhow::ensure!(count < MAX_PAIR_SESSIONS, "too many terminal views");
             let session = pair
                 .registry
                 .binding_for(label.session)
@@ -775,6 +753,25 @@ impl RtcSessions {
     }
 }
 
+/// Look only at directory entries. A stale lock, a dangling symlink, or a
+/// filesystem error is enough to leave this attachment on the ordinary close.
+async fn worker_files_absent(registry: &SessionRegistry, id: Uuid) -> bool {
+    let Some(dir) = registry.discovered_dir().cloned() else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        std::fs::symlink_metadata(&dir).is_ok_and(|entry| entry.is_dir())
+            && ["endpoint", "lock", "sock", "lifecycle.sock"]
+                .iter()
+                .all(|suffix| {
+                    matches!(std::fs::symlink_metadata(dir.join(format!("{id}.{suffix}"))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                })
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// How a pair channel asks whether a window's Codex accepts `--no-daemon`:
 /// `codex_launch`, with the environment and folder this daemon started the
 /// window's current shell with. A window it adopted rather than started has
@@ -790,7 +787,7 @@ fn codex_launch_asker(registry: SessionRegistry) -> crate::host_conv::CodexNoDae
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -1961,7 +1958,11 @@ mod tests {
         );
     }
 
-    async fn refusal_frames(pc: &Arc<RTCPeerConnection>, session: Uuid, kind: &str) -> Vec<Value> {
+    pub(crate) async fn refusal_frames(
+        pc: &Arc<RTCPeerConnection>,
+        session: Uuid,
+        kind: &str,
+    ) -> Vec<Value> {
         let dc = pc
             .create_data_channel(
                 &format!(
@@ -2002,36 +2003,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_refusal_and_worker_recovery() {
-        use crate::worker_backend;
-        use spawnd::sessiond::endpoint;
-        let Some(root) = std::env::var_os("SPAWN_TEST_DEVICE_REFUSAL_ROOT") else {
-            #[cfg(unix)]
-            let temp = tempfile::tempdir_in("/tmp").unwrap();
-            #[cfg(windows)]
-            let temp = tempfile::tempdir().unwrap();
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "rtc::pair::tests::device_refusal_and_worker_recovery",
-                    "--nocapture",
-                ])
-                .env("SPAWN_TEST_DEVICE_REFUSAL_ROOT", temp.path())
-                .env("SPAWND_WORKER_DIR", temp.path().join("w"))
-                .env("SPAWN_CONFIG_DIR", temp.path().join("c"))
-                .env("SPAWND_NO_CPU_SCOPES", "1");
-            #[cfg(unix)]
-            command
-                .env("SPAWND_WORKER_BIN", worker_backend::built_worker_bin())
-                .env("HOME", temp.path())
-                .env("SHELL", "/bin/sh")
-                .env("PATH", "/usr/bin:/bin");
-            assert!(command.status().unwrap().success());
-            return;
-        };
-        let root = std::path::PathBuf::from(root);
-        assert!(root.is_dir());
+    async fn device_refusal_requires_an_idle_window_with_no_worker_files() {
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
         let rtc = RtcSessions::new();
         rtc.bind_registered_host_id(Uuid::new_v4()).await;
         let registry = SessionRegistry::new();
@@ -2042,9 +2019,9 @@ mod tests {
         let id = Uuid::new_v4();
         assert!(registry.claim_discovery());
         assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
-        registry.finish_discovery();
+        registry.finish_discovery(dir.clone());
         let gate = registry.worker_gate(id);
-        let change = gate.change.write().await;
+        let change = gate.write().await;
         assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
         let another = Uuid::new_v4();
         let missing = json!({"version": 1, "kind": "event", "event": "attach_refused", "reason": "session_not_running"});
@@ -2068,7 +2045,7 @@ mod tests {
             exited,
             registry.clone(),
             rtc.clone(),
-            Some(exit_sink),
+            exit_sink,
         );
         tokio::pin!(removal);
         assert!(futures_util::poll!(&mut removal).is_pending());
@@ -2088,37 +2065,59 @@ mod tests {
         removal.await;
         assert!(pending.await.unwrap().is_empty());
 
-        let dir = worker_backend::worker_dir().unwrap();
-        let ep = endpoint::endpoint_for(&dir, &endpoint::config_root_tag(), id).unwrap();
-        let endpoint::LockAttempt::Acquired(reservation) = endpoint::try_reserve(&ep).unwrap()
-        else {
-            panic!("expected free endpoint")
-        };
-        assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
-        // A worker waiting for its launch must see neither Start nor Shutdown.
-        let mut endpoints = endpoint::bind_worker(&ep, &reservation, Uuid::new_v4()).unwrap();
-        let unfinished = async {
-            use spawnd::sessiond::wire;
-            let mut stream = endpoint::accept_main(&mut endpoints.main).await.unwrap();
-            assert_eq!(refusal_frames(&pc, another, "ctl").await.len(), 1);
-            let hello = json!({
-                "version": wire::PROTO_VERSION, "session_id": id, "instance_id": Uuid::new_v4(),
-                "state": "awaiting_start"
-            });
-            wire::write_json_frame(&mut stream, wire::T_HELLO, &hello)
-                .await
-                .unwrap();
-            assert!(wire::read_frame(&mut stream).await.unwrap().is_none());
-        };
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(refusal_frames(&pc, id, "ctl"), unfinished)
-        })
-        .await
-        .unwrap();
-        assert!(result.is_empty());
-        endpoints.identity.cleanup().unwrap();
-        drop(endpoints);
-        drop(reservation);
+        for suffix in ["endpoint", "lock", "sock", "lifecycle.sock"] {
+            let path = dir.join(format!("{id}.{suffix}"));
+            std::fs::write(&path, b"stale").unwrap();
+            assert!(refusal_frames(&pc, id, "pty").await.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+            std::fs::remove_file(path).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            // A real listening endpoint would accept even a short-lived probe.
+            let socket =
+                std::os::unix::net::UnixListener::bind(dir.join(format!("{id}.sock"))).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            assert!(refusal_frames(&pc, id, "ctl").await.is_empty());
+            assert_eq!(
+                socket.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        let moved = dir.join("moved");
+        // A non-directory ancestor gives ENOTDIR, not evidence of absence.
+        let inaccessible = SessionRegistry::new();
+        std::fs::write(&moved, []).unwrap();
+        inaccessible.finish_discovery(moved);
+        assert!(!worker_files_absent(&inaccessible, another).await);
+        let live = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, live);
+        let (_pty, _ctl) = attach_answered(&pc, live).await;
+        // Fill the admission map using this same parent without opening a
+        // hundred extra channels. Its next missing view gets the usual close.
+        {
+            let mut peers = rtc.peers.lock().await;
+            let child = peers.values().next().unwrap().clone();
+            for n in 1..MAX_PAIR_SESSIONS {
+                peers.insert(format!("capacity/{n}"), child.clone());
+            }
+        }
+        assert!(refusal_frames(&pc, another, "ctl").await.is_empty());
+        rtc.peers
+            .lock()
+            .await
+            .retain(|key, _| !key.starts_with("capacity/"));
+        rtc.host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .pair
+            .as_ref()
+            .unwrap()
+            .retire();
+        assert!(refusal_frames(&pc, another, "ctl").await.is_empty());
         // The parent may finish reporting its original connection after the
         // first channel opens. None of these window decisions emits a frame.
         while let Ok(frame) = frames.try_recv() {
@@ -2130,57 +2129,9 @@ mod tests {
             );
         }
 
-        #[cfg(unix)]
-        {
-            // The explicit Restart on a missing window goes through the real
-            // daemon handler. A second registry has missed that worker and
-            // must adopt it on this pair without a second session.started.
-            let first = SessionRegistry::new();
-            let (old_server, mut old_frames) = mpsc::channel(64);
-            crate::run::handle_session_restart(
-                crate::proto::SessionCreate {
-                    session_id: id,
-                    cwd: root.to_str().unwrap().into(),
-                    skills: vec![],
-                    create_cwd: false,
-                },
-                &first,
-                &rtc,
-                &old_server,
-            )
-            .await;
-            let started: Value =
-                serde_json::from_str(old_frames.try_recv().unwrap().as_str()).unwrap();
-            assert_eq!(started["type"], "session.started", "{started}");
-            std::fs::write(root.join(".restart-cwd"), []).unwrap();
-            let previous = first.binding_for(id).unwrap();
-            drop(first.remove_if_generation(id, previous.generation()));
-            let (_pty, _ctl) = attach(&pc, id).await;
-            let binding = registry.binding_for(id).unwrap();
-            assert_eq!(
-                std::path::Path::new(&*registry.cwd_for_binding(binding).unwrap()),
-                root
-            );
-            // Ordinary shell exit proves the healed channel has the same live
-            // worker. Its real exit is still forwarded in the ordinary way.
-            assert!(registry.with_handle(id, |h| h
-                .write_stdin(b"test -f .restart-cwd && exit 23; exit 1\n")
-                .unwrap()));
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let frame: Value =
-                        serde_json::from_str(frames.recv().await.unwrap().as_str()).unwrap();
-                    assert_ne!(frame["type"], "session.started");
-                    if frame["type"] == "session.exit" && frame["exit_code"] == 23 {
-                        break;
-                    }
-                }
-            })
-            .await
-            .expect("shell exited normally");
-        }
         rtc.close_all().await;
         pc.close().await.unwrap();
+        worker.abort();
     }
 
     /// The other side of the refusal above: an attach for a session that is
@@ -2421,7 +2372,7 @@ mod tests {
             assert!(attachment_label(&bad).is_none(), "{bad}");
         }
     }
-    async fn connect_pair(
+    pub(crate) async fn connect_pair(
         sessions: &RtcSessions,
         registry: &SessionRegistry,
         key: [u8; 32],
