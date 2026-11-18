@@ -1,6 +1,10 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { confirm } from "@/components/ui/confirm";
+import {
+  type BrowserDeviceRegistrationState,
+  browserDeviceRegistrationQueryKey,
+} from "@/lib/browser-device-registration";
 import { putSupportLog, readSupportLog, supportLogRefusal } from "@/lib/support-log";
 import copy from "@/lib/support-log-copy.json";
 import { supportLogDevice } from "@/lib/support-log-device";
@@ -10,7 +14,7 @@ export function useSupportLog(accountId: string) {
   const key = ["support-log", accountId];
   const { data: state, refetch } = useQuery({
     queryKey: key,
-    queryFn: ({ signal }) => readSupportLog(signal).catch(() => null),
+    queryFn: ({ signal }) => readSupportLog(accountId, signal),
     retry: false,
     gcTime: 0,
     networkMode: "always",
@@ -18,7 +22,15 @@ export function useSupportLog(accountId: string) {
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
-  const [approved, setApproved] = useState<boolean | null>(null);
+  const registration = useSyncExternalStore(
+    client.getQueryCache().subscribe,
+    () =>
+      client.getQueryData<BrowserDeviceRegistrationState>(
+        browserDeviceRegistrationQueryKey(accountId),
+      ),
+    () => undefined,
+  );
+  const [hasIdentity, setHasIdentity] = useState<boolean | null>(null);
   const [message, setMessage] = useState("");
   const available = !!state;
   const panel = useRef<AbortController | null>(null);
@@ -27,18 +39,19 @@ export function useSupportLog(accountId: string) {
     const controller = new AbortController();
     panel.current = controller;
     const { signal } = controller;
-    void supportLogDevice(client, accountId, signal, false)
+    setHasIdentity(null);
+    void supportLogDevice(accountId, registration)
       .then((signer) => {
-        if (!signal.aborted) setApproved(signer !== null);
+        if (!signal.aborted) setHasIdentity(signer !== null);
       })
       .catch(() => {
-        if (!signal.aborted) setApproved(false);
+        if (!signal.aborted) setMessage(copy.failure);
       });
     return () => {
       controller.abort();
       panel.current = null;
     };
-  }, [client, accountId, available]);
+  }, [registration, accountId, available]);
 
   const mutationKey = ["support-log-consent", accountId];
   const busy = useIsMutating({ mutationKey }) > 0;
@@ -68,16 +81,14 @@ export function useSupportLog(accountId: string) {
         return;
       if (signal.aborted) return;
       try {
-        const sign = await supportLogDevice(client, accountId, signal, true).catch(() => null);
+        const sign = await supportLogDevice(accountId, registration);
         if (signal.aborted) return;
         if (!sign) {
           setMessage("");
-          setApproved(false);
+          setHasIdentity(false);
           return;
         }
-        const fresh = await readSupportLog(signal);
-        if (signal.aborted) return;
-        const statement = await sign(enabled, fresh);
+        const statement = await sign(client, enabled, signal);
         if (signal.aborted) return;
         try {
           await putSupportLog(statement, signal);
@@ -96,7 +107,7 @@ export function useSupportLog(accountId: string) {
     // disabled switch. The account-scoped mutation survives a panel remount.
     if (
       !state ||
-      approved !== true ||
+      hasIdentity !== true ||
       client.isMutating({ mutationKey }) ||
       enabled === (state.sharing === "on")
     )
@@ -105,7 +116,7 @@ export function useSupportLog(accountId: string) {
   }
   return {
     state,
-    approved,
+    hasIdentity,
     change,
     busy,
     message,

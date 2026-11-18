@@ -32,7 +32,9 @@ for (const { consent, transcript_hex, signing_seed_hex } of vectors.positive) {
         bytes[i] ^= 1;
       }
       for (const delta of [-86_400_000, 86_400_000]) {
-        expect(checkedConsentTime(consent.issued_at_ms + delta)).toBe(consent.issued_at_ms + delta);
+        expect(checkedConsentTime(consent.issued_at_ms + delta, consent.account_id)).toBe(
+          consent.issued_at_ms + delta,
+        );
       }
       for (const time of [
         consent.issued_at_ms - 86_400_001,

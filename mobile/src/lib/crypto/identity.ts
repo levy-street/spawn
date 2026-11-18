@@ -284,7 +284,7 @@ export const deviceIdentity = {
         "Support log consent does not match this device",
       );
     }
-    checkedConsentTime(statement.issued_at_ms);
+    checkedConsentTime(statement.issued_at_ms, statement.account_id);
     const loaded = validateRecord(record);
     try {
       return signPureEd25519(loaded.seed, encodeSupportLogConsent(statement));

@@ -10,11 +10,18 @@ export interface SupportLogConsent {
   issued_at_ms: number;
 }
 
-export function checkedConsentTime(value: unknown): number {
+// Highest stored or signed time seen in this app instance, including across panel opens.
+const newestTime = new Map<string, number>();
+
+export function rememberConsentTime(accountId: string, time: number) {
+  if (time > (newestTime.get(accountId) ?? -1)) newestTime.set(accountId, time);
+}
+
+export function checkedConsentTime(value: unknown, accountId: string): number {
   if (
     typeof value !== "number" ||
     !Number.isSafeInteger(value) ||
-    value < 0 ||
+    value <= (newestTime.get(accountId) ?? -1) ||
     Math.abs(Date.now() - value) > 86_400_000
   )
     throw new Error("Invalid consent time");

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { API_URL, ApiError } from "@/lib/api";
-import type { SignedSupportLogConsent } from "@/lib/support-log-consent";
+import { rememberConsentTime, type SignedSupportLogConsent } from "@/lib/support-log-consent";
 import copy from "@/lib/support-log-copy.json";
 import { CLIENT_INSTANCE_ID } from "./client-instance";
 
@@ -34,29 +34,39 @@ const collectionState = z.discriminatedUnion("state", [
   collection.extend({ state: z.literal("deleted"), completed_at: date, deleted_at: date }),
 ]);
 
-const accountState = z.object({
-  statement: z
-    .object({
-      enabled: z.boolean(),
-      issued_at_ms: z.number(),
-      signer_device_id: z.guid(),
-      signer_device_name: z.string().nullable(),
-    })
-    .nullable(),
-  sharing: z.enum(["on", "off", "off_signer_removed"]),
-  next_issued_at_ms: z.union([
-    z.number(),
-    z.object({ code: z.enum(["timestamp_overflow", "future_timestamp"]) }),
-  ]),
-  hosts: z.array(
-    z.object({ id: z.guid(), name: z.string(), capable: z.boolean(), last_seen_at: nullableDate }),
-  ),
-  collections: z.array(collectionState),
-  retention_days: z.literal(7),
-});
+const accountState = z
+  .object({
+    statement: z
+      .object({
+        enabled: z.boolean(),
+        issued_at_ms: z.int().nonnegative(),
+        signer_device_id: z.guid(),
+        signer_device_name: z.string().nullable(),
+      })
+      .nullable(),
+    sharing: z.enum(["on", "off", "off_signer_removed"]),
+    next_issued_at_ms: z.union([
+      z.number(),
+      z.object({ code: z.enum(["timestamp_overflow", "future_timestamp"]) }),
+    ]),
+    hosts: z.array(
+      z.object({
+        id: z.guid(),
+        name: z.string(),
+        capable: z.boolean(),
+        last_seen_at: nullableDate,
+      }),
+    ),
+    collections: z.array(collectionState),
+    retention_days: z.literal(7),
+  })
+  .refine((state) => state.sharing !== "on" || state.statement !== null);
 export type SupportLogState = z.infer<typeof accountState>;
 
-export async function readSupportLog(signal: AbortSignal): Promise<SupportLogState> {
+export async function readSupportLog(
+  accountId: string,
+  signal: AbortSignal,
+): Promise<SupportLogState> {
   // Let a panel closed in the same turn cancel discovery before any network I/O.
   await Promise.resolve();
   signal.throwIfAborted();
@@ -66,7 +76,9 @@ export async function readSupportLog(signal: AbortSignal): Promise<SupportLogSta
     signal,
   });
   if (response.status !== 200) throw new Error("Support log unavailable");
-  return accountState.parse(await response.json());
+  const state = accountState.parse(await response.json());
+  if (state.statement) rememberConsentTime(accountId, state.statement.issued_at_ms);
+  return state;
 }
 
 export async function putSupportLog(statement: SignedSupportLogConsent, signal: AbortSignal) {

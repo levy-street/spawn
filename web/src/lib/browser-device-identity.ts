@@ -590,7 +590,7 @@ export async function signSupportLogConsent(
       "Support log consent does not match this device",
     );
   }
-  checkedConsentTime(statement.issued_at_ms);
+  checkedConsentTime(statement.issued_at_ms, statement.account_id);
   const bytes = encodeSupportLogConsent(statement);
   return encodeBase64Url(
     new Uint8Array(await crypto.subtle.sign("Ed25519", record.privateKey, bytes)),

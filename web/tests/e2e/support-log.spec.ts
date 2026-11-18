@@ -1,7 +1,6 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { expect, type Page, test, type WebSocketRoute } from "@playwright/test";
 import copy from "../../../proto/support-log-copy.json" with { type: "json" };
-import { encodeAcctEndorsementTranscript } from "../../src/lib/acct-endorsement-transcript";
 import type { SupportLogState } from "../../src/lib/support-log";
 import {
   encodeSupportLogConsent,
@@ -29,29 +28,20 @@ function state(sharing: SupportLogState["sharing"] = "off"): SupportLogState {
   };
 }
 const switchFor = (page: Page) => page.getByRole("switch", { name: copy.switchLabel });
-function peer() {
-  const pair = generateKeyPairSync("ed25519");
-  return {
-    id: randomUUID(),
-    key: pair.publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64url"),
-    privateKey: pair.privateKey,
-  };
+function peer(): { id: string; key: string } {
+  return { id: randomUUID(), key: randomBytes(32).toString("base64url") };
 }
-function approval(from: ReturnType<typeof peer>, to: { id: string; key: string }) {
+function approval(from: ReturnType<typeof peer>, to: ReturnType<typeof peer>) {
   return {
     endorser_device_id: from.id,
     endorser_public_key: from.key,
     endorsed_device_id: to.id,
     endorsed_public_key: to.key,
-    signature: sign(
-      null,
-      encodeAcctEndorsementTranscript(USER_ID, from.key, to.key, to.id),
-      from.privateKey,
-    ).toString("base64url"),
+    signature: "A".repeat(86),
     created_at: CREATED_AT,
   };
 }
-async function setup(page: Page, approved = true, links = 1) {
+async function setup(page: Page) {
   await mockApp(page, { hosts: [] });
   await page.clock.install({ time: now });
   const sockets: WebSocketRoute[] = [];
@@ -61,49 +51,13 @@ async function setup(page: Page, approved = true, links = 1) {
   const register = page.waitForResponse((r) => r.url().endsWith("/api/browser-devices/register"));
   await page.goto("/hosts");
   const self = { id: BROWSER_DEVICE_ID, key: (await (await register).json()).public_key as string };
-  const peers = Array.from({ length: links }, peer);
-  const root = peers[0]!;
-  const path = peers.map((from, i) => approval(from, peers[i + 1] ?? self));
-  const edges = [
-    ...Array<ReturnType<typeof approval>>(65).fill(approval(peer(), self)),
-    ...[...path].reverse(),
-  ];
+  const edges: ReturnType<typeof approval>[] = [];
   let approvalReads = 0;
   await page.route("**/api/trust/account-endorsements", (r) => {
     approvalReads++;
     return r.fulfill({ json: edges });
   });
-  if (approved) {
-    await page.evaluate(
-      ({ accountId, rootPublicKey }) =>
-        new Promise<void>((resolve, reject) => {
-          const open = indexedDB.open("spawn-root-knowledge", 1);
-          open.onupgradeneeded = () =>
-            open.result.createObjectStore("root-keys", { keyPath: "recordId" });
-          open.onerror = () => reject(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            const tx = db.transaction("root-keys", "readwrite");
-            tx.objectStore("root-keys").put({
-              recordId: JSON.stringify([accountId, location.origin]),
-              accountId,
-              origin: location.origin,
-              rootPublicKey,
-              source: "bundle",
-              version: 1,
-              learnedAtMs: Date.now(),
-            });
-            tx.oncomplete = () => {
-              db.close();
-              resolve();
-            };
-            tx.onerror = () => reject(tx.error);
-          };
-        }),
-      { accountId: USER_ID, rootPublicKey: root.key },
-    );
-  }
-  return { sockets, edges, path, approvalReads: () => approvalReads };
+  return { sockets, edges, self, approvalReads: () => approvalReads };
 }
 async function consentSigns(page: Page) {
   return page.evaluateHandle(() => {
@@ -122,24 +76,34 @@ async function openAccount(page: Page) {
   await expect(page.getByRole("heading", { name: "Account", exact: true })).toBeVisible();
 }
 
-for (const failure of ["404", "network", "bad shape", "201"]) {
+for (const [failure, status, body] of [
+  ["404", 404, state()],
+  ["network", 0, null],
+  ["bad shape", 200, { ...state(), hosts: [{}] }],
+  ["201", 201, state()],
+  ["on without a statement", 200, { ...state(), sharing: "on" }],
+  ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1].map(
+    (time) =>
+      [
+        `invalid stored time ${time}`,
+        200,
+        { ...state("on"), statement: { ...state("on").statement, issued_at_ms: time } },
+      ] as const,
+  ),
+] as const) {
   test(`${failure} leaves the existing Account sections and controls intact`, async ({ page }) => {
     let calls = 0;
     page.on("request", (request) => {
       if (request.url().endsWith("/api/support-log")) calls++;
     });
-    await setup(page);
-    await page.route("**/api/support-log", (r) => {
-      return failure === "network"
-        ? r.abort()
-        : r.fulfill({
-            status: failure === "bad shape" ? 200 : Number(failure),
-            json: failure === "bad shape" ? { ...state(), hosts: [{}] } : state(),
-          });
-    });
+    const { approvalReads } = await setup(page);
+    await page.route("**/api/support-log", (r) =>
+      status === 0 ? r.abort() : r.fulfill({ status, json: body }),
+    );
     expect(calls).toBe(0);
     await openAccount(page);
     await expect.poll(() => calls).toBe(1);
+    expect(approvalReads()).toBe(0);
     await page.clock.fastForward(180_000);
     const panel = page.getByRole("heading", { name: "Account", exact: true }).locator("../..");
     expect(
@@ -242,12 +206,7 @@ test("shows the removed signer, update, ordered history and every reason", async
       decline_code,
     })),
   ];
-  let puts = 0;
-  await setup(page, false);
-  await page.route("**/api/support-log/consent", (r) => {
-    puts++;
-    return r.abort();
-  });
+  await setup(page);
   await page.route("**/api/support-log", (r) => r.fulfill({ json: data }));
   await openAccount(page);
   const block = page.getByRole("region", { name: copy.title });
@@ -256,10 +215,8 @@ test("shows the removed signer, update, ordered history and every reason", async
     block.getByText(copy.needsUpdate.replace("{machine}", "This machine")),
   ).toBeVisible();
   await expect(switchFor(page)).not.toBeChecked();
-  await expect(switchFor(page)).toBeDisabled();
-  await expect(block.getByText(copy.cannotSign)).toBeVisible();
-  await switchFor(page).evaluate((el) => (el as HTMLButtonElement).click());
-  expect(puts).toBe(0);
+  await expect(switchFor(page)).toBeEnabled();
+  await expect(block.getByText(copy.cannotSign)).toHaveCount(0);
   const rows = block.getByRole("listitem");
   await expect(rows).toHaveCount(data.collections.length);
   const templates = [
@@ -332,7 +289,12 @@ test("one confirmed on, immediate off, and the server's returned history", async
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const { path, approvalReads } = await setup(page, true, 8);
+  const { edges, self, approvalReads } = await setup(page);
+  const peers = Array.from({ length: 9 }, peer);
+  const path = peers.map((from, i) => approval(from, peers[i - 1] ?? self));
+  const branch = approval(peer(), self);
+  edges.push(approval(peer(), peer()), ...[...path].reverse(), branch);
+  const nearest = [...path.slice(0, 1), branch, ...path.slice(1, 8)];
   let current = state();
   await page.route("**/api/support-log", (r) =>
     r.fulfill({ json: { ...current, account_id: randomUUID() } }),
@@ -378,7 +340,7 @@ test("one confirmed on, immediate off, and the server's returned history", async
       account_id: USER_ID,
       signer_device_id: BROWSER_DEVICE_ID,
       issued_at_ms: now + 17 + i,
-      carried_endorsements: path.map(
+      carried_endorsements: nearest.map(
         ({ endorser_public_key, endorsed_public_key, endorsed_device_id, signature }) => ({
           account_id: USER_ID,
           endorser_public_key,
@@ -418,6 +380,7 @@ for (const [status, message] of [
       puts = 0;
     await page.route("**/api/support-log", (r) => {
       reads++;
+      if (status === 429 && reads === 3) return r.abort();
       return r.fulfill({ json: state("on") });
     });
     await page.route("**/api/support-log/consent", (r) => {
@@ -462,26 +425,63 @@ for (const stamp of [
   });
 }
 
-for (const why of ["invalid signature", "broken path", "nine links"]) {
-  test(`${why} disables the switch and sends nothing`, async ({ page }) => {
-    const { edges, path } = await setup(page, true, why === "nine links" ? 9 : 2);
-    if (why === "broken path") edges.splice(edges.indexOf(path[0]!), 1);
-    if (why === "invalid signature") path[0]!.signature = "A".repeat(86);
-    const signs = await consentSigns(page);
-    let puts = 0;
-    await page.route("**/api/support-log", (r) => r.fulfill({ json: state("on") }));
-    await page.route("**/api/support-log/consent", (r) => {
-      puts++;
-      return r.abort();
-    });
+for (const failedRead of [false, true]) {
+  test(`a change carries ${failedRead ? "nothing after a failed read" : "at most 64 nearest approvals"}`, async ({
+    page,
+  }) => {
+    const { edges, self } = await setup(page);
+    const first = peer();
+    const peers = [first, ...Array.from({ length: 64 }, peer)];
+    const nearest = peers.map((p) => approval(p, self));
+    edges.push(approval(peer(), first), ...nearest);
+    if (failedRead) await page.route("**/api/trust/account-endorsements", (r) => r.abort());
+    let reads = 0;
+    await page.route("**/api/support-log", (r) =>
+      ++reads === 3 ? r.abort() : r.fulfill({ json: state("on") }),
+    );
+    await page.route("**/api/support-log/consent", (r) => r.fulfill({ status: 204 }));
     await openAccount(page);
+    const put = page.waitForRequest((r) => r.url().endsWith("/api/support-log/consent"));
     await switchFor(page).click();
-    await expect(page.getByText(copy.cannotSign)).toBeVisible();
-    await expect(switchFor(page)).toBeDisabled();
-    expect(await signs.jsonValue()).toEqual({ consent: 0 });
-    expect(puts).toBe(0);
+    const sent = (await put).postDataJSON() as SignedSupportLogConsent;
+    expect(sent.carried_endorsements.map((e) => e.endorser_public_key)).toEqual(
+      failedRead ? [] : nearest.slice(0, 64).map((e) => e.endorser_public_key),
+    );
+    await expect(page.getByText(copy.sent)).toBeVisible();
+    await expect(switchFor(page)).toBeEnabled();
+    await expect(switchFor(page)).toBeChecked();
   });
 }
+
+test("a delayed signing read cannot go behind a newer stored statement", async ({ page }) => {
+  await setup(page);
+  let reads = 0;
+  let finish!: () => void;
+  const delayed = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  await page.route("**/api/support-log", async (r) => {
+    const data = state(++reads === 3 ? "off_signer_removed" : "on");
+    if (reads === 2) await delayed;
+    else if (reads === 3) data.statement!.issued_at_ms = now + 18;
+    await r.fulfill({ json: data });
+  });
+  let puts = 0;
+  await page.route("**/api/support-log/consent", (r) => {
+    puts++;
+    return r.abort();
+  });
+  const signs = await consentSigns(page);
+  await openAccount(page);
+  await switchFor(page).click();
+  await expect.poll(() => reads).toBe(2);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText(copy.offSignerRemoved)).toBeVisible();
+  finish();
+  await expect(page.getByText(copy.failure)).toBeVisible();
+  expect(await signs.jsonValue()).toEqual({ consent: 0 });
+  expect(puts).toBe(0);
+});
 
 test("confirmation uses a fresh time and reopening cannot replay it", async ({ page }) => {
   await setup(page);
@@ -559,7 +559,7 @@ for (const status of [200, 409]) {
 }
 
 test("a throwing log row leaves account deletion usable", async ({ page }) => {
-  await setup(page, false);
+  await setup(page);
   const data = state();
   const rowTime = new Date(now + 27).toISOString();
   data.collections = [

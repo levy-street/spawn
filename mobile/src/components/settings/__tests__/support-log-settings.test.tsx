@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { NavigationContext } from "@react-navigation/native";
 import { act, fireEvent, waitFor, within } from "@testing-library/react-native";
 import type { ContextType } from "react";
@@ -13,14 +13,12 @@ import { qk } from "@/data/queryKeys";
 import { effectsForFrame } from "@/data/realtime/event-map";
 import { decodeHex, encodeBase64Url } from "@/lib/crypto/bytes";
 import * as ed25519 from "@/lib/crypto/ed25519";
-import { deriveEd25519PublicKey } from "@/lib/crypto/ed25519";
 import {
   clearDeviceIdentityAccount,
   deviceIdentity,
   setDeviceIdentityAccount,
 } from "@/lib/crypto/identity";
 import type { SignedSupportLogConsent } from "@/lib/crypto/support-log-consent";
-import { signAccountEndorsementV1 } from "@/lib/crypto/transcripts";
 import { secureStorage } from "@/lib/secure-storage";
 import vectors from "../../../../../proto/support-log-consent-v1-vectors.json";
 import { createTestQueryClient, renderWithProviders } from "../../../../tests/render";
@@ -76,33 +74,18 @@ function response(status: number, body: unknown) {
   } as Response;
 }
 
-const self = { id: device, publicKey: key, seed: decodeHex(seed) };
+const self = { id: device, publicKey: key };
 function peer() {
-  const secret = new Uint8Array(
-    generateKeyPairSync("ed25519")
-      .privateKey.export({ format: "der", type: "pkcs8" })
-      .subarray(-32),
-  );
-  return {
-    id: randomUUID(),
-    publicKey: encodeBase64Url(deriveEd25519PublicKey(secret)),
-    seed: secret,
-  };
+  return { id: randomUUID(), publicKey: randomBytes(32).toString("base64url") };
 }
 
 function approval(from: typeof self, to: typeof self): AccountEndorsementRecord {
-  const transcript = {
-    accountId: mockAccount,
-    endorserPublicKey: from.publicKey,
-    endorsedPublicKey: to.publicKey,
-    endorsedDeviceId: to.id,
-  };
   return {
     endorser_device_id: from.id,
     endorsed_device_id: to.id,
     endorser_public_key: from.publicKey,
     endorsed_public_key: to.publicKey,
-    signature: encodeBase64Url(signAccountEndorsementV1(from.seed, transcript)),
+    signature: "A".repeat(86),
     created_at: iso,
   };
 }
@@ -119,14 +102,13 @@ function fixture(initial = state()) {
   const client = createTestQueryClient();
   client.setQueryData(qk.browserDeviceRegistration(mockAccount), local);
   client.setQueryData(qk.me(), { user: { id: mockAccount } });
-  const approver = peer();
   const wire = {
     get: jest.fn<Promise<Response>, []>(async () => response(200, initial)),
     put: jest.fn<Promise<Response>, [SignedSupportLogConsent]>(async () =>
       response(200, state("on")),
     ),
     approvalStatus: 200,
-    edges: [approval(self, approver), approval(approver, self)],
+    edges: [] as AccountEndorsementRecord[],
   };
   const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
     switch (path) {
@@ -196,17 +178,26 @@ function accountPanel() {
   );
 }
 
-for (const failure of ["404", "401", "bad shape", "network", "201"]) {
+for (const [failure, status, body] of [
+  ["404", 404, state()],
+  ["401", 401, state()],
+  ["bad shape", 200, { ...state(), collections: [{}] }],
+  ["network", 0, null],
+  ["201", 201, state()],
+  ["on without a statement", 200, { ...state(), sharing: "on" }],
+  ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1].map(
+    (time) =>
+      [
+        `invalid stored time ${time}`,
+        200,
+        { ...state("on"), statement: { ...state("on").statement, issued_at_ms: time } },
+      ] as const,
+  ),
+] as const) {
   test(`${failure} adds only the Account discovery read and preserves its structure`, async () => {
     const { wire, fetch, client } = fixture();
-    if (failure === "network") wire.get.mockRejectedValue(new Error());
-    else
-      wire.get.mockResolvedValue(
-        response(
-          failure === "bad shape" ? 200 : Number(failure),
-          failure === "bad shape" ? { ...state(), collections: [{}] } : state(),
-        ),
-      );
+    if (status === 0) wire.get.mockRejectedValue(new Error());
+    else wire.get.mockResolvedValue(response(status, body));
     const screen = await renderWithProviders(<View />, { queryClient: client });
     expect(fetch).not.toHaveBeenCalled();
     await screen.rerender(accountPanel());
@@ -298,14 +289,11 @@ test("shows removed signer, host update and all collection outcomes in response 
 
 test("one confirmed on and immediate off use the server's state and signing time", async () => {
   const { wire, show, fetch } = fixture();
-  const approver = peer();
-  const middle = peer();
-  const path = [approval(approver, middle), approval(middle, self)];
-  wire.edges = [
-    approval(self, approver),
-    ...Array<AccountEndorsementRecord>(65).fill(approval(middle, approver)),
-    ...[...path].reverse(),
-  ];
+  const peers = Array.from({ length: 9 }, peer);
+  const path = peers.map((from, i) => approval(from, peers[i - 1] ?? self));
+  const branch = approval(peer(), self);
+  wire.edges = [approval(peer(), peer()), ...[...path].reverse(), branch];
+  const nearest = [...path.slice(0, 1), branch, ...path.slice(1, 8)];
   wire.get.mockResolvedValue(response(200, { ...state(), account_id: randomUUID() }));
   let finish!: (reply: Response) => void;
   wire.put.mockImplementationOnce(
@@ -341,7 +329,7 @@ test("one confirmed on and immediate off use the server's state and signing time
     signer_device_id: device,
     signer_public_key: key,
     issued_at_ms: stamp,
-    carried_endorsements: path.map(
+    carried_endorsements: nearest.map(
       ({ endorser_public_key, endorsed_public_key, endorsed_device_id, signature }) => ({
         account_id: mockAccount,
         endorser_public_key,
@@ -382,12 +370,17 @@ test.each([
   [500, copy.failure],
 ] as const)("%i shows its refusal and stale reads only once", async (status, message) => {
   const { wire, show } = fixture(state("on"));
-  wire.put.mockResolvedValue(response(status, { detail: { retry_after_seconds: 19 } }));
+  wire.put.mockImplementation(async () => {
+    if (status === 429) wire.get.mockRejectedValue(new Error());
+    return response(status, { detail: { retry_after_seconds: 19 } });
+  });
   const screen = await show();
   const toggle = () => screen.getByRole("switch", { name: copy.switchLabel });
   await waitFor(() => expect(toggle()).toBeEnabled());
   await fireEvent.press(toggle());
   await waitFor(() => expect(screen.getByText(message)).toBeOnTheScreen());
+  await waitFor(() => expect(toggle()).toBeEnabled());
+  expect(screen.getByText(message)).toBeOnTheScreen();
   expect(toggle()).toBeChecked();
   expect(wire.get).toHaveBeenCalledTimes(3);
   expect(wire.put).toHaveBeenCalledTimes(1);
@@ -411,32 +404,43 @@ test.each([
   expect(wire.put).not.toHaveBeenCalled();
 });
 
-test.each(["no key", "invalid signature", "unverified peer", "broken path", "nine links"])(
-  "%s disables the switch and sends nothing",
-  async (why) => {
-    const { wire, show, fetch, client } = fixture();
-    const first = peer();
-    const anchors = [first, ...Array.from({ length: why === "nine links" ? 8 : 1 }, peer)];
-    wire.edges = [
-      approval(self, first),
-      ...anchors.map((from, i) => approval(from, anchors[i + 1] ?? self)),
-    ];
-    if (why === "no key") storage.delete(`spawn.identity.ed25519.v1.${mockAccount}`);
-    if (why === "invalid signature" && wire.edges[1]) wire.edges[1].signature = "A".repeat(86);
-    if (why === "unverified peer") wire.edges.shift();
-    if (why === "broken path") wire.edges.splice(1, 1);
-    client.setQueryData(qk.trustAccountEndorsements(), wire.edges);
-    const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
-    const screen = await show();
-    await waitFor(() => expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen());
-    expect(screen.getByRole("switch")).toBeDisabled();
-    await fireEvent.press(screen.getByRole("switch"));
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(sign).not.toHaveBeenCalled();
-    expect(wire.put).not.toHaveBeenCalled();
-    expect(confirm).not.toHaveBeenCalled();
-  },
-);
+test("a phone without a local key cannot send a change", async () => {
+  const { wire, show, fetch } = fixture();
+  storage.delete(`spawn.identity.ed25519.v1.${mockAccount}`);
+  const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
+  const screen = await show();
+  await waitFor(() => expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen());
+  expect(screen.getByRole("switch")).toBeDisabled();
+  await fireEvent.press(screen.getByRole("switch"));
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(sign).not.toHaveBeenCalled();
+  expect(wire.put).not.toHaveBeenCalled();
+  expect(confirm).not.toHaveBeenCalled();
+});
+
+test("a delayed signing read cannot go behind a newer stored statement", async () => {
+  const { wire, show, client } = fixture(state("on"));
+  const screen = await show();
+  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+  let finish!: (reply: Response) => void;
+  wire.get.mockReturnValueOnce(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const sign = jest.spyOn(deviceIdentity, "signSupportLogConsent");
+  await fireEvent.press(screen.getByRole("switch"));
+  await waitFor(() => expect(wire.get).toHaveBeenCalledTimes(2));
+  const newer = state("off_signer_removed");
+  if (newer.statement) newer.statement.issued_at_ms = stamp + 1;
+  wire.get.mockResolvedValue(response(200, newer));
+  await act(() => client.invalidateQueries({ queryKey: qk.supportLog() }));
+  await waitFor(() => expect(screen.getByText(copy.offSignerRemoved)).toBeOnTheScreen());
+  await act(() => finish(response(200, state("on"))));
+  await waitFor(() => expect(screen.getByText(copy.failure)).toBeOnTheScreen());
+  expect(sign).not.toHaveBeenCalled();
+  expect(wire.put).not.toHaveBeenCalled();
+});
 
 test("focus, panel show and data events refresh while visible with no polling", async () => {
   jest.replaceProperty(Platform, "OS", "android");
@@ -619,13 +623,27 @@ test("a throwing log row leaves the account deletion form usable", async () => {
   expect(screen.getByText("Type your email to confirm")).toBeOnTheScreen();
 });
 
-test("a refused approval lookup disables the switch", async () => {
-  const { wire, show } = fixture(state("on"));
-  wire.approvalStatus = 401;
-  const screen = await show();
-  await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
-  await fireEvent.press(screen.getByRole("switch"));
-  await waitFor(() => expect(screen.getByText(copy.cannotSign)).toBeOnTheScreen());
-  expect(screen.getByRole("switch")).toBeDisabled();
-  expect(wire.put).not.toHaveBeenCalled();
-});
+test.each([false, true])(
+  "a change carries at most 64 nearest approvals or none on read failure (%s)",
+  async (failedRead) => {
+    const { wire, show } = fixture(state("on"));
+    const first = peer();
+    const peers = [first, ...Array.from({ length: 64 }, peer)];
+    const nearest = peers.map((p) => approval(p, self));
+    wire.edges = [approval(peer(), first), ...nearest];
+    if (failedRead) wire.approvalStatus = 503;
+    wire.put.mockImplementation(async () => {
+      wire.get.mockRejectedValue(new Error());
+      return response(204, null);
+    });
+    const screen = await show();
+    await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+    await fireEvent.press(screen.getByRole("switch"));
+    await waitFor(() => expect(screen.getByText(copy.sent)).toBeOnTheScreen());
+    await waitFor(() => expect(screen.getByRole("switch")).toBeEnabled());
+    expect(screen.getByRole("switch")).toBeChecked();
+    expect(
+      wire.put.mock.calls[0]?.[0].carried_endorsements.map((e) => e.endorser_public_key),
+    ).toEqual(failedRead ? [] : nearest.slice(0, 64).map((e) => e.endorser_public_key));
+  },
+);

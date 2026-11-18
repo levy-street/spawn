@@ -39,7 +39,7 @@ function SupportLogPanel({ accountId }: { accountId: string }) {
 }
 
 function VisibleSupportLog({ accountId }: { accountId: string }) {
-  const { state, approved, change, busy, message } = useSupportLog(accountId);
+  const { state, hasIdentity, change, busy, message } = useSupportLog(accountId);
   if (!state) return null;
   return (
     <section
@@ -52,9 +52,9 @@ function VisibleSupportLog({ accountId }: { accountId: string }) {
         hint={copy.description}
         checked={state.sharing === "on"}
         onCheckedChange={change}
-        disabled={busy || approved !== true}
+        disabled={busy || hasIdentity !== true}
       />
-      {approved === false && <p>{copy.cannotSign}</p>}
+      {hasIdentity === false && <p>{copy.cannotSign}</p>}
       {state.sharing === "off_signer_removed" && <p>{copy.offSignerRemoved}</p>}
       {message && <p role="status">{message}</p>}
       {state.hosts

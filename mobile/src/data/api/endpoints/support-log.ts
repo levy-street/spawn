@@ -1,7 +1,10 @@
 import { z } from "zod";
 import copy from "@/components/settings/support-log-copy.json";
 import { ApiError, api } from "@/data/api/client";
-import type { SignedSupportLogConsent } from "@/lib/crypto/support-log-consent";
+import {
+  rememberConsentTime,
+  type SignedSupportLogConsent,
+} from "@/lib/crypto/support-log-consent";
 
 const date = z.iso.datetime({ offset: true });
 const nullableDate = date.nullable();
@@ -33,30 +36,40 @@ const collectionState = z.discriminatedUnion("state", [
   collection.extend({ state: z.literal("deleted"), completed_at: date, deleted_at: date }),
 ]);
 
-const accountState = z.object({
-  statement: z
-    .object({
-      enabled: z.boolean(),
-      issued_at_ms: z.number(),
-      signer_device_id: z.guid(),
-      signer_device_name: z.string().nullable(),
-    })
-    .nullable(),
-  sharing: z.enum(["on", "off", "off_signer_removed"]),
-  next_issued_at_ms: z.union([
-    z.number(),
-    z.object({ code: z.enum(["timestamp_overflow", "future_timestamp"]) }),
-  ]),
-  hosts: z.array(
-    z.object({ id: z.guid(), name: z.string(), capable: z.boolean(), last_seen_at: nullableDate }),
-  ),
-  collections: z.array(collectionState),
-  retention_days: z.literal(7),
-});
+const accountState = z
+  .object({
+    statement: z
+      .object({
+        enabled: z.boolean(),
+        issued_at_ms: z.int().nonnegative(),
+        signer_device_id: z.guid(),
+        signer_device_name: z.string().nullable(),
+      })
+      .nullable(),
+    sharing: z.enum(["on", "off", "off_signer_removed"]),
+    next_issued_at_ms: z.union([
+      z.number(),
+      z.object({ code: z.enum(["timestamp_overflow", "future_timestamp"]) }),
+    ]),
+    hosts: z.array(
+      z.object({
+        id: z.guid(),
+        name: z.string(),
+        capable: z.boolean(),
+        last_seen_at: nullableDate,
+      }),
+    ),
+    collections: z.array(collectionState),
+    retention_days: z.literal(7),
+  })
+  .refine((state) => state.sharing !== "on" || state.statement !== null);
 export type SupportLogState = z.infer<typeof accountState>;
 
-export async function readSupportLog(signal: AbortSignal): Promise<SupportLogState> {
-  return accountState.parse(
+export async function readSupportLog(
+  accountId: string,
+  signal: AbortSignal,
+): Promise<SupportLogState> {
+  const state = accountState.parse(
     await api("/api/support-log", {
       signal,
       onResponse: (response) => {
@@ -64,6 +77,8 @@ export async function readSupportLog(signal: AbortSignal): Promise<SupportLogSta
       },
     }),
   );
+  if (state.statement) rememberConsentTime(accountId, state.statement.issued_at_ms);
+  return state;
 }
 
 export async function putSupportLog(statement: SignedSupportLogConsent, signal: AbortSignal) {
