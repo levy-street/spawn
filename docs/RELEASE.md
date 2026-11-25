@@ -409,6 +409,23 @@ protection is the one guarantee the counter exists to give, so it is not the
 server's to waive. Use the override only when the older signed release is the
 intended recovery; it does not permit unsigned updates.
 
+**How a daemon hears of a release.** The server offers the active daemon
+release in two ways. A daemon that registers is offered it straight away. A
+daemon that is already connected is offered a release within about a minute of
+that release becoming active: the server reads the active manifest every 15
+seconds, and when the release changes it makes the same offer to each connected
+daemon that is behind, one host at a time with two seconds between offers. The
+second way exists because a deploy restarts the server before it activates the
+new prebuilt snapshot, so every daemon registers again while the previous
+release is still active. Both ways skip a host that is already on the release,
+cannot update itself, is already updating, or failed to update to this
+release. The second way also leaves a host with a mismatched worker pair to
+registration, which repairs it. It offers nothing while the manifest is
+unreadable, and never offers a release it has already seen or one with a lower
+counter than one it has seen. `SPAWN_DAEMON_AUTO_UPDATE=false` stops both ways;
+`SPAWN_DAEMON_RELEASE_OFFERS=false` stops only the second. `server/CLAUDE.md`
+("Daemon release offers") has the details.
+
 ### Proving the updater
 
 The repeatable local updater proof has three CI scripts, all run by
@@ -843,7 +860,10 @@ And it checks its own work:
   rollback command. (`scripts/health-check.sh` on the host's timer walks the
   same paths between deploys.)
 - after prebuilt publication, `/api/release` must report the new full server
-  commit and the new daemon tree; this proves the manifest became live
+  commit and the new daemon tree; this proves the manifest became live. The
+  daemons that registered again after the restart, while the previous release
+  was still active, are offered the new one within about a minute ("How a
+  daemon hears of a release")
 
 The daemon gate compares the target tree to the manifest currently on the host
 before any production mutation. `SPAWN_DEPLOY_PREBUILTS=0` is the explicit
