@@ -16,12 +16,24 @@ async def test_builtins_are_seeded_without_shell(client):
     r = await client.get("/api/agents", headers=auth)
     assert r.status_code == 200
     builtins = {a["name"]: a for a in r.json() if a["owner_user_id"] is None}
-    assert set(builtins) == {"claude-code", "codex", "opencode", "aider-sonnet", "hermes"}
+    assert set(builtins) == {
+        "claude-code",
+        "codex",
+        "opencode",
+        "aider-sonnet",
+        "hermes",
+        "antigravity",
+    }
     assert builtins["claude-code"]["command"] == "claude"
     assert builtins["aider-sonnet"]["command"] == "aider --model claude-sonnet-4-6"
     assert builtins["codex"]["install"].startswith("curl -fsSL")
     assert builtins["hermes"]["command"] == "hermes"
     assert builtins["hermes"]["install"].startswith("curl -fsSL")
+    assert builtins["antigravity"]["kind"] == "antigravity"
+    assert builtins["antigravity"]["command"] == "agy"
+    assert builtins["antigravity"]["install"] == (
+        "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+    )
     for agent in builtins.values():
         assert isinstance(agent["command"], str)
         assert "default_argv" not in agent
@@ -144,6 +156,7 @@ async def test_builtins_carry_a_yolo_spelling(client):
     assert builtins["codex"]["yolo_args"] == "--dangerously-bypass-approvals-and-sandbox"
     assert builtins["aider-sonnet"]["yolo_args"] == "--yes-always"
     assert builtins["hermes"]["yolo_args"] == "--yolo"
+    assert builtins["antigravity"]["yolo_args"] == "--dangerously-skip-permissions"
     # opencode has no flag; it is told through the environment instead.
     assert builtins["opencode"]["yolo_args"] is None
     assert "OPENCODE_PERMISSION" in builtins["opencode"]["yolo_env"]

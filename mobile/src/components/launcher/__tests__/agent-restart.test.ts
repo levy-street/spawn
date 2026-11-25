@@ -32,6 +32,12 @@ const hermes = makeAgent({
   kind: "hermes",
   command: "hermes",
 });
+const agy = makeAgent({
+  id: "66666666-6666-4666-8666-666666666666",
+  name: "antigravity",
+  kind: "antigravity",
+  command: "agy",
+});
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -100,6 +106,14 @@ describe("planAgentRestart", () => {
         hermes,
       ]),
     ).toEqual({ kind: "agent", agent: hermes, command: "hermes", resumes: false });
+  });
+
+  test("an Antigravity CLI window continues the newest conversation in its folder", () => {
+    // It names its own conversations, so an id on the window's record was
+    // never one it was handed, and is not read back.
+    expect(
+      planAgentRestart(session({ agent_id: agy.id, foreground_command: "agy" }), [claude, agy]),
+    ).toEqual({ kind: "agent", agent: agy, command: "agy --continue", resumes: true });
   });
 
   test("a bare shell window is just a shell", () => {
@@ -514,6 +528,38 @@ describe("restartSessionAgent with the host's answer", () => {
       });
       expect(pending.queued.get(session().id)).toBe("codex resume");
     }
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("an Antigravity CLI window continues its folder's latest, looks nothing up and writes nothing", async () => {
+    const recordConversation = jest.fn(async () => undefined);
+    const transcripts = jest.fn(async () => records([]));
+    // No host names an Antigravity conversation: with no answer, or one that
+    // sees no agent it knows, the recorded id is not the way back in.
+    for (const inspect of [
+      async () => null,
+      async () => live({ agent: null, conversation_id: null, source: "none" }),
+    ]) {
+      const pending = pendingStore();
+      const result = await restartSessionAgent({
+        session: session({ agent_id: agy.id, foreground_command: "agy" }),
+        agents: [claude, agy],
+        restart: async () => session({ status: "starting" }),
+        pending,
+        inspect,
+        transcripts,
+        recordConversation,
+      });
+      expect(result.plan).toEqual({
+        kind: "agent",
+        agent: agy,
+        command: "agy --continue",
+        resumes: true,
+      });
+      expect(pending.queued.get(session().id)).toBe("agy --continue");
+      expect(pending.flagged.get(session().id)).toBeNull();
+    }
+    expect(transcripts).not.toHaveBeenCalled();
     expect(recordConversation).not.toHaveBeenCalled();
   });
 

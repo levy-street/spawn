@@ -23,6 +23,67 @@ const MAX_PAIR_CONTROLS: usize = 32;
 /// and sixteen streams queued; without a bound a device could park one
 /// task per stream id, some 65,000, each on a lock.
 const MAX_PAIR_PENDING_CHANNELS: usize = 2 * MAX_PAIR_SESSIONS + MAX_PAIR_CONTROLS + 1;
+/// How long a channel refused for a missing session keeps its pending slot
+/// waiting for the channel to open here: the refusal's 2-second check and
+/// send, and margin. The refusal runs from `on_open`, which runs only for a
+/// channel that opens; the library may keep that callback, unrun, for as
+/// long as the connection lives, and the slot must not stay with it.
+const REFUSAL_OPEN_DEADLINE: Duration = Duration::from_secs(5);
+/// How long the close that ends such a refusal is waited for. It holds no
+/// slot, but a close queues its stream reset behind any writer on the
+/// association waiting for room, which a silent device can make for ever.
+const REFUSAL_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+/// The least time between two warnings of one reason on one connection.
+const WHOLESALE_REFUSAL_WARNING_WINDOW: Duration = Duration::from_secs(60);
+
+/// Why a channel was refused for its connection's sake, not its own: every
+/// channel on the connection is refused the same way until that changes.
+#[derive(Clone, Copy, Debug)]
+enum Wholesale {
+    PendingBound,
+    Retired,
+    ViewCapacity,
+}
+
+/// A refusal `attach_pair_channel` makes for its connection's sake. It reads
+/// as the plain message it always had.
+#[derive(Debug)]
+struct RefusedWholesale(Wholesale, &'static str);
+
+impl std::fmt::Display for RefusedWholesale {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.1)
+    }
+}
+
+impl std::error::Error for RefusedWholesale {}
+
+/// Per reason, when a connection last warned of it and how many of its
+/// channels were refused for it since. A plain mutex, held for a few loads
+/// and stores and never across an await.
+#[derive(Default)]
+struct WholesaleRefusals(std::sync::Mutex<[(Option<tokio::time::Instant>, u64); 3]>);
+
+impl WholesaleRefusals {
+    /// Count one refusal. `Some(refused)` when a warning is due: how many
+    /// were refused for this reason since the last one, this one included.
+    fn count(&self, reason: Wholesale) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        let mut windows = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (warned, refused) = &mut windows[reason as usize];
+        *refused = refused.saturating_add(1);
+        if warned
+            .is_some_and(|at| now.saturating_duration_since(at) < WHOLESALE_REFUSAL_WARNING_WINDOW)
+        {
+            return None;
+        }
+        *warned = Some(now);
+        Some(std::mem::take(refused))
+    }
+}
 
 pub(super) struct PairContext {
     pub(super) device_key: [u8; 32],
@@ -40,10 +101,12 @@ pub(super) struct PairContext {
     /// How many of this connection's channels are being admitted now
     /// (`PendingChannel`), at most `MAX_PAIR_PENDING_CHANNELS`.
     pending_channels: AtomicUsize,
+    wholesale_refusals: WholesaleRefusals,
 }
 
 /// One device channel from the moment its handler is called until its
-/// admission and any refusal work finish, counted against `MAX_PAIR_PENDING_CHANNELS`.
+/// admission and any refusal work finish, counted against `MAX_PAIR_PENDING_CHANNELS`
+/// (a refused channel that has not opened by `REFUSAL_OPEN_DEADLINE`, until then).
 struct PendingChannel(Arc<PairContext>);
 
 impl PendingChannel {
@@ -63,7 +126,42 @@ impl Drop for PendingChannel {
     }
 }
 
+/// A pending slot two owners race for: the first to take it has it.
+fn take_pending(slot: &std::sync::Mutex<Option<PendingChannel>>) -> Option<PendingChannel> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 impl PairContext {
+    /// A channel refused for this connection's sake. Said at WARN at most
+    /// once a minute per reason, with how many were refused since the last
+    /// line: counts and the reason only.
+    fn refused_wholesale(&self, reason: Wholesale) {
+        let Some(refused) = self.wholesale_refusals.count(reason) else {
+            return;
+        };
+        match reason {
+            Wholesale::PendingBound => tracing::warn!(
+                reason = "pending bound full",
+                refused,
+                bound = MAX_PAIR_PENDING_CHANNELS,
+                current = self.pending_channels.load(Ordering::Acquire),
+                "device channels refused: as many of their connection's channels are waiting for admission already"
+            ),
+            Wholesale::Retired => tracing::warn!(
+                reason = "connection retired or trust changed",
+                refused,
+                "device channels refused: their connection is retired or its trust is no longer current"
+            ),
+            Wholesale::ViewCapacity => tracing::warn!(
+                reason = "view capacity full",
+                refused,
+                "device channels refused: their connection has as many terminal views as it may"
+            ),
+        }
+    }
+
     pub(super) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         let mut channels = self
@@ -225,6 +323,7 @@ impl RtcSessions {
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
             pending_channels: AtomicUsize::new(0),
+            wholesale_refusals: WholesaleRefusals::default(),
         });
         if let Err(error) = self
             .create_host_answer(
@@ -388,6 +487,7 @@ impl RtcSessions {
                         bound = MAX_PAIR_PENDING_CHANNELS,
                         "device channel refused: as many of its connection's channels are waiting for admission already"
                     );
+                    pair.refused_wholesale(Wholesale::PendingBound);
                     reject_channel(&dc).await;
                     return;
                 };
@@ -395,10 +495,12 @@ impl RtcSessions {
                 let reliable = dc.ordered()
                     && dc.max_packet_lifetime().is_none()
                     && dc.max_retransmits().is_none();
-                if !reliable
-                    || pair.retired.load(Ordering::Acquire)
-                    || !sessions.trust_epoch_is_current(pair.trust_epoch)
-                {
+                let retired = pair.retired.load(Ordering::Acquire)
+                    || !sessions.trust_epoch_is_current(pair.trust_epoch);
+                if retired {
+                    pair.refused_wholesale(Wholesale::Retired);
+                }
+                if !reliable || retired {
                     reject_channel(&dc).await;
                     return;
                 }
@@ -418,6 +520,7 @@ impl RtcSessions {
                         .await
                     {
                         drop(admission);
+                        pair.refused_wholesale(Wholesale::Retired);
                         reject_channel(&dc).await;
                         return;
                     }
@@ -480,6 +583,9 @@ impl RtcSessions {
                     Ok(None) => {}
                     Err(error) => {
                         tracing::debug!(%error, "session attachment refused");
+                        if let Some(RefusedWholesale(reason, _)) = error.downcast_ref() {
+                            pair.refused_wholesale(*reason);
+                        }
                         reject_channel(&dc).await;
                     }
                 }
@@ -521,9 +627,25 @@ impl RtcSessions {
         let sessions = self.clone();
         let parent = parent_id.to_owned();
         let peer = Arc::downgrade(pc);
+        // The slot goes back when the refusal below has finished or at the
+        // deadline, whichever is first. The timer holds the slot alone:
+        // neither the channel nor the connection.
+        let slot = Arc::new(std::sync::Mutex::new(Some(pending)));
+        let expiry = Arc::clone(&slot);
+        tokio::spawn(async move {
+            tokio::time::sleep(REFUSAL_OPEN_DEADLINE).await;
+            drop(take_pending(&expiry));
+        });
         dc.on_open(Box::new(move || {
             Box::pin(async move {
+                let pending = take_pending(&slot);
                 let Some(dc) = weak_dc.upgrade() else { return };
+                // Opened after the deadline gave its slot back: the ordinary
+                // close, with no answer.
+                let Some(pending) = pending else {
+                    let _ = tokio::time::timeout(REFUSAL_CLOSE_DEADLINE, dc.close()).await;
+                    return;
+                };
                 let pending = Arc::new(pending);
                 let check_and_send = async {
                     let Some(pc) = peer.upgrade() else { return };
@@ -559,7 +681,17 @@ impl RtcSessions {
                     }
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(2), check_and_send).await;
-                let _ = dc.close().await;
+                // The close needs no slot. A blocking check still running
+                // past its limit keeps this one until it is done.
+                drop(pending);
+                let close = async {
+                    #[cfg(test)]
+                    sessions
+                        .pause_effect(&session_id.to_string(), TestEffectPoint::RefusalClose)
+                        .await;
+                    let _ = dc.close().await;
+                };
+                let _ = tokio::time::timeout(REFUSAL_CLOSE_DEADLINE, close).await;
             })
         }));
     }
@@ -603,7 +735,7 @@ impl RtcSessions {
         };
         anyhow::ensure!(
             self.pair_is_current(parent_id, pc, pair.trust_epoch).await,
-            "retired device connection"
+            RefusedWholesale(Wholesale::Retired, "retired device connection")
         );
         let parent = self
             .host_peers
@@ -611,7 +743,7 @@ impl RtcSessions {
             .await
             .get(parent_id)
             .cloned()
-            .context("retired parent")?;
+            .ok_or(RefusedWholesale(Wholesale::Retired, "retired parent"))?;
         let id = format!(
             "pair/{}/{}/{}/{}",
             pair.device_key
@@ -651,7 +783,7 @@ impl RtcSessions {
         } else {
             anyhow::ensure!(
                 self.has_pair_view_capacity(pc).await,
-                "too many terminal views"
+                RefusedWholesale(Wholesale::ViewCapacity, "too many terminal views")
             );
             if transition.is_none() {
                 anyhow::ensure!(
@@ -714,7 +846,7 @@ impl RtcSessions {
                 let mut peers = self.peers.lock().await;
                 anyhow::ensure!(
                     !pair.retired.load(Ordering::Acquire),
-                    "retired device connection"
+                    RefusedWholesale(Wholesale::Retired, "retired device connection")
                 );
                 peers.insert(id.clone(), child.clone());
             }
@@ -2201,6 +2333,491 @@ pub(super) mod tests {
         );
     }
 
+    /// Refuse a window of `missing` on a channel that never opens: one
+    /// created on a connection that never connects stays connecting, so its
+    /// `on_open` never runs. `None` when the pending bound refuses it first.
+    async fn refuse_unopened(
+        sessions: &RtcSessions,
+        pc: &Arc<RTCPeerConnection>,
+        pair: &Arc<PairContext>,
+        missing: Uuid,
+    ) -> Option<Arc<RTCDataChannel>> {
+        let pending = PendingChannel::begin(pair)?;
+        let dc = pc
+            .create_data_channel(
+                &format!("spawn.pty/{missing}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        sessions.refuse_missing_session("unopened", pc, pending, missing, &dc);
+        Some(dc)
+    }
+
+    /// A device connection's context with no connection behind it.
+    fn standalone_pair(device_key: [u8; 32]) -> Arc<PairContext> {
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        Arc::new(PairContext {
+            device_key,
+            registry: SessionRegistry::new(),
+            out_tx,
+            trust_epoch: 0,
+            ice_restart: false,
+            remote_ufrags: Mutex::new(HashSet::new()),
+            restart: Mutex::new(()),
+            retired: AtomicBool::new(false),
+            host_channels: std::sync::Mutex::new(Vec::new()),
+            pending_channels: AtomicUsize::new(0),
+            wholesale_refusals: WholesaleRefusals::default(),
+        })
+    }
+
+    /// A window whose session is gone is refused from its channel's
+    /// `on_open`, and the channel keeps its pending slot for that work. A
+    /// channel that never opens here never runs that callback, and the
+    /// library may keep the callback for as long as the connection lives, so
+    /// the slot comes back at `REFUSAL_OPEN_DEADLINE`. Before, such a channel
+    /// kept its slot for as long as the callback was kept, and enough of them
+    /// filled the bound: from then on every channel on the connection, a live
+    /// window's too, was refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_channel_that_never_opens_gives_its_slot_back_at_the_deadline() {
+        let sessions = RtcSessions::new();
+        let pair = standalone_pair([22; 32]);
+        let pc = Arc::new(
+            webrtc::api::APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let missing = Uuid::new_v4();
+        let pending = || pair.pending_channels.load(Ordering::Acquire);
+
+        let first = refuse_unopened(&sessions, &pc, &pair, missing)
+            .await
+            .unwrap();
+        assert_eq!(pending(), 1, "the refusal holds its channel's slot");
+        tokio::time::sleep(REFUSAL_OPEN_DEADLINE - Duration::from_millis(1)).await;
+        assert_eq!(pending(), 1, "the slot is held until the deadline");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            pending(),
+            0,
+            "a refused channel that never opened gave its slot back at the deadline"
+        );
+
+        // A device retries a window whose session is gone every few seconds,
+        // for as long as the window stays open, and can have many. More such
+        // channels than the bound, twenty a second, never fill it.
+        let mut channels = vec![first];
+        let mut busiest = 0;
+        for attempt in 0..MAX_PAIR_PENDING_CHANNELS + 8 {
+            let channel = refuse_unopened(&sessions, &pc, &pair, missing).await;
+            assert!(
+                channel.is_some(),
+                "attempt {attempt} was refused for want of a slot"
+            );
+            channels.extend(channel);
+            busiest = busiest.max(pending());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(REFUSAL_OPEN_DEADLINE).await;
+        let drained = pending();
+        let admitted = PendingChannel::begin(&pair).is_some();
+        let unopened = channels
+            .iter()
+            .all(|channel| channel.ready_state() == RTCDataChannelState::Connecting);
+        drop(channels);
+        let _ = pc.close().await;
+        assert!(unopened, "no refused channel opened");
+        assert!(
+            busiest < MAX_PAIR_PENDING_CHANNELS,
+            "{busiest} slots held at once"
+        );
+        assert_eq!(drained, 0, "every refused channel gave its slot back");
+        assert!(admitted, "the next channel on the connection is admitted");
+    }
+
+    /// What a device does with a window whose session is gone, over and
+    /// over: it opens the window's two channels, the first is answered
+    /// `session_not_running`, and it closes the other, whether or not that one
+    /// has opened here yet. More such channels than the pending bound, one window
+    /// after another, never fill it, and a live window still opens on the
+    /// connection afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_retried_for_a_missing_session_never_fill_the_pending_bound() {
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let rtc = RtcSessions::new();
+        rtc.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_terminal_pair(&rtc, &registry, &dir).await;
+        registry.finish_discovery(dir.clone());
+        let pair = rtc
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .pair
+            .clone()
+            .unwrap();
+        let missing = Uuid::new_v4();
+        let mut busiest = 0;
+        let mut answered = 0;
+        for _ in 0..MAX_PAIR_PENDING_CHANNELS / 2 + 8 {
+            let suffix = format!("{missing}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+            let pty = pc
+                .create_data_channel(&format!("spawn.pty/{suffix}"), None)
+                .await
+                .unwrap();
+            let ctl = pc
+                .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
+                .await
+                .unwrap();
+            // The refused channel's typed answer, if it comes after this
+            // handler is in place, and then its close. The channel is
+            // already open here, so a quick answer can come first: the close
+            // is read from the channel's state.
+            let (events, mut typed) = mpsc::unbounded_channel();
+            pty.on_message(Box::new(move |message| {
+                let _ = events.send(message.data == SESSION_NOT_RUNNING.as_bytes());
+                Box::pin(async {})
+            }));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while pty.ready_state() != RTCDataChannelState::Closed {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("the refused window is closed");
+            if typed.try_recv().unwrap_or(false) {
+                answered += 1;
+            }
+            let _ = ctl.close().await;
+            let _ = pty.close().await;
+            busiest = busiest.max(pair.pending_channels.load(Ordering::Acquire));
+        }
+        let drained = tokio::time::timeout(REFUSAL_OPEN_DEADLINE * 2, async {
+            while pair.pending_channels.load(Ordering::Acquire) > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let live = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, live);
+        let attached =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&pc, live)).await;
+        rtc.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
+        assert!(
+            busiest < MAX_PAIR_PENDING_CHANNELS,
+            "{busiest} slots held at once"
+        );
+        assert!(
+            answered > 0,
+            "no refused window was answered session_not_running"
+        );
+        assert!(drained.is_ok(), "every refused channel gave its slot back");
+        assert!(
+            attached.is_ok(),
+            "a live window opens on the connection after the refusals"
+        );
+    }
+
+    /// The close that ends a refusal queues its stream reset behind any
+    /// writer on the association waiting for room, which a device that has
+    /// stopped reading can make wait for ever. The slot goes back before that
+    /// close, and the close is given up at `REFUSAL_CLOSE_DEADLINE`: over
+    /// more refused windows than the bound, every close hanging, no slot
+    /// waits on a close and the bound never fills.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refusals_whose_close_hangs_never_hold_a_slot() {
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let rtc = RtcSessions::new();
+        rtc.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_terminal_pair(&rtc, &registry, &dir).await;
+        registry.finish_discovery(dir.clone());
+        let pair = rtc
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .pair
+            .clone()
+            .unwrap();
+        let mut hung = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..MAX_PAIR_PENDING_CHANNELS + 8 {
+            let missing = Uuid::new_v4();
+            let close = rtc
+                .stall_effect(&missing.to_string(), TestEffectPoint::RefusalClose)
+                .await;
+            let pty = pc
+                .create_data_channel(
+                    &format!("spawn.pty/{missing}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                    None,
+                )
+                .await
+                .unwrap();
+            // A channel past a full bound is refused at once: no close.
+            let reached = tokio::time::timeout(Duration::from_secs(10), close.wait_entered())
+                .await
+                .is_ok();
+            held.push(pair.pending_channels.load(Ordering::Acquire));
+            let _ = pty.close().await;
+            hung.push(close);
+            if !reached {
+                break;
+            }
+        }
+        // A hung close lets its stall go when it is given up.
+        tokio::time::sleep(REFUSAL_CLOSE_DEADLINE + Duration::from_secs(2)).await;
+        let given_up = hung.iter().all(|close| Arc::strong_count(close) == 1);
+        let live = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, live);
+        let attached =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&pc, live)).await;
+        rtc.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
+        assert!(
+            held.len() == MAX_PAIR_PENDING_CHANNELS + 8 && held.iter().all(|&pending| pending == 0),
+            "slots held while refusals' closes hung: {held:?}"
+        );
+        assert!(given_up, "a refusal's hung close outlived its deadline");
+        assert!(
+            attached.is_ok(),
+            "a live window opens on the connection after the refusals"
+        );
+    }
+
+    /// What a test logs, as the ordinary log writes it.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Every WARN this module logs on this thread while the guard lives, in
+    /// the ordinary log's format, and into `support` as the support log does.
+    /// On a single-thread runtime the daemon's own tasks log on this thread.
+    fn capture_module_warnings(
+        support: Option<&crate::support_log::SupportLog>,
+    ) -> (Logged, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        let logged = Logged::default();
+        let sink = logged.clone();
+        let ordinary = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                *meta.level() == tracing::Level::WARN && meta.target() == "spawnd::rtc::pair"
+            }));
+        let subscriber = tracing_subscriber::registry()
+            .with(ordinary)
+            .with(support.map(|log| log.layer()));
+        (logged, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Each reason a connection's channels are refused wholesale is warned
+    /// of, in the ordinary log and in the support log: once for a burst, and
+    /// again only once the window has passed, with how many were refused
+    /// since the last line. Each connection and each reason has its own
+    /// window, and the lines carry counts and the reason only.
+    #[tokio::test(start_paused = true)]
+    async fn wholesale_refusals_are_warned_once_a_window_with_their_count() {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let support = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
+        let (logged, guard) = capture_module_warnings(Some(&support));
+        let pair = standalone_pair([23; 32]);
+        let other = standalone_pair([24; 32]);
+        let full = |refused: u64| {
+            format!(
+                "device channels refused: as many of their connection's channels are waiting for admission already reason=\"pending bound full\" refused={refused} bound={MAX_PAIR_PENDING_CHANNELS} current=0"
+            )
+        };
+
+        for _ in 0..5 {
+            pair.refused_wholesale(Wholesale::PendingBound);
+        }
+        pair.refused_wholesale(Wholesale::Retired);
+        other.refused_wholesale(Wholesale::PendingBound);
+        let burst = logged.lines();
+        tokio::time::advance(WHOLESALE_REFUSAL_WARNING_WINDOW - Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            pair.refused_wholesale(Wholesale::PendingBound);
+        }
+        let within = logged.lines().len();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        pair.refused_wholesale(Wholesale::PendingBound);
+        pair.refused_wholesale(Wholesale::ViewCapacity);
+        let after = logged.lines();
+        drop(guard);
+        assert!(support.flush(Duration::from_secs(10)));
+        let recorded: Vec<Value> =
+            std::fs::read_to_string(support.dir().join(crate::support_log::CURRENT))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|record: &Value| {
+                    record["level"] == "WARN" && record["target"] == "spawnd::rtc::pair"
+                })
+                .collect();
+
+        assert_eq!(
+            burst.len(),
+            3,
+            "one line per reason and connection: {burst:#?}"
+        );
+        assert!(burst[0].ends_with(&full(1)), "{}", burst[0]);
+        assert!(
+            burst[1].ends_with(
+                "device channels refused: their connection is retired or its trust is no longer current reason=\"connection retired or trust changed\" refused=1"
+            ),
+            "{}",
+            burst[1]
+        );
+        assert!(burst[2].ends_with(&full(1)), "{}", burst[2]);
+        assert_eq!(within, 3, "nothing more within the window");
+        assert_eq!(after.len(), 5, "{after:#?}");
+        // The four refused after the first line in the burst, three within
+        // the window and the one that ends it.
+        assert!(after[3].ends_with(&full(8)), "{}", after[3]);
+        assert!(
+            after[4].ends_with(
+                "device channels refused: their connection has as many terminal views as it may reason=\"view capacity full\" refused=1"
+            ),
+            "{}",
+            after[4]
+        );
+        assert_eq!(recorded.len(), 5, "{recorded:#?}");
+        let fields: Vec<_> = recorded.iter().map(|record| &record["fields"]).collect();
+        assert_eq!(
+            fields[0],
+            &json!({"reason": "pending bound full", "refused": 1, "bound": MAX_PAIR_PENDING_CHANNELS, "current": 0})
+        );
+        assert_eq!(
+            fields[1],
+            &json!({"reason": "connection retired or trust changed", "refused": 1})
+        );
+        assert_eq!(fields[3]["refused"], 8);
+        assert_eq!(
+            fields[4],
+            &json!({"reason": "view capacity full", "refused": 1})
+        );
+    }
+
+    /// An ordinary refusal — a window whose session is gone, answered
+    /// `session_not_running`, or a channel with a label nobody serves — and a
+    /// window that is admitted warn of nothing. On the same connection each
+    /// wholesale refusal does, once.
+    #[tokio::test]
+    async fn only_wholesale_refusals_are_warned_of() {
+        let (logged, _guard) = capture_module_warnings(None);
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let rtc = RtcSessions::new();
+        rtc.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        // Its bootstrap channel's label is one nobody serves.
+        let pc = connect_terminal_pair(&rtc, &registry, &dir).await;
+        registry.finish_discovery(dir.clone());
+        let missing = json!({"version": 1, "kind": "event", "event": "attach_refused", "reason": "session_not_running"});
+        assert_eq!(refusal_frames(&pc, Uuid::new_v4(), "pty").await, [missing]);
+        let live = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, live);
+        let (_pty, _ctl) = attach_answered(&pc, live).await;
+        let ordinary = logged.lines();
+
+        let pair = rtc
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .pair
+            .clone()
+            .unwrap();
+        let permits: Vec<_> = std::iter::from_fn(|| PendingChannel::begin(&pair)).collect();
+        assert!(refusal_frames(&pc, Uuid::new_v4(), "pty").await.is_empty());
+        drop(permits);
+        {
+            let mut peers = rtc.peers.lock().await;
+            let child = peers.values().next().unwrap().clone();
+            for n in 1..MAX_PAIR_SESSIONS {
+                peers.insert(format!("capacity/{n}"), child.clone());
+            }
+        }
+        assert!(refusal_frames(&pc, Uuid::new_v4(), "pty").await.is_empty());
+        rtc.peers
+            .lock()
+            .await
+            .retain(|key, _| !key.starts_with("capacity/"));
+        pair.retire();
+        assert!(refusal_frames(&pc, Uuid::new_v4(), "pty").await.is_empty());
+        let wholesale = logged.lines();
+        rtc.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
+        assert!(ordinary.is_empty(), "{ordinary:#?}");
+        assert_eq!(wholesale.len(), 3, "{wholesale:#?}");
+        assert!(
+            wholesale[0].ends_with(&format!(
+                "reason=\"pending bound full\" refused=1 bound={MAX_PAIR_PENDING_CHANNELS} current={MAX_PAIR_PENDING_CHANNELS}"
+            )),
+            "{}",
+            wholesale[0]
+        );
+        assert!(
+            wholesale[1].ends_with("reason=\"view capacity full\" refused=1"),
+            "{}",
+            wholesale[1]
+        );
+        assert!(
+            wholesale[2].ends_with("reason=\"connection retired or trust changed\" refused=1"),
+            "{}",
+            wholesale[2]
+        );
+    }
+
     /// Offer jobs outlive the dispatch loop that queued them, so one queued
     /// on a control connection that has since dropped can start after the
     /// daemon has reconnected. It must not put that connection's sender in
@@ -3080,6 +3697,7 @@ pub(super) mod tests {
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
             pending_channels: AtomicUsize::new(0),
+            wholesale_refusals: WholesaleRefusals::default(),
         });
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),

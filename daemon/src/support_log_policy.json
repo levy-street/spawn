@@ -329,7 +329,10 @@
         "data channel acceptor ended",
         "spawn.pty and spawn.ctl are both required",
         "worker replay is unavailable",
-        "worker live-stream barrier timed out"
+        "worker live-stream barrier timed out",
+        "pending bound full",
+        "connection retired or trust changed",
+        "view capacity full"
       ]
     },
     "refreshed": {
@@ -611,7 +614,7 @@
     {
       "target": "spawnd::rtc",
       "file": "src/rtc.rs",
-      "line": 4857,
+      "line": 4858,
       "field": "error",
       "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
       "why": "Direct tokio::fs::write io::Error, not a parser or a worker spawn error; path is a separate allowed field."
@@ -690,14 +693,14 @@
     },
     {
       "file": "src/rtc.rs",
-      "line": 4856,
+      "line": 4857,
       "field": "path",
       "source": "tracing::debug!(path = %path.display(), \"replay dumped for diagnostics\")",
       "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."
     },
     {
       "file": "src/rtc.rs",
-      "line": 4857,
+      "line": 4858,
       "field": "path",
       "source": "tracing::warn!(%error, path = %path.display(), \"replay dump failed\")",
       "why": "Configured replay directory plus typed session/request UUIDs; never replay bytes."

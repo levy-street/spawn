@@ -11,7 +11,7 @@ const BODY = `# SPAWN D
 
 > The open-source control plane for CLI coding agents. A daemon on every host you own — summon your agents, reach them from any browser, and the server that connects you never hears a word.
 
-spawnd runs coding agents (Claude Code, Codex, OpenCode, Aider, or any CLI) as persistent terminal sessions on machines you own. One daemon per host dials out, so nothing listens and no ports open. Any browser — a phone's included, installed as a web app — becomes the console: workspaces per project, live sessions across hosts, attention cues when an agent waits on a yes. Your browser talks to each daemon peer-to-peer, end-to-end encrypted; when a relay is unavoidable it forwards ciphertext it cannot decrypt. Agents authenticate on the host as they always do; spawnd holds no provider credentials. Open source, MIT/Apache-2.0. Daemon for macOS and Linux.
+spawnd runs coding agents (Claude Code, Codex, Antigravity CLI, OpenCode, Aider, or any CLI) as persistent terminal sessions on machines you own. One daemon per host dials out, so nothing listens and no ports open. Any browser — a phone's included, installed as a web app — becomes the console: workspaces per project, live sessions across hosts, attention cues when an agent waits on a yes. Your browser talks to each daemon peer-to-peer, end-to-end encrypted; when a relay is unavoidable it forwards ciphertext it cannot decrypt. Agents authenticate on the host as they always do; spawnd holds no provider credentials. Open source, MIT/Apache-2.0. Daemon for macOS and Linux.
 
 ## Start here
 

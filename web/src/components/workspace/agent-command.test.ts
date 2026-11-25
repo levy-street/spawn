@@ -136,6 +136,7 @@ describe("conversation grammar", () => {
   const claude = { kind: "claude-code", command: "claude", env: {} };
   const codex = { kind: "codex", command: "codex", env: {} };
   const hermes = { kind: "hermes", command: "hermes", env: {} };
+  const agy = { kind: "antigravity", command: "agy", env: {} };
   const id = "3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10";
 
   test("Claude Code is launched under an id SPAWN D chose and resumed by it", () => {
@@ -204,6 +205,24 @@ describe("conversation grammar", () => {
     });
     expect(queuedLaunch((options) => agentLaunchCommand(claude, id, options))).toEqual({
       command: `claude --session-id ${id}`,
+      codexNoDaemon: null,
+    });
+  });
+
+  test("Antigravity CLI names its own conversations: resumed by a named id, else this folder's latest", () => {
+    expect(newAgentConversationId("antigravity")).toBeNull();
+    expect(agentLaunchCommand(agy, id)).toBe("agy");
+    expect(agentResumeCommand(agy, id)).toBe(`agy --conversation ${id}`);
+    expect(agentResumeCommand(agy, null)).toBe("agy --continue");
+    expect(agentResumeCommand(agy, "--dangerously-skip-permissions")).toBe("agy --continue");
+    expect(
+      agentResumeCommand({ ...agy, yolo: true, yolo_args: "--dangerously-skip-permissions" }, null),
+    ).toBe("agy --dangerously-skip-permissions --continue");
+    expect(agentCanResume("antigravity")).toBe(true);
+    // Codex's `--no-daemon` is Codex's alone: an Antigravity launch is queued
+    // in one form.
+    expect(queuedLaunch((options) => agentResumeCommand(agy, null, options) ?? "")).toEqual({
+      command: "agy --continue",
       codexNoDaemon: null,
     });
   });

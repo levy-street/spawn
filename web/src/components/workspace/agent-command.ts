@@ -147,9 +147,9 @@ export type AgentConversationGrammar = {
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
-  /** Flags for a window whose conversation cannot be named: Claude Code
-   *  continues the folder's latest; Codex opens its own picker. Null when the
-   *  CLI has neither. */
+  /** Flags for a window whose conversation cannot be named: Claude Code and
+   *  Antigravity CLI continue the folder's latest; Codex opens its own picker.
+   *  Null when the CLI has neither. */
   withoutId: string | null;
 };
 
@@ -172,6 +172,17 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
     launch: null,
     resume: (id) => `resume ${id}`,
     withoutId: "resume",
+  },
+  // Antigravity CLI (`agy`) names its own conversations too, and no host names
+  // one for its window yet (`conv.inspect` answers for Claude Code and Codex
+  // only), so a restart takes `--continue`, as Claude Code does without an id:
+  // the newest conversation in the folder the window starts in. A restart
+  // never reads a recorded id for it; `--conversation <id>` is there for the
+  // day a host can name one.
+  antigravity: {
+    launch: null,
+    resume: (id) => `--conversation ${id}`,
+    withoutId: "--continue",
   },
 };
 

@@ -65,8 +65,8 @@ export type AgentRestartResult = { plan: AgentRestartPlan };
 
 /**
  * The conversation a restart brings the agent back into, or null for none to
- * name (Claude Code then continues the latest one here; Codex shows its
- * picker).
+ * name (Claude Code and Antigravity CLI then continue the latest one here;
+ * Codex shows its picker).
  *
  * An answer from the host about this window's agent decides it: the id the
  * host names, or none when it deliberately names none (a Codex whose threads
@@ -79,8 +79,9 @@ export type AgentRestartResult = { plan: AgentRestartPlan };
  * Without such an answer — a daemon without `conv.v1`, no connection to the
  * host, a timeout, an answer about another program — the recorded id stands,
  * but only for a CLI that SPAWN D launches under an id it chose (Claude
- * Code). A CLI that names its own conversations (Codex) has no recorded id
- * worth trusting, and opens its own picker.
+ * Code). A CLI that names its own conversations (Codex, Antigravity CLI) has
+ * no recorded id worth trusting: Codex opens its own picker, and Antigravity
+ * CLI continues the latest one here.
  *
  * A conversation that something outside the window also holds is resumed all
  * the same: on the same host `claude --resume <id>` of a running background

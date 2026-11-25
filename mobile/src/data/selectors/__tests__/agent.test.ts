@@ -42,6 +42,7 @@ const BUILT_INS = [
     command: "aider --model claude-sonnet-4-6",
   }),
   agent({ id: "hermes", name: "hermes", kind: "hermes", command: "hermes" }),
+  agent({ id: "antigravity", name: "antigravity", kind: "antigravity", command: "agy" }),
 ];
 
 describe("agent identity", () => {
@@ -51,8 +52,15 @@ describe("agent identity", () => {
     ["opencode", "opencode", "OpenCode"],
     ["aider", "aider", "Aider Sonnet"],
     ["hermes", "hermes", "Hermes Agent"],
+    ["agy", "antigravity", "Antigravity CLI"],
   ])("recognizes %s", (command, logoKey, displayName) => {
     expect(identifyAgent(command, BUILT_INS)).toMatchObject({ logoKey, displayName });
+  });
+
+  it("knows agy by its whole executable name, with no definition to go on", () => {
+    expect(identifyAgent("agy", [])).toMatchObject({ logoKey: "antigravity" });
+    expect(identifyAgent("agy.exe", [])).toMatchObject({ logoKey: "antigravity" });
+    expect(identifyAgent("stagy", [])).toMatchObject({ logoKey: null, displayName: "stagy" });
   });
 
   it("matches a custom definition by executable basename", () => {
@@ -170,6 +178,7 @@ describe("conversation grammar", () => {
   const claude = agent({ kind: "claude-code", command: "claude", name: "Claude Code" });
   const codex = agent({ kind: "codex", command: "codex", name: "codex" });
   const hermes = agent({ kind: "hermes", command: "hermes", name: "hermes" });
+  const agy = agent({ kind: "antigravity", command: "agy", name: "antigravity" });
   const id = "3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10";
 
   test("Claude Code is launched under an id SPAWN D chose and resumed by it", () => {
@@ -243,6 +252,24 @@ describe("conversation grammar", () => {
     });
     expect(queuedLaunch((options) => agentLaunchCommand(claude, id, options))).toEqual({
       command: `claude --session-id ${id}`,
+      codexNoDaemon: null,
+    });
+  });
+
+  test("Antigravity CLI names its own conversations: resumed by a named id, else this folder's latest", () => {
+    expect(newAgentConversationId("antigravity", () => id)).toBeNull();
+    expect(agentLaunchCommand(agy, id)).toBe("agy");
+    expect(agentResumeCommand(agy, id)).toBe(`agy --conversation ${id}`);
+    expect(agentResumeCommand(agy, null)).toBe("agy --continue");
+    expect(agentResumeCommand(agy, "--dangerously-skip-permissions")).toBe("agy --continue");
+    expect(
+      agentResumeCommand({ ...agy, yolo: true, yolo_args: "--dangerously-skip-permissions" }, null),
+    ).toBe("agy --dangerously-skip-permissions --continue");
+    expect(agentCanResume("antigravity")).toBe(true);
+    // Codex's `--no-daemon` is Codex's alone: an Antigravity launch is queued
+    // in one form.
+    expect(queuedLaunch((options) => agentResumeCommand(agy, null, options) ?? "")).toEqual({
+      command: "agy --continue",
       codexNoDaemon: null,
     });
   });
