@@ -110,12 +110,21 @@ release, which would then be stored as failed. Registration settles the mark
 when the host next connects.
 
 Just before each offer the task pings the daemon (`request_host_ping`, two
-seconds). A send into the socket of a machine that has just gone to sleep still
-succeeds, and the release would then be stored as failed for that host when it
-came back on its old build. So a daemon that does not answer, or whose ping
-fails, is offered nothing and its host row is not written; its next
-registration offers the release. Every daemon that can update itself answers
-pings.
+seconds for the answer, under one three-second limit for the whole ping, its
+send included, since the broker's limit covers only the answer and a stuck
+socket would otherwise hold the pass). A send into a connection that is already
+dead can still succeed, and the release would then be stored as failed for that
+host when it came back on its old build. So a daemon that does not answer in
+time, or whose ping fails, is offered nothing and its host row is not written;
+its next registration offers the release. Every daemon that can update itself
+answers pings. The ping covers only that dead connection. A daemon that answers
+and whose machine then sleeps or loses its network during the download ends
+the same way, with or without this task: when it registers again on its old
+build, registration's activation write records the update as failed
+("restarted on the previous binary"), whether or not any update result
+arrived, and that release is not offered to the host again until its owner
+chooses Try again or a newer release is published. Issue #170 is about that
+case.
 
 Nothing is offered while the manifest is unreadable or missing. Nothing is
 offered when the release changes to one the task has already seen, or to one

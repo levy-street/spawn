@@ -34,6 +34,10 @@ POLL_SECONDS = 15.0
 OFFER_GAP_SECONDS = 2.0
 #: How long a daemon has to answer the ping sent just before its offer.
 PING_SECONDS = 2.0
+#: How long the whole ping may take, its send included: the broker's ping
+#: limits only the wait for the answer, and a stuck socket could otherwise
+#: hold a pass at the send.
+PING_LIMIT_SECONDS = 3.0
 
 #: What names one daemon release: its daemon tree and its release counter.
 #: Hosts compare trees; the counter tells a re-release of an older tree apart.
@@ -208,13 +212,20 @@ class DaemonReleaseOffers:
     async def _answers(self, conn: DaemonConn) -> bool:
         """Whether this daemon answers a ping now, on the same connection.
 
-        A send into the socket of a machine that has just gone to sleep still
-        succeeds. The host would be marked updating, and when it came back on
-        its old build that release would be stored as failed for it. A daemon
-        that does not answer is offered nothing and its host is not written;
-        its next registration offers the release instead.
+        A send into a connection that is already dead can still succeed. The
+        host would be marked updating, and when it came back on its old build
+        that release would be stored as failed for it. A daemon that does not
+        answer, within `PING_LIMIT_SECONDS` for the whole ping, is offered
+        nothing and its host is not written; its next registration offers the
+        release instead. This does not cover a daemon that answers and then
+        loses its machine or network during the download (issue #170).
         """
         broker = get_broker()
-        if not await broker.request_host_ping(conn, timeout=PING_SECONDS):
+        try:
+            async with asyncio.timeout(PING_LIMIT_SECONDS):
+                answered = await broker.request_host_ping(conn, timeout=PING_SECONDS)
+        except TimeoutError:
+            return False
+        if not answered:
             return False
         return broker.get_daemon_for_host(conn.host_id) is conn

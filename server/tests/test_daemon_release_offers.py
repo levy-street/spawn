@@ -90,12 +90,14 @@ class Socket(FakeDaemonWebSocket):
     """Sets `idle` once registration has finished and the next frame is awaited.
 
     Answers each `host.ping` as a daemon does, unless `ping` is "silent" (never
-    answers) or "refuse" (the write fails).
+    answers), "refuse" (the write fails) or "stuck" (the write never returns;
+    `ping_held` is set once it has begun).
     """
 
     def __init__(self, *, refuse_updates: bool = False, ping: str = "answer") -> None:
         super().__init__()
         self.idle = asyncio.Event()
+        self.ping_held = asyncio.Event()
         self.refuse_updates = refuse_updates
         self.ping = ping
 
@@ -111,6 +113,9 @@ class Socket(FakeDaemonWebSocket):
         if frame["type"] == "host.ping":
             if self.ping == "refuse":
                 raise OSError("socket refused the write")
+            if self.ping == "stuck":
+                self.ping_held.set()
+                await asyncio.Event().wait()
             if self.ping == "answer":
                 self.queue_text({"type": "host.pong", "request_id": frame["request_id"]})
         await super().send_text(value)
@@ -543,6 +548,50 @@ async def test_a_daemon_that_does_not_answer_a_ping_is_left_to_registration(
     assert [record.getMessage() for record in offer_records(caplog)] == [
         "daemon release offer to one host failed: WebSocketDisconnect",
         "daemon release offer pass: 3 connections considered, 1 tried",
+    ]
+
+
+async def test_a_ping_whose_send_never_returns_does_not_hold_the_pass(
+    fleet, prebuilts, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    prebuilts.stage("a", TREE_A, 100)
+    prebuilts.stage("b", TREE_B, 200)
+    first, first_ws = await fleet.connect()
+    stuck, stuck_ws = await fleet.connect(socket=Socket(ping="stuck"))
+    last, last_ws = await fleet.connect()
+    prebuilts.activate("a")
+    pauses = Pauses()
+    offers = DaemonReleaseOffers(pause=pauses)
+    await offers.poll_once()
+
+    def fields(row: Host) -> tuple:
+        return (row.update_state, row.update_tree, row.update_error, row.update_requested_at)
+
+    before = fields(await host_row(stuck))
+    limit = offers_mod.PING_LIMIT_SECONDS
+
+    async def gap(count):
+        # The gap before the stuck host gives its whole ping no time at all, so
+        # the test sits out no real interval; the gap after it restores the
+        # real limit for the last host.
+        monkeypatch.setattr(offers_mod, "PING_LIMIT_SECONDS", 0 if count == 1 else limit)
+
+    pauses.hook = gap
+    prebuilts.activate("b")
+    await asyncio.wait_for(offers.poll_once(), 10)
+
+    assert limit == 3.0
+    assert stuck_ws.ping_held.is_set()
+    assert stuck_ws.updates() == []
+    assert fields(await host_row(stuck)) == before
+    for host_id, ws in ((first, first_ws), (last, last_ws)):
+        assert [frame["tree"] for frame in ws.updates()] == [TREE_B]
+        row = await host_row(host_id)
+        assert (row.update_state, row.update_tree) == ("updating", TREE_B)
+    assert pauses.calls == [offers_mod.OFFER_GAP_SECONDS] * 2
+    assert [record.getMessage() for record in offer_records(caplog)] == [
+        "daemon release offer pass: 3 connections considered, 2 tried",
     ]
 
 
