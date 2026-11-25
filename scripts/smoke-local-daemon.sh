@@ -700,7 +700,8 @@ start_server() {
       SPAWN_PUBLIC_URL="$base_url" \
       exec python3 -c \
         'import os, sys; os.setsid(); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' \
-        uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port"
+        uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port" \
+        --ws websockets-sansio
   ) >>"$server_log" 2>&1 &
   server_pid=$!
   if ! claim_owned_process_group "server" "$server_pid"; then
@@ -710,7 +711,8 @@ start_server() {
   uv_exe="$(readlink -f "$(command -v uv)")"
   identity="$(capture_owned_process_identity \
     "server" "$server_pid" "$uv_exe" \
-    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port")" || return 1
+    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port" \
+    --ws websockets-sansio)" || return 1
   server_identity="$identity"
 
   for _ in {1..80}; do

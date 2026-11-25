@@ -123,7 +123,8 @@ try {
     $serverProcess = Start-Process -FilePath (Get-Command uv).Source `
         -ArgumentList @(
             'run', '--frozen', 'uvicorn', 'spawn_server.main:app',
-            '--host', '127.0.0.1', '--port', [string] $port
+            '--host', '127.0.0.1', '--port', [string] $port,
+            '--ws', 'websockets-sansio'
         ) `
         -WorkingDirectory $serverDir `
         -RedirectStandardOutput $stdoutLog `

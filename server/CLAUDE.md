@@ -66,6 +66,13 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   WAL, a fifteen-second busy timeout, `synchronous=NORMAL`, foreign keys — so
   readers never wait on a writer. A `database is locked` in the log is a
   transaction held open too long, never a reason to add a retry.
+- A new place that starts the server (a script, a test fixture, a command in
+  a doc): pass `--ws websockets-sansio` on the command line, or
+  `ws="websockets-sansio"` to uvicorn's `Config` from Python.
+  `scripts/check-ws-sansio-launch.sh`, run by `scripts/test-all.sh`, fails a
+  launch without it. `docs/NETWORK.md` ("The websocket implementation")
+  compares the two implementations; `docs/RELEASE.md` has the production
+  switch and its rollback.
 
 Agent installation through REST is refused after ownership checks; the server
 does not dispatch installers or run an agent auto-update scheduler. Historical
