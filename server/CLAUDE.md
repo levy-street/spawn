@@ -101,8 +101,21 @@ calls it only for hosts that function would give an ordinary update: automatic
 updates on, the host behind the release, self-update available, not already
 updating, and not failed for this release. A host whose worker pair is
 mismatched is left to registration. Registration repairs such a host whatever
-its update state, and a second offer while the first is running would be
-refused by the daemon as busy and stored as a failure for the new release.
+its update state and whatever the automatic-update setting, and a second offer
+while the first is running would be refused by the daemon as busy and stored as
+a failure for the new release. A host marked updating is left alone however
+long ago the update began. That function stops counting an update as running
+after three minutes, but a daemon still busy with it would refuse the new
+release, which would then be stored as failed. Registration settles the mark
+when the host next connects.
+
+Just before each offer the task pings the daemon (`request_host_ping`, two
+seconds). A send into the socket of a machine that has just gone to sleep still
+succeeds, and the release would then be stored as failed for that host when it
+came back on its old build. So a daemon that does not answer, or whose ping
+fails, is offered nothing and its host row is not written; its next
+registration offers the release. Every daemon that can update itself answers
+pings.
 
 Nothing is offered while the manifest is unreadable or missing. Nothing is
 offered when the release changes to one the task has already seen, or to one
@@ -116,13 +129,15 @@ checked on the next poll, by which time its registration has normally recorded
 its own offer. Only a registration still inside its own offer a whole poll
 after its connection became routable could still race the task.
 The task holds no database transaction across a send and takes no lock of its
-own. Stopping the server stops it between hosts; shutdown waits for the offer
-or manifest read in progress. Each pass logs one INFO line with the number of
-connections considered and offers made, and no host identifiers.
+own. Stopping the server stops it between hosts; shutdown waits for the ping,
+offer or manifest read in progress. Each pass logs one INFO line
+with the number of connections considered and of hosts handed to the offer
+function, which does not report whether it sent, and no host identifiers.
 
 `SPAWN_DAEMON_RELEASE_OFFERS=false` means the task is never started, and only
-registration offers a release. `SPAWN_DAEMON_AUTO_UPDATE=false` also stops the
-task from offering anything.
+registration offers a release. `SPAWN_DAEMON_AUTO_UPDATE=false` stops the task
+from offering anything, and stops registration's offers except its repair of a
+mismatched worker pair.
 
 ## Support log delivery and storage
 

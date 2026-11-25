@@ -7,9 +7,9 @@ nothing else would offer the new one until each daemon's next registration.
 
 This task reads the active release about every 15 seconds. When it changes, it
 asks each connected daemon's host, one at a time, through the registration's
-own offer function (`ws.daemon._auto_update_after_registration`). Nothing
-existing waits for it or calls into it; with `daemon_release_offers` off it is
-never started.
+own offer function (`ws.daemon._auto_update_after_registration`), and only for
+a daemon that has just answered a ping. Nothing existing waits for it or calls
+into it; with `daemon_release_offers` off it is never started.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ POLL_SECONDS = 15.0
 #: The wait between two offers in one pass, so a fleet does not download and
 #: restart at once from one small server.
 OFFER_GAP_SECONDS = 2.0
+#: How long a daemon has to answer the ping sent just before its offer.
+PING_SECONDS = 2.0
 
 #: What names one daemon release: its daemon tree and its release counter.
 #: Hosts compare trees; the counter tells a re-release of an older tree apart.
@@ -146,9 +148,10 @@ class DaemonReleaseOffers:
     async def _offer_pass(
         self, connections: list[DaemonConn], manifest: schemas.DaemonReleaseOut
     ) -> None:
-        # `made` counts offers the function made; one the socket did not take
-        # is recorded by that function as failed, as at registration.
-        considered = attempted = made = 0
+        # `tried` counts hosts handed to the offer function. That function does
+        # not say whether it sent; a send the socket did not take is recorded
+        # by it as failed, as at registration.
+        considered = tried = 0
         for conn in connections:
             if self.stopping:
                 break
@@ -156,32 +159,38 @@ class DaemonReleaseOffers:
             try:
                 if not await self._due(conn, manifest):
                     continue
-                if attempted:
+                if tried:
                     await self._pause(OFFER_GAP_SECONDS)
                     if self.stopping:
                         break
                     if not await self._due(conn, manifest):
                         continue
-                attempted += 1
+                if not await self._answers(conn) or self.stopping:
+                    continue
+                tried += 1
                 await daemon_ws._auto_update_after_registration(conn)
-                made += 1
             except Exception as exc:
                 log.error("daemon release offer to one host failed: %s", type(exc).__name__)
         log.info(
-            "daemon release offer pass: %d connections considered, %d offers made",
+            "daemon release offer pass: %d connections considered, %d tried",
             considered,
-            made,
+            tried,
         )
 
     async def _due(self, conn: DaemonConn, manifest: schemas.DaemonReleaseOut) -> bool:
         """Whether the registration's ordinary offer would go to this host now.
 
         The same gate the offer function applies, read in a short session of
-        its own, so the pass waits between and counts only real offers. A host
-        whose worker pair is mismatched is left to registration: the function
-        repairs such a host whatever its update state, and a second offer while
-        the first is still running is refused by the daemon as busy and stored
-        as a failure for the new release.
+        its own, so the pass pings, waits for and counts only hosts it would
+        hand to that function. A host whose worker pair is mismatched is left
+        to registration: the function repairs such a host whatever its update
+        state, and a second offer while the first is still running is refused
+        by the daemon as busy and stored as a failure for the new release. A
+        host marked updating is left alone however long ago that began: the
+        function stops counting an update as running after three minutes, and
+        a daemon still busy with it would refuse the new release, which would
+        then be stored as failed. Registration settles that mark when the host
+        next connects.
         """
         broker = get_broker()
         if broker.get_daemon_for_host(conn.host_id) is not conn:
@@ -190,8 +199,22 @@ class DaemonReleaseOffers:
             return False
         async with get_sessionmaker()() as session:
             host = await session.get(Host, conn.host_id)
-        if host is None or host.worker_mismatch:
+        if host is None or host.worker_mismatch or host.update_state == "updating":
             return False
         if release.host_update_state(host, manifest).state != "available":
+            return False
+        return broker.get_daemon_for_host(conn.host_id) is conn
+
+    async def _answers(self, conn: DaemonConn) -> bool:
+        """Whether this daemon answers a ping now, on the same connection.
+
+        A send into the socket of a machine that has just gone to sleep still
+        succeeds. The host would be marked updating, and when it came back on
+        its old build that release would be stored as failed for it. A daemon
+        that does not answer is offered nothing and its host is not written;
+        its next registration offers the release instead.
+        """
+        broker = get_broker()
+        if not await broker.request_host_ping(conn, timeout=PING_SECONDS):
             return False
         return broker.get_daemon_for_host(conn.host_id) is conn

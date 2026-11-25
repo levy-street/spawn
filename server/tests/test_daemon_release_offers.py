@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -87,12 +87,17 @@ def prebuilts(tmp_path, monkeypatch):
 
 
 class Socket(FakeDaemonWebSocket):
-    """Sets `idle` once registration has finished and the next frame is awaited."""
+    """Sets `idle` once registration has finished and the next frame is awaited.
 
-    def __init__(self, *, refuse_updates: bool = False) -> None:
+    Answers each `host.ping` as a daemon does, unless `ping` is "silent" (never
+    answers) or "refuse" (the write fails).
+    """
+
+    def __init__(self, *, refuse_updates: bool = False, ping: str = "answer") -> None:
         super().__init__()
         self.idle = asyncio.Event()
         self.refuse_updates = refuse_updates
+        self.ping = ping
 
     async def receive(self):
         if self.receive_count:
@@ -102,11 +107,23 @@ class Socket(FakeDaemonWebSocket):
     async def send_text(self, value: str) -> None:
         if self.refuse_updates and '"daemon.update"' in value:
             raise OSError("socket refused the write")
+        frame = json.loads(value)
+        if frame["type"] == "host.ping":
+            if self.ping == "refuse":
+                raise OSError("socket refused the write")
+            if self.ping == "answer":
+                self.queue_text({"type": "host.pong", "request_id": frame["request_id"]})
         await super().send_text(value)
 
-    def updates(self) -> list[dict]:
+    def sent(self, kind: str) -> list[dict]:
         frames = [json.loads(text) for text in self.sent_text]
-        return [frame for frame in frames if frame["type"] == "daemon.update"]
+        return [frame for frame in frames if frame["type"] == kind]
+
+    def updates(self) -> list[dict]:
+        return self.sent("daemon.update")
+
+    def pings(self) -> list[dict]:
+        return self.sent("host.ping")
 
 
 class Fleet:
@@ -258,8 +275,10 @@ async def test_a_new_release_is_offered_once_to_each_host_that_is_behind(
     for host_id in (first, second):
         row = await host_row(host_id)
         assert (row.update_state, row.update_tree) == ("updating", TREE_B)
+    for ws in (first_ws, second_ws):
+        assert len(ws.pings()) == 1
     for ws in (current_ws, no_self_update_ws, updating_ws, failed_ws, mismatch_ws):
-        assert ws.updates() == []
+        assert ws.updates() == [] and ws.pings() == []
     still_updating = await host_row(updating)
     assert still_updating.update_state == "updating"
     assert still_updating.update_requested_at.replace(tzinfo=UTC) == requested
@@ -271,7 +290,7 @@ async def test_a_new_release_is_offered_once_to_each_host_that_is_behind(
     [line] = offer_records(caplog)
     assert line.levelno == logging.INFO
     assert line.getMessage() == (
-        "daemon release offer pass: 7 connections considered, 2 offers made"
+        "daemon release offer pass: 7 connections considered, 2 tried"
     )
     assert not any(
         host_id in record.getMessage()
@@ -296,7 +315,7 @@ async def test_automatic_update_off_offers_nothing(fleet, prebuilts, monkeypatch
     prebuilts.activate("b")
     await offers.poll_once()
 
-    assert ws.updates() == []
+    assert ws.updates() == [] and ws.pings() == []
 
 
 async def test_seen_older_and_unreadable_releases_offer_nothing(fleet, prebuilts):
@@ -474,9 +493,128 @@ async def test_pacing_failures_and_closed_connections_do_not_stop_the_pass(
     messages = [record.getMessage() for record in offer_records(caplog)]
     assert messages == [
         "daemon release offer to one host failed: RuntimeError",
-        "daemon release offer pass: 5 connections considered, 3 offers made",
+        "daemon release offer pass: 5 connections considered, 4 tried",
     ]
     assert not any(raising in message for message in messages)
+
+
+async def test_a_daemon_that_does_not_answer_a_ping_is_left_to_registration(
+    fleet, prebuilts, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    prebuilts.stage("a", TREE_A, 100)
+    prebuilts.stage("b", TREE_B, 200)
+    silent, silent_ws = await fleet.connect(socket=Socket(ping="silent"))
+    refusing, refusing_ws = await fleet.connect(socket=Socket(ping="refuse"))
+    answering, answering_ws = await fleet.connect()
+    broker = broker_mod.get_broker()
+    real_ping = broker.request_host_ping
+    timeouts: list[float] = []
+
+    async def ping(conn, *, timeout):
+        timeouts.append(timeout)
+        # The silent daemon is really asked and never answers; its wait ends
+        # at once, so the test sits out no real interval.
+        return await real_ping(conn, timeout=0 if conn.host_id == silent else timeout)
+
+    monkeypatch.setattr(broker, "request_host_ping", ping)
+    prebuilts.activate("a")
+    pauses = Pauses()
+    offers = DaemonReleaseOffers(pause=pauses)
+    await offers.poll_once()
+
+    def fields(row: Host) -> tuple:
+        return (row.update_state, row.update_tree, row.update_error, row.update_requested_at)
+
+    before = {host_id: fields(await host_row(host_id)) for host_id in (silent, refusing)}
+    prebuilts.activate("b")
+    await offers.poll_once()
+
+    assert timeouts == [offers_mod.PING_SECONDS] * 3 == [2.0] * 3
+    assert len(silent_ws.pings()) == 1
+    for host_id, ws in ((silent, silent_ws), (refusing, refusing_ws)):
+        assert ws.updates() == []
+        assert fields(await host_row(host_id)) == before[host_id]
+    assert [frame["tree"] for frame in answering_ws.updates()] == [TREE_B]
+    row = await host_row(answering)
+    assert (row.update_state, row.update_tree) == ("updating", TREE_B)
+    # Nothing was offered before the answering host, so no gap was waited.
+    assert pauses.calls == []
+    assert [record.getMessage() for record in offer_records(caplog)] == [
+        "daemon release offer to one host failed: WebSocketDisconnect",
+        "daemon release offer pass: 3 connections considered, 1 tried",
+    ]
+
+
+async def test_a_host_marked_updating_long_ago_is_left_alone(fleet, prebuilts):
+    prebuilts.stage("a", TREE_A, 100)
+    prebuilts.stage("b", TREE_B, 200)
+    stale, stale_ws = await fleet.connect()
+    _, other_ws = await fleet.connect()
+    # Past the point where the offer function stops counting it as updating.
+    requested = datetime.now(UTC) - release.DAEMON_UPDATE_TIMEOUT - timedelta(minutes=1)
+    await set_host(stale, update_state="updating", update_tree=TREE_A, update_requested_at=requested)
+    prebuilts.activate("a")
+    offers = DaemonReleaseOffers(pause=Pauses())
+    await offers.poll_once()
+
+    prebuilts.activate("b")
+    await offers.poll_once()
+
+    assert stale_ws.updates() == [] and stale_ws.pings() == []
+    row = await host_row(stale)
+    assert release.host_update_state(row).state == "available"
+    assert (row.update_state, row.update_tree) == ("updating", TREE_A)
+    assert row.update_requested_at.replace(tzinfo=UTC) == requested
+    assert [frame["tree"] for frame in other_ws.updates()] == [TREE_B]
+
+
+async def test_a_release_without_a_counter_is_offered_once(fleet, prebuilts):
+    prebuilts.stage("a", TREE_A, 100)
+    prebuilts.stage("plain", TREE_B, None)
+    host_id, ws = await fleet.connect()
+    prebuilts.activate("a")
+    offers = DaemonReleaseOffers(pause=Pauses())
+    await offers.poll_once()
+
+    prebuilts.activate("plain")
+    await offers.poll_once()
+    assert [frame["tree"] for frame in ws.updates()] == [TREE_B]
+
+    await reset_update_state(host_id)
+    for name in ("a", "plain"):
+        prebuilts.activate(name)
+        await offers.poll_once()
+    assert len(ws.updates()) == 1
+
+
+async def test_the_release_changing_during_a_pass_gives_each_host_one_offer(fleet, prebuilts):
+    tree_d = "d" * 40
+    prebuilts.stage("a", TREE_A, 100)
+    prebuilts.stage("b", TREE_B, 200)
+    prebuilts.stage("d", tree_d, 300)
+    _, first_ws = await fleet.connect()
+    _, second_ws = await fleet.connect()
+    prebuilts.activate("a")
+    pauses = Pauses()
+    offers = DaemonReleaseOffers(pause=pauses)
+    await offers.poll_once()
+
+    async def newer(_count):
+        prebuilts.activate("d")
+
+    pauses.hook = newer
+    prebuilts.activate("b")
+    await offers.poll_once()
+    pauses.hook = None
+    await offers.poll_once()
+    await offers.poll_once()
+
+    # The offer function reads the active release itself, so the second host
+    # got the one that became active in the gap. The next pass finds both
+    # hosts updating and offers nothing more.
+    assert [frame["tree"] for frame in first_ws.updates()] == [TREE_B]
+    assert [frame["tree"] for frame in second_ws.updates()] == [tree_d]
 
 
 async def test_stop_ends_the_pass_between_hosts(fleet, prebuilts):
