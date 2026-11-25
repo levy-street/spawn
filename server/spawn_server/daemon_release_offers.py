@@ -1,4 +1,5 @@
-"""Offer a newly active daemon release to daemons that are already connected.
+"""Offer a newly active daemon release to daemons that are already connected,
+and try again an update that a sleeping or disconnected machine interrupted.
 
 Registration offers the active daemon release to every daemon that registers.
 A deploy restarts the server before it switches the prebuilt `current` pointer,
@@ -10,13 +11,24 @@ asks each connected daemon's host, one at a time, through the registration's
 own offer function (`ws.daemon._auto_update_after_registration`), and only for
 a daemon that has just answered a ping. Nothing existing waits for it or calls
 into it; with `daemon_release_offers` off it is never started.
+
+On a poll that makes no such pass, it also tries again an update that
+registration recorded as interrupted (issue #170): a host marked updating that
+registered again on its old build, typically a laptop that slept or lost its
+network during the download. That is done only on a connection the task has
+seen registered for six minutes without a break, once per connection, at most
+three times per host and release, through a conditional write that clears the
+failure only if the row is exactly as read, and then the same offer function.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Iterable
+
+from sqlalchemy import update
 
 from . import release, schemas
 from .config import get_settings
@@ -38,6 +50,31 @@ PING_SECONDS = 2.0
 #: limits only the wait for the answer, and a stuck socket could otherwise
 #: hold a pass at the send.
 PING_LIMIT_SECONDS = 3.0
+
+#: What registration's activation write (`_prepare_host_activation` in
+#: `ws/daemon.py`) stores when a host it had marked updating registers again on
+#: another build than the one offered. That is the only place this text is
+#: written, and it is written whether or not any update result arrived, so it
+#: is the one failure this task tries again. Any other text is a failure the
+#: daemon or the server reported, and stays for the owner.
+INTERRUPTED_UPDATE_ERROR = "restarted on the previous binary"
+#: How long the task must have seen a connection registered, without a break,
+#: before it tries an interrupted update again on it. Six minutes is longer
+#: than the daemon's own five-minute limit on a download (`DOWNLOAD_TIMEOUT` in
+#: `daemon/src/update.rs`), so the download of an earlier attempt on that
+#: machine has ended by then, and far longer than a sleeping laptop's brief
+#: wake. That limit covers the download only: the two manifest fetches before
+#: it have a five-minute request limit each. A retry that still finds an
+#: attempt running is refused by the daemon as busy, which is stored as that
+#: failure and not tried again.
+RETRY_AFTER_SECONDS = 6 * 60.0
+#: Retries per host per release. The count is kept in memory, so a server
+#: restart forgets it. That is acceptable: it is a backstop against a loop
+#: within one process's life (a machine interrupted every time, or a real
+#: failure whose report never arrives), a restart is rare and allows at most
+#: this many more, and each retry still needs six minutes on one connection
+#: and an answered ping.
+RETRIES_PER_RELEASE = 3
 
 #: What names one daemon release: its daemon tree and its release counter.
 #: Hosts compare trees; the counter tells a re-release of an older tree apart.
@@ -62,9 +99,11 @@ class DaemonReleaseOffers:
             read_active_release
         ),
         pause: Callable[[float], Awaitable[None]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._read_manifest = read_manifest
         self._pause = pause or self._wait
+        self._clock = clock
         self._stop = asyncio.Event()
         self._started = False
         self._current: ReleaseIdentity | None = None
@@ -74,6 +113,13 @@ class DaemonReleaseOffers:
         # current release because they were new when it was first seen.
         self._previous: set[str] = set()
         self._owed: set[str] = set()
+        # When each connection the last poll saw was first seen, and those
+        # already used for a retry. A connection is forgotten as soon as a poll
+        # no longer sees it, so one that drops and returns starts again.
+        self._first_seen: dict[str, float] = {}
+        self._retried: set[str] = set()
+        # Retries made per host and release, for the life of this process.
+        self._retries: dict[tuple[str, ReleaseIdentity], int] = {}
 
     @property
     def stopping(self) -> bool:
@@ -108,6 +154,7 @@ class DaemonReleaseOffers:
         # this task never runs inside that window.
         settled = [conn for conn_id, conn in connections.items() if conn_id in self._previous]
         self._previous = set(connections)
+        self._track(connections)
         if not self._started:
             # Startup: registration offers to every daemon from here on.
             self._started = True
@@ -122,6 +169,10 @@ class DaemonReleaseOffers:
             self._owed.clear()
             if owed:
                 await self._offer_pass(owed, manifest)
+                return
+            # Only on a poll that made no release pass, so a retry never runs
+            # beside one, and a whole poll interval follows that pass's offers.
+            await self._retry_pass(list(connections.values()), manifest, identity)
             return
         self._owed.clear()
         already = identity in self._seen or self._older(identity)
@@ -131,6 +182,13 @@ class DaemonReleaseOffers:
             return
         self._owed = set(connections) - {conn.id for conn in settled}
         await self._offer_pass(settled, manifest)
+
+    def _track(self, connection_ids: Iterable[str]) -> None:
+        now = self._clock()
+        self._first_seen = {
+            conn_id: self._first_seen.get(conn_id, now) for conn_id in connection_ids
+        }
+        self._retried.intersection_update(self._first_seen)
 
     def _remember(self, identity: ReleaseIdentity) -> None:
         self._current = identity
@@ -218,7 +276,8 @@ class DaemonReleaseOffers:
         answer, within `PING_LIMIT_SECONDS` for the whole ping, is offered
         nothing and its host is not written; its next registration offers the
         release instead. This does not cover a daemon that answers and then
-        loses its machine or network during the download (issue #170).
+        loses its machine or network during the download; `_retry_pass` is
+        for that case (issue #170).
         """
         broker = get_broker()
         try:
@@ -229,3 +288,153 @@ class DaemonReleaseOffers:
         if not answered:
             return False
         return broker.get_daemon_for_host(conn.host_id) is conn
+
+    async def _retry_pass(
+        self,
+        connections: list[DaemonConn],
+        manifest: schemas.DaemonReleaseOut,
+        identity: ReleaseIdentity,
+    ) -> None:
+        """Try again an update that registration recorded as interrupted.
+
+        Only on a connection seen for `RETRY_AFTER_SECONDS` without a break,
+        once per connection (whatever the outcome, from the ping on), and at
+        most `RETRIES_PER_RELEASE` times per host and release. One host at a
+        time, with the release pass's gap between two hosts pinged.
+        """
+        now = self._clock()
+        attempted = 0
+        for conn in connections:
+            if self.stopping:
+                break
+            first_seen = self._first_seen.get(conn.id)
+            if (
+                conn.id in self._retried
+                or first_seen is None
+                or now - first_seen < RETRY_AFTER_SECONDS
+                or self._retries.get((conn.host_id, identity), 0) >= RETRIES_PER_RELEASE
+            ):
+                continue
+            try:
+                daemon_tree = await self._interrupted(conn, manifest)
+                if daemon_tree is None:
+                    continue
+                if attempted:
+                    await self._pause(OFFER_GAP_SECONDS)
+                    if self.stopping:
+                        break
+                    daemon_tree = await self._interrupted(conn, manifest)
+                    if daemon_tree is None:
+                        continue
+                attempted += 1
+                self._retried.add(conn.id)
+                await self._retry(conn, manifest, identity, daemon_tree)
+            except Exception as exc:
+                log.error("daemon update retry for one host failed: %s", type(exc).__name__)
+
+    async def _retry(
+        self,
+        conn: DaemonConn,
+        manifest: schemas.DaemonReleaseOut,
+        identity: ReleaseIdentity,
+        daemon_tree: str,
+    ) -> None:
+        if not await self._answers(conn):
+            log.info("daemon update retry: no answer to the ping; nothing written")
+            return
+        if self.stopping:
+            return
+        if not await self._clear_interrupted(conn, manifest, daemon_tree):
+            log.info("daemon update retry: the host changed first; nothing written")
+            return
+        key = (conn.host_id, identity)
+        count = self._retries[key] = self._retries.get(key, 0) + 1
+        if get_broker().get_daemon_for_host(conn.host_id) is not conn:
+            # Replaced since the write. The host now reads as available, so the
+            # replacement's registration makes the offer.
+            log.info(
+                "daemon update retry %d of %d: failure cleared; the daemon reconnected, "
+                "so its registration makes the offer",
+                count,
+                RETRIES_PER_RELEASE,
+            )
+            return
+        log.info(
+            "daemon update retry %d of %d: failure cleared; handed to the offer function",
+            count,
+            RETRIES_PER_RELEASE,
+        )
+        await daemon_ws._auto_update_after_registration(conn)
+
+    async def _interrupted(
+        self, conn: DaemonConn, manifest: schemas.DaemonReleaseOut
+    ) -> str | None:
+        """The daemon tree of this connection's host, if it may be retried now.
+
+        That is a host whose update to the active release registration
+        recorded as interrupted on this very connection, that is still behind
+        the release, can update itself and has no mismatched worker pair, with
+        automatic updates on. Read in a short session of its own, as `_due`.
+        """
+        broker = get_broker()
+        if broker.get_daemon_for_host(conn.host_id) is not conn:
+            return None
+        if not get_settings().daemon_auto_update:
+            return None
+        async with get_sessionmaker()() as session:
+            host = await session.get(Host, conn.host_id)
+        if host is None or not _interrupted_on(host, conn, manifest):
+            return None
+        if broker.get_daemon_for_host(conn.host_id) is not conn:
+            return None
+        return host.daemon_tree
+
+    async def _clear_interrupted(
+        self, conn: DaemonConn, manifest: schemas.DaemonReleaseOut, daemon_tree: str
+    ) -> bool:
+        """Clear the interrupted failure if the row still holds exactly what was read.
+
+        One conditional write: a registration since the read (a new
+        connection), the owner's Try again (updating) or a reported failure
+        (another text) makes it match nothing, and nothing is written. Only
+        the state and its text are cleared, so the host reads as available;
+        the attempted tree is kept, so a failure reported after this write
+        still reads as failed for this release and the offer function leaves
+        it alone.
+        """
+        async with get_sessionmaker()() as session:
+            result = await session.execute(
+                update(Host)
+                .where(
+                    Host.id == conn.host_id,
+                    Host.daemon_connection_id == conn.id,
+                    Host.daemon_generation == conn.host_generation,
+                    Host.daemon_tree == daemon_tree,
+                    Host.self_update.is_(True),
+                    Host.worker_mismatch.is_(False),
+                    Host.update_state == "failed",
+                    Host.update_error == INTERRUPTED_UPDATE_ERROR,
+                    Host.update_tree == manifest.tree,
+                )
+                .values(update_state=None, update_error=None)
+            )
+            if result.rowcount != 1:
+                await session.rollback()
+                return False
+            await session.commit()
+            return True
+
+
+def _interrupted_on(host: Host, conn: DaemonConn, manifest: schemas.DaemonReleaseOut) -> bool:
+    return (
+        host.daemon_connection_id == conn.id
+        and host.daemon_generation == conn.host_generation
+        and host.update_state == "failed"
+        and host.update_error == INTERRUPTED_UPDATE_ERROR
+        and host.update_tree == manifest.tree
+        and host.self_update is True
+        and host.worker_mismatch is False
+        # Failed for this release, which also means a daemon that reports a
+        # clean tree other than the release's: behind it, not current.
+        and release.host_update_state(host, manifest).state == "failed"
+    )

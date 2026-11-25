@@ -427,20 +427,30 @@ skip a host that is already on the release, cannot update itself, or failed to
 update to this release. The second way also skips a host that is updating.
 Registration does not: when a host the server marked updating registers again
 on its old build, registration records that update as failed, "restarted on the
-previous binary", whether or not any update result arrived. A release that has
-failed for a host is not offered to it again until its owner chooses Try again
-or a newer release is published. The ping covers only an offer sent into a
-connection that is already dead. A daemon that answers and whose machine then
-sleeps or loses its network during the download ends the same way, with or
-without the second way (issue #170). Registration's repair of a mismatched
-worker pair is the exception to the skips: it is offered whatever the host's
-update state. The second way also leaves a host with a mismatched worker pair
-to registration, which repairs it. It offers nothing while the manifest is
-unreadable, and never offers a release it has already seen or one with a lower
-counter than one it has seen.
+previous binary", whether or not any update result arrived. That is how an
+update ends when the machine sleeps or loses its network during the download;
+the ping covers only an offer sent into a connection that is already dead. The
+second way tries such an interrupted update again (issue #170): once the
+daemon's connection has stayed registered for six minutes, longer than the
+daemon's own five-minute download limit, it pings the daemon and, if the host's
+row is still exactly as it read it, clears that failure and makes the same
+offer. It does this once per connection and at most three times per host and
+release while the server runs, one host at a time, and never during a release
+pass. Until then the owner's SPAWN D apps show the update as failed; then as
+updating, and as current once the new build registers. Any other failure for a
+release, such as a verify error or a health revert that the daemon reported in
+its own words, and an interrupted update that has used its three retries, are
+not offered to the host again until its owner chooses Try again or a newer
+release is published. Registration's repair of a mismatched worker pair is the
+exception to the skips: it is offered whatever the host's update state. The
+second way also leaves a host with a mismatched worker pair to registration,
+which repairs it, and never retries one. It offers nothing while the manifest
+is unreadable, and makes no pass for a release it has already seen or one with
+a lower counter than one it has seen; a retry only repeats, for the active
+release, an offer already made to that host.
 `SPAWN_DAEMON_AUTO_UPDATE=false` stops both ways, except that repair.
-`SPAWN_DAEMON_RELEASE_OFFERS=false` stops only the second. `server/CLAUDE.md`
-("Daemon release offers") has the details.
+`SPAWN_DAEMON_RELEASE_OFFERS=false` stops only the second, its retries
+included. `server/CLAUDE.md` ("Daemon release offers") has the details.
 
 ### Proving the updater
 
