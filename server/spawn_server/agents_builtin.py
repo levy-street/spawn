@@ -81,6 +81,19 @@ BUILTIN_AGENTS: list[dict] = [
         "yolo_args": "--yolo",
         "yolo_env": {},
     },
+    {
+        # Google's Antigravity CLI, Gemini CLI's successor. The vendor script
+        # installs one native binary at `~/.local/bin/agy`; plain `agy` is an
+        # interactive session. Sign-in is its own, on the host, as for every
+        # agent here.
+        "name": "antigravity",
+        "kind": "antigravity",
+        "command": "agy",
+        "env": {},
+        "install": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        "yolo_args": "--dangerously-skip-permissions",
+        "yolo_env": {},
+    },
 ]
 
 

@@ -34,6 +34,12 @@ const AGENT_PLATES = {
     foreground: "#000000",
     ring: "rgba(0,0,0,0.10)",
   },
+  // Google draws the Antigravity arch on white in both themes.
+  antigravity: {
+    background: "#FFFFFF",
+    foreground: "#3186FF",
+    ring: "rgba(0,0,0,0.10)",
+  },
   shell: {
     background: "#1C2128",
     foreground: "#7EE787",
@@ -95,6 +101,8 @@ export function AgentIcon({ identity, size }: AgentIconProps) {
         // tile rather than at glyph scale — the face has to stay legible in a
         // session row.
         <HermesMark color={plate.foreground} size={Math.round(resolvedSize * 0.86)} />
+      ) : identity.logoKey === "antigravity" ? (
+        <AntigravityMark size={glyphSize} />
       ) : (
         <ShellMark color={plate.foreground} size={glyphSize} />
       )}
@@ -149,6 +157,47 @@ function CodexMark({ size }: { size: number }) {
         fill={`url(#${gradientId})`}
         testID="agent-mark-codex"
       />
+    </Svg>
+  );
+}
+
+/** The Antigravity arch. Google paints it with soft blurred blooms — green and
+ * yellow into red across the crown, blue down the legs — which two gradients
+ * approximate closely enough to read at row sizes; the web app draws the same. */
+const ANTIGRAVITY_ARCH =
+  "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z";
+
+function AntigravityMark({ size }: { size: number }) {
+  const id = `antigravity-${useId().replaceAll(":", "_")}`;
+  return (
+    <Svg height={size} viewBox="0 0 24 24" width={size}>
+      <Defs>
+        <LinearGradient
+          gradientUnits="userSpaceOnUse"
+          id={`${id}-crown`}
+          x1="7"
+          x2="17"
+          y1="10"
+          y2="3"
+        >
+          <Stop offset="0" stopColor="#00B95C" />
+          <Stop offset="0.5" stopColor="#FBBC04" />
+          <Stop offset="1" stopColor="#FC413D" />
+        </LinearGradient>
+        <LinearGradient
+          gradientUnits="userSpaceOnUse"
+          id={`${id}-legs`}
+          x1="12"
+          x2="12"
+          y1="4"
+          y2="14"
+        >
+          <Stop offset="0" stopColor="#3186FF" stopOpacity="0" />
+          <Stop offset="1" stopColor="#3186FF" />
+        </LinearGradient>
+      </Defs>
+      <Path d={ANTIGRAVITY_ARCH} fill={`url(#${id}-crown)`} testID="agent-mark-antigravity" />
+      <Path d={ANTIGRAVITY_ARCH} fill={`url(#${id}-legs)`} />
     </Svg>
   );
 }

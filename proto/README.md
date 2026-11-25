@@ -349,6 +349,7 @@ Built-in agents (server-seeded, idempotent, `owner_user_id = null`):
 - **opencode** — command `opencode`, install `npm install -g opencode-ai`, yolo `OPENCODE_PERMISSION` (it has no flag; permissions are configuration)
 - **aider-sonnet** — command `aider --model claude-sonnet-4-6`, install `pipx install aider-chat || pip install --user aider-chat`, yolo `--yes-always`
 - **hermes** — command `hermes`, install `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`, yolo `--yolo`
+- **antigravity** — Google's Antigravity CLI: command `agy`, install `curl -fsSL https://antigravity.google/cli/install.sh | bash`, yolo `--dangerously-skip-permissions`
 
 There is no `shell` built-in: sessions *are* shells.
 
@@ -359,6 +360,17 @@ carrying that name is an unofficial third-party bridge, and pointing a
 built-in at one would be a supply-chain decision, not a version check. It does
 get the daemon's self-updater (`hermes update --yes`), the same treatment as
 `claude-code`.
+
+`antigravity` installs from a vendor script too — one native binary, no
+registry package — so the tools panel shows its installed `agy --version`
+with no "latest". It names its own conversations and cannot be started under
+an id a client chose, so it is launched plainly, and no host names the
+conversation of its window yet (`conv.inspect` answers for `claude-code` and
+`codex` only): a restart types `agy --continue`, the newest conversation in
+the window's folder, as Claude Code does when it has no id, and never reads
+the window's recorded id. `agy --conversation <id>` is how one would be
+resumed by name once a host can name it; that needs a daemon change.
+`agent.transcripts` answers `supported: false` for it, as for `opencode`.
 
 > spawn does not manage agent-CLI provider credentials. Each agent CLI handles
 > its own login interactively on the host (e.g. `claude /login` writes

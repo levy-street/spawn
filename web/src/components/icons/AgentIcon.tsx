@@ -7,7 +7,8 @@ import { cn } from "@/lib/utils";
 /**
  * Agent identity icon: maps an agent definition `kind` (preferred) or a
  * running `command` to a bundled brand mark — Claude Code, Codex, OpenCode,
- * Aider, Hermes Agent — a terminal glyph for shells, or a monogram fallback.
+ * Aider, Hermes Agent, Antigravity CLI — a terminal glyph for shells, or a
+ * monogram fallback.
  * Used by the sidebar session rows, pane headers, and the shortcut bar.
  *
  * Successor to `components/agents/AgentKindIcon.tsx`, which dies with the
@@ -31,6 +32,8 @@ const PLATE_CLASS: Record<ResolvedAgentIcon["icon"], string> = {
   aider: "bg-[#10231b] text-[#3fcf8e] ring-white/10",
   // Hermes ships the Nous girl on a white tile, identical in light/dark.
   hermes: "bg-white text-black ring-black/10",
+  // Google draws the Antigravity arch on white in both themes.
+  antigravity: "bg-white ring-black/10",
   shell: "bg-[#1c2128] text-[#7ee787] ring-white/10",
   monogram: "bg-muted text-muted-foreground ring-border",
 };
@@ -74,6 +77,8 @@ export function AgentIcon({
         // The mascot is the mark: render it near full-bleed like the Codex
         // tile so the face stays legible at row sizes.
         <HermesMark size={Math.round(size * 0.86)} />
+      ) : resolved.icon === "antigravity" ? (
+        <AntigravityMark size={glyphSize} />
       ) : resolved.icon === "shell" ? (
         <ShellMark size={glyphSize} />
       ) : (
@@ -128,6 +133,48 @@ function CodexMark({ size }: { size: number }) {
           <stop offset="1" stopColor="#3941FF" />
         </linearGradient>
       </defs>
+    </svg>
+  );
+}
+
+/** The Antigravity arch. Google paints it with soft blurred blooms — green and
+ * yellow into red across the crown, blue down the legs — which two gradients
+ * approximate closely enough to read at row sizes, and which the mobile app's
+ * SVG renderer can draw the same way. */
+const ANTIGRAVITY_ARCH =
+  "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z";
+
+function AntigravityMark({ size }: { size: number }) {
+  const id = useId().replaceAll(":", "_");
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient
+          id={`${id}-crown`}
+          x1="7"
+          x2="17"
+          y1="10"
+          y2="3"
+          gradientUnits="userSpaceOnUse"
+        >
+          <stop stopColor="#00B95C" />
+          <stop offset=".5" stopColor="#FBBC04" />
+          <stop offset="1" stopColor="#FC413D" />
+        </linearGradient>
+        <linearGradient
+          id={`${id}-legs`}
+          x1="12"
+          x2="12"
+          y1="4"
+          y2="14"
+          gradientUnits="userSpaceOnUse"
+        >
+          <stop stopColor="#3186FF" stopOpacity="0" />
+          <stop offset="1" stopColor="#3186FF" />
+        </linearGradient>
+      </defs>
+      <path d={ANTIGRAVITY_ARCH} fill={`url(#${id}-crown)`} />
+      <path d={ANTIGRAVITY_ARCH} fill={`url(#${id}-legs)`} />
     </svg>
   );
 }

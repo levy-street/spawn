@@ -30,7 +30,15 @@ export function stripExecutableSuffix(name: string): string {
 }
 
 export type ResolvedAgentIcon = {
-  icon: "claude-code" | "codex" | "opencode" | "aider" | "hermes" | "shell" | "monogram";
+  icon:
+    | "claude-code"
+    | "codex"
+    | "opencode"
+    | "aider"
+    | "hermes"
+    | "antigravity"
+    | "shell"
+    | "monogram";
   /** Tooltip / accessible name: brand name, shell name, or the raw input. */
   label: string;
   /** Monogram letter (only for `icon: "monogram"`). */
@@ -53,6 +61,11 @@ function matchName(name: string): ResolvedAgentIcon | null {
   if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
   if (lower.includes("aider")) return { icon: "aider", label: "Aider" };
   if (lower.includes("hermes")) return { icon: "hermes", label: "Hermes Agent" };
+  // Google's Antigravity CLI runs as `agy` — three letters too few to look
+  // for inside other names, so only the executable itself is matched.
+  if (lower.includes("antigravity") || lower === "agy") {
+    return { icon: "antigravity", label: "Antigravity CLI" };
+  }
   if (SHELL_COMMANDS.has(lower)) return { icon: "shell", label: lower };
   return null;
 }
