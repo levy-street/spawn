@@ -409,6 +409,39 @@ protection is the one guarantee the counter exists to give, so it is not the
 server's to waive. Use the override only when the older signed release is the
 intended recovery; it does not permit unsigned updates.
 
+**How a daemon hears of a release.** The server offers the active daemon
+release in two ways. A daemon that registers is offered it straight away. A
+daemon that is already connected is offered a release within about 15 seconds
+of that release becoming active, longer when the first read of a new release
+hashes its binaries, and then in turn: about two seconds for each host offered
+before it, and up to about five seconds for each host before it that is due but
+does not answer (the gap and the ping). The server reads the active manifest
+every 15 seconds, and when the release changes it pings each connected daemon
+that is behind and makes the same offer to each one that answers within two
+seconds, one host at a time with two seconds between offers. A daemon that does
+not answer is offered nothing, nothing is recorded for it, and its next
+registration offers the release. The second way exists because a deploy
+restarts the server before it activates the new prebuilt snapshot, so every
+daemon registers again while the previous release is still active. Both ways
+skip a host that is already on the release, cannot update itself, or failed to
+update to this release. The second way also skips a host that is updating.
+Registration does not: when a host the server marked updating registers again
+on its old build, registration records that update as failed, "restarted on the
+previous binary", whether or not any update result arrived. A release that has
+failed for a host is not offered to it again until its owner chooses Try again
+or a newer release is published. The ping covers only an offer sent into a
+connection that is already dead. A daemon that answers and whose machine then
+sleeps or loses its network during the download ends the same way, with or
+without the second way (issue #170). Registration's repair of a mismatched
+worker pair is the exception to the skips: it is offered whatever the host's
+update state. The second way also leaves a host with a mismatched worker pair
+to registration, which repairs it. It offers nothing while the manifest is
+unreadable, and never offers a release it has already seen or one with a lower
+counter than one it has seen.
+`SPAWN_DAEMON_AUTO_UPDATE=false` stops both ways, except that repair.
+`SPAWN_DAEMON_RELEASE_OFFERS=false` stops only the second. `server/CLAUDE.md`
+("Daemon release offers") has the details.
+
 ### Proving the updater
 
 The repeatable local updater proof has three CI scripts, all run by
@@ -745,6 +778,15 @@ generations and abandoned stages are retained for recovery; this script does
 not garbage-collect them. Rollback must select a complete compatible generation,
 not copy individual binaries across generations.
 
+Connected daemons are offered a release within about 15 seconds of it becoming
+active ("How a daemon hears of a release"), which can be before the deploy has
+finished checking the public manifest. So if that check fails, connected hosts
+may already have tried the update and recorded a failure for that release, and
+the server does not offer it to them again by itself. After the fault is
+fixed, their owners can retry with Try again in the host's update dialog;
+other hosts get the release at their next registration. Restoring an older release makes the
+server offer connected daemons nothing, because its counter is lower.
+
 It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
 once rather than rediscovering during an incident.
 
@@ -843,7 +885,12 @@ And it checks its own work:
   rollback command. (`scripts/health-check.sh` on the host's timer walks the
   same paths between deploys.)
 - after prebuilt publication, `/api/release` must report the new full server
-  commit and the new daemon tree; this proves the manifest became live
+  commit and the new daemon tree; this proves the manifest became live. The
+  daemons that registered again after the restart, while the previous release
+  was still active, are offered the new one within about 15 seconds of it
+  becoming active (longer while its binaries are first hashed), then about two
+  seconds per host offered and up to about five per host that is due but does
+  not answer ("How a daemon hears of a release")
 
 The daemon gate compares the target tree to the manifest currently on the host
 before any production mutation. `SPAWN_DEPLOY_PREBUILTS=0` is the explicit

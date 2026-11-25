@@ -560,6 +560,10 @@ class Broker:
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)
 
+    def daemons(self) -> list[DaemonConn]:
+        """Every routable daemon connection at this moment, one per host."""
+        return list(self._daemons_by_host.values())
+
     def support_daemons(self) -> list[DaemonConn]:
         return [
             conn for conn in self._daemons_by_host.values()

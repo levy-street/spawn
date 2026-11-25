@@ -168,6 +168,10 @@ class Settings(BaseSettings):
     # Off by default. A private absolute directory outside the checkout.
     support_log_dir: str | None = None
     daemon_auto_update: bool = True
+    # On by default. Offers a daemon release that becomes active while daemons
+    # are connected, instead of at each one's next registration
+    # (daemon_release_offers.py). Off: only registration offers a release.
+    daemon_release_offers: bool = True
     prebuilt_dir: Path = Field(
         default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"
     )

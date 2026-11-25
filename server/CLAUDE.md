@@ -31,6 +31,7 @@ spawn_server/
   support_log_types.py     exact unsigned timestamps on SQLite and PostgreSQL
   support_log_files.py     private atomic disk writes and file presence checks
   support_log_retention.py bounded sweeps, withdrawal and account deletion cleanup
+  daemon_release_offers.py offers a newly active daemon release to connected daemons
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
                 web_push, release, invites, limits, rate_limit, trust_events,
                 data_events, host_status, …
@@ -79,6 +80,73 @@ authorization and durable-state requirements for their replacement.
   host-v1 and session-v2 routes remain supported. The daemon advertises
   `supports_device_connections`; an old daemon must produce an explicit update
   refusal. Session channel attachment never becomes a server signaling route.
+
+## Daemon release offers
+
+Registration offers the active daemon release to each daemon that registers
+(`_auto_update_after_registration` in `ws/daemon.py`). A deploy restarts the
+server before it switches the prebuilt `current` pointer, so every daemon
+registers again while the previous release is still active. Without a second
+path, a connected daemon would get each release one registration late, which
+usually means at the next deploy.
+
+`daemon_release_offers.py` is that second path. It is one lifespan task,
+started and stopped like the support log pump. Every 15 seconds it reads the
+active manifest in a worker thread, because the first read of a new release
+hashes every binary the manifest lists. The tree and the release counter name
+a release. At startup the task records the active release and offers nothing.
+When the release changes, it calls the registration's own offer function for
+each connected daemon, one host at a time, with two seconds between offers. It
+calls it only for hosts that function would give an ordinary update: automatic
+updates on, the host behind the release, self-update available, not already
+updating, and not failed for this release. A host whose worker pair is
+mismatched is left to registration. Registration repairs such a host whatever
+its update state and whatever the automatic-update setting, and a second offer
+while the first is running would be refused by the daemon as busy and stored as
+a failure for the new release. A host marked updating is left alone however
+long ago the update began. That function stops counting an update as running
+after three minutes, but a daemon still busy with it would refuse the new
+release, which would then be stored as failed. Registration settles the mark
+when the host next connects.
+
+Just before each offer the task pings the daemon (`request_host_ping`, two
+seconds for the answer, under one three-second limit for the whole ping, its
+send included, since the broker's limit covers only the answer and a stuck
+socket would otherwise hold the pass). A send into a connection that is already
+dead can still succeed, and the release would then be stored as failed for that
+host when it came back on its old build. So a daemon that does not answer in
+time, or whose ping fails, is offered nothing and its host row is not written;
+its next registration offers the release. Every daemon that can update itself
+answers pings. The ping covers only that dead connection. A daemon that answers
+and whose machine then sleeps or loses its network during the download ends
+the same way, with or without this task: when it registers again on its old
+build, registration's activation write records the update as failed
+("restarted on the previous binary"), whether or not any update result
+arrived, and that release is not offered to the host again until its owner
+chooses Try again or a newer release is published. Issue #170 is about that
+case.
+
+Nothing is offered while the manifest is unreadable or missing. Nothing is
+offered when the release changes to one the task has already seen, or to one
+whose counter is lower than any it has seen. The daemon refuses a downgrade as
+well.
+
+Registration's offer reads the host, then writes it, then sends. Two callers
+inside that window could both send. So the task offers only to a connection the
+previous poll already saw. A connection that became routable since then is
+checked on the next poll, by which time its registration has normally recorded
+its own offer. Only a registration still inside its own offer a whole poll
+after its connection became routable could still race the task.
+The task holds no database transaction across a send and takes no lock of its
+own. Stopping the server stops it between hosts; shutdown waits for the ping,
+offer or manifest read in progress. Each pass logs one INFO line
+with the number of connections considered and of hosts handed to the offer
+function, which does not report whether it sent, and no host identifiers.
+
+`SPAWN_DAEMON_RELEASE_OFFERS=false` means the task is never started, and only
+registration offers a release. `SPAWN_DAEMON_AUTO_UPDATE=false` stops the task
+from offering anything, and stops registration's offers except its repair of a
+mismatched worker pair.
 
 ## Support log delivery and storage
 

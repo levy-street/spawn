@@ -15,6 +15,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import auth
 from .agents_builtin import seed_builtin_agents
 from .config import get_settings
+from .daemon_release_offers import DaemonReleaseOffers
 from .data_events import DataEventMiddleware
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .redis import lifespan_shutdown as redis_shutdown
@@ -118,9 +119,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         support_sweeps = start_sweeps(store)
         pump = app.state.support_log_pump = SupportLogPump()
         pump_task = asyncio.create_task(pump.run(), name="support-log-dispatch")
+    release_offers = None
+    if settings.daemon_release_offers:
+        release_offers = app.state.daemon_release_offers = DaemonReleaseOffers()
+        release_offers_task = asyncio.create_task(
+            release_offers.run(), name="daemon-release-offers"
+        )
     try:
         yield
     finally:
+        if release_offers is not None:
+            del app.state.daemon_release_offers
+            release_offers.stop()
+            await release_offers_task
         if store is not None:
             del app.state.support_log_pump
             pump.stop()
