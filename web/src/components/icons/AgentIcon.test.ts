@@ -8,6 +8,7 @@ describe("resolveAgentIcon", () => {
     expect(resolveAgentIcon("opencode").icon).toBe("opencode");
     expect(resolveAgentIcon("aider-sonnet").icon).toBe("aider");
     expect(resolveAgentIcon("hermes").icon).toBe("hermes");
+    expect(resolveAgentIcon("antigravity").icon).toBe("antigravity");
   });
 
   test("kind wins over command", () => {
@@ -18,6 +19,13 @@ describe("resolveAgentIcon", () => {
     expect(resolveAgentIcon(undefined, "/usr/local/bin/claude").icon).toBe("claude-code");
     expect(resolveAgentIcon(null, "aider --model sonnet").icon).toBe("aider");
     expect(resolveAgentIcon(null, "hermes --yolo").icon).toBe("hermes");
+    expect(resolveAgentIcon(null, "/home/me/.local/bin/agy --continue").icon).toBe("antigravity");
+  });
+
+  test("agy is matched as a whole executable name, never inside another", () => {
+    expect(resolveAgentIcon(undefined, "agy.exe").icon).toBe("antigravity");
+    expect(resolveAgentIcon(undefined, "stagy").icon).toBe("monogram");
+    expect(resolveAgentIcon("agyle").icon).toBe("monogram");
   });
 
   test("skips env-prefix tokens in commands", () => {
@@ -57,6 +65,7 @@ describe("agentDisplayName", () => {
     expect(agentDisplayName("claude")).toBe("Claude Code");
     expect(agentDisplayName("/usr/local/bin/codex")).toBe("Codex");
     expect(agentDisplayName("hermes")).toBe("Hermes Agent");
+    expect(agentDisplayName("agy")).toBe("Antigravity CLI");
   });
 
   test("nothing running reads as a shell", () => {

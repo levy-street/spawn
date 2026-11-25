@@ -24,6 +24,12 @@ const IDENTITIES: readonly AgentIdentity[] = [
   },
   { kind: "aider", displayName: "Aider Sonnet", logoKey: "aider", monogramSeed: "Aider" },
   { kind: "hermes", displayName: "Hermes Agent", logoKey: "hermes", monogramSeed: "Hermes" },
+  {
+    kind: "antigravity",
+    displayName: "Antigravity CLI",
+    logoKey: "antigravity",
+    monogramSeed: "Antigravity CLI",
+  },
   { kind: "shell", displayName: "Shell", logoKey: "shell", monogramSeed: "Shell" },
 ];
 
@@ -33,6 +39,7 @@ const PLATES: Record<AgentLogoKey, { backgroundColor: string; borderColor: strin
   opencode: { backgroundColor: "#000000", borderColor: "rgba(255,255,255,0.20)" },
   aider: { backgroundColor: "#10231B", borderColor: "rgba(255,255,255,0.10)" },
   hermes: { backgroundColor: "#FFFFFF", borderColor: "rgba(0,0,0,0.10)" },
+  antigravity: { backgroundColor: "#FFFFFF", borderColor: "rgba(0,0,0,0.10)" },
   shell: { backgroundColor: "#1C2128", borderColor: "rgba(255,255,255,0.10)" },
 };
 
@@ -66,7 +73,7 @@ describe("spawnd brand artwork", () => {
 });
 
 describe("agent brand plates", () => {
-  test("renders distinct fixed artwork for all six known identities", async () => {
+  test("renders distinct fixed artwork for all seven known identities", async () => {
     await render(
       <ThemeProvider>
         <View>
@@ -105,6 +112,34 @@ describe("agent brand plates", () => {
       nativeGradientColor("#3941FF"),
     ]);
     expect(screen.getByTestId("codex-plate")).toHaveProp("fill", svgBrush("#FFFFFF"));
+  });
+
+  test("paints the Antigravity arch with the same two fixed gradients as the web", async () => {
+    const antigravity = IDENTITIES.find((identity) => identity.logoKey === "antigravity");
+    if (!antigravity) throw new Error("Antigravity fixture missing");
+    const view = await render(
+      <ThemeProvider>
+        <AgentIcon identity={antigravity} />
+      </ThemeProvider>,
+    );
+
+    const [crown, legs] = view.container.queryAll((node) => node.type === "RNSVGLinearGradient");
+    if (!crown || !legs) throw new Error("Antigravity gradients missing");
+    expect(crown).toHaveProp("gradient", [
+      0,
+      nativeGradientColor("#00B95C"),
+      0.5,
+      nativeGradientColor("#FBBC04"),
+      1,
+      nativeGradientColor("#FC413D"),
+    ]);
+    // The legs fade in from clear, so the crown shows through above them.
+    expect(legs).toHaveProp("gradient", [
+      0,
+      nativeGradientColor("#3186FF") & 0x00ffffff,
+      1,
+      nativeGradientColor("#3186FF"),
+    ]);
   });
 
   test("falls back to a neutral monogram for an unknown identity", async () => {

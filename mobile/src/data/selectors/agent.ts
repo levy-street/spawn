@@ -19,7 +19,14 @@ interface Brand {
   logoKey: AgentLogoKey;
 }
 
-const BRANDS: Array<{ needle: string; brand: Brand }> = [
+const ANTIGRAVITY: Brand = {
+  kind: "antigravity",
+  displayName: "Antigravity CLI",
+  logoKey: "antigravity",
+};
+
+/** `exact` names match only the whole name, not as part of another. */
+const BRANDS: Array<{ needle: string; exact?: boolean; brand: Brand }> = [
   {
     needle: "claude",
     brand: { kind: "claude-code", displayName: "Claude Code", logoKey: "claude-code" },
@@ -28,6 +35,10 @@ const BRANDS: Array<{ needle: string; brand: Brand }> = [
   { needle: "opencode", brand: { kind: "opencode", displayName: "OpenCode", logoKey: "opencode" } },
   { needle: "aider", brand: { kind: "aider", displayName: "Aider Sonnet", logoKey: "aider" } },
   { needle: "hermes", brand: { kind: "hermes", displayName: "Hermes Agent", logoKey: "hermes" } },
+  { needle: "antigravity", brand: ANTIGRAVITY },
+  // Google's Antigravity CLI runs as `agy` — three letters too few to look
+  // for inside other names.
+  { needle: "agy", exact: true, brand: ANTIGRAVITY },
 ];
 
 export function commandBasename(command: string | null | undefined): string | null {
@@ -82,8 +93,12 @@ export function sessionAgent(
 }
 
 function brandFor(value: string | null | undefined): Brand | null {
-  const normalized = value?.toLowerCase() ?? "";
-  return BRANDS.find(({ needle }) => normalized.includes(needle))?.brand ?? null;
+  const normalized = value?.toLowerCase().replace(WINDOWS_EXECUTABLE_SUFFIX, "") ?? "";
+  return (
+    BRANDS.find(({ needle, exact }) =>
+      exact ? normalized === needle : normalized.includes(needle),
+    )?.brand ?? null
+  );
 }
 
 export function identifyAgent(
@@ -235,9 +250,9 @@ export interface AgentConversationGrammar {
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
-  /** Flags for a window whose conversation cannot be named: Claude Code
-   *  continues the folder's latest; Codex opens its own picker. Null when the
-   *  CLI has neither. */
+  /** Flags for a window whose conversation cannot be named: Claude Code and
+   *  Antigravity CLI continue the folder's latest; Codex opens its own picker.
+   *  Null when the CLI has neither. */
   withoutId: string | null;
 }
 
@@ -260,6 +275,17 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
     launch: null,
     resume: (id) => `resume ${id}`,
     withoutId: "resume",
+  },
+  // Antigravity CLI (`agy`) names its own conversations too, and no host names
+  // one for its window yet (`conv.inspect` answers for Claude Code and Codex
+  // only), so a restart takes `--continue`, as Claude Code does without an id:
+  // the newest conversation in the folder the window starts in. A restart
+  // never reads a recorded id for it; `--conversation <id>` is there for the
+  // day a host can name one. The web app spells the same grammar.
+  antigravity: {
+    launch: null,
+    resume: (id) => `--conversation ${id}`,
+    withoutId: "--continue",
   },
 };
 
