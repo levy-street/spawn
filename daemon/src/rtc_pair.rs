@@ -35,14 +35,15 @@ const REFUSAL_OPEN_DEADLINE: Duration = Duration::from_secs(5);
 const REFUSAL_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 /// The least time between two warnings of one reason on one connection.
 const WHOLESALE_REFUSAL_WARNING_WINDOW: Duration = Duration::from_secs(60);
-/// How long a connection's pending bound may stay full before a refusal for
-/// it retires the connection (`BoundWatch`).
+/// How long after a refusal first finds a connection's pending bound full a
+/// later refusal for the full bound retires the connection, if the count has
+/// not fallen to `PENDING_BOUND_DRAINED` in between (`BoundWatch`).
 const PENDING_BOUND_FULL_LIMIT: Duration = Duration::from_secs(30);
 /// At or below this many pending channels the bound has drained: the clock
 /// a full bound started is cleared.
 const PENDING_BOUND_DRAINED: usize = MAX_PAIR_PENDING_CHANNELS / 2;
-/// Why a connection whose pending bound stayed full was retired: the
-/// server hears it with `unavailable`, and the warning says it.
+/// Why a connection was retired for its full pending bound (`BoundWatch`):
+/// the server hears it with `unavailable`, and the warning says it.
 const PENDING_BOUND_STAYED_FULL: &str = "pending bound stayed full";
 
 /// Why a channel was refused for its connection's sake, not its own: every
@@ -114,21 +115,28 @@ pub(super) struct PairContext {
     bound_watch: BoundWatch,
 }
 
-/// Whether a connection's pending bound has stayed full, and where the
-/// slots it holds wait. On a working connection a handful of channels are
-/// pending for milliseconds. One whose bound stays full refuses every
-/// channel the device opens, and the device takes a refusal for an answer
-/// and retries on the same connection for ever; such a connection is
+/// Whether a connection's pending bound has stayed full, in the sense below,
+/// and where the slots it holds wait. On a working connection a handful of
+/// channels are pending for milliseconds. One whose bound stays full refuses
+/// every channel the device opens, and the device takes a refusal for an
+/// answer and retries on the same connection for ever; such a connection is
 /// retired, as one whose acceptor ended is, and the device builds a new one.
 ///
-/// The clock starts at the first refusal for the full bound and is cleared
-/// when the pending count falls to `PENDING_BOUND_DRAINED`, which happens in
-/// `PendingChannel`'s drop alone. A refusal for the full bound once the clock
-/// has run `PENDING_BOUND_FULL_LIMIT` retires the connection. Nothing runs on
-/// a timer: the decision is made only on a refusal already happening.
+/// The clock starts at the first refusal that finds the bound full and,
+/// short of the retirement itself, is cleared only when the pending count
+/// falls to `PENDING_BOUND_DRAINED` (half the bound) or less, which happens
+/// in `PendingChannel`'s drop alone.
+/// So "stayed full" means the count has not fallen to half the bound or less
+/// since a refusal first found it full, not that it was full all that time:
+/// a count that sits between half and full keeps the clock running, and a
+/// later refusal for the full bound once the clock has run
+/// `PENDING_BOUND_FULL_LIMIT` retires the connection at once, however
+/// briefly the bound has been full again. The warning's `full_secs` is the
+/// time since that first refusal, not time spent continuously full. Nothing
+/// runs on a timer: the decision is made only on a refusal already happening.
 ///
 /// The counts are held slots at each wait a slot can sit at for long, read
-/// only for the retirement's warning.
+/// only for the retirement's warning (`RtcSessions::retire_full_pair`).
 #[derive(Default)]
 struct BoundWatch {
     /// A plain mutex, held for a load and a store and never across an await.
@@ -255,10 +263,11 @@ impl PairContext {
         }
     }
 
-    /// A channel was refused for the full pending bound. How long the bound
-    /// has stayed full, when that is past `PENDING_BOUND_FULL_LIMIT` and the
-    /// connection is to be retired for it: said once, the clock starting
-    /// afresh at the next such refusal.
+    /// A channel was refused for the full pending bound. The time since a
+    /// refusal first found it full, the count not having fallen to
+    /// `PENDING_BOUND_DRAINED` since (`BoundWatch`), when that has reached
+    /// `PENDING_BOUND_FULL_LIMIT` and the connection is to be retired for
+    /// it: said once, the clock starting afresh at the next such refusal.
     fn bound_stayed_full(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
         let mut since = self
@@ -1032,16 +1041,28 @@ impl RtcSessions {
         Ok(None)
     }
 
-    /// Retire a device connection whose pending bound stayed full, the way
-    /// one whose channel acceptor ended is retired (`retire_host_if_same`):
-    /// out of the host map with its attachments, `unavailable` to the
-    /// server, which the device answers with a new connection, and its
-    /// transport closed in a tracked task. Its channels still parked keep
-    /// their slots on this connection's count, never a new one's, and each
-    /// is refused when its wait ends: the connection is no longer current
-    /// (`attach_pair_channel`, the host-control admission, a refusal's
-    /// checks). One warning says where the held slots were waiting.
+    /// Retire a device connection whose pending bound has stayed full in
+    /// `BoundWatch`'s sense, the way one whose channel acceptor ended is
+    /// retired (`retire_host_if_same`): out of the host map with its
+    /// attachments, `unavailable` to the server, which the device answers
+    /// with a new connection, and its transport closed in a tracked task.
+    /// Its channels still parked keep their slots on this connection's
+    /// count, never a new one's. One parked at a transition, at the
+    /// admission lock or in a refusal's file check is refused when its wait
+    /// ends: the connection is no longer current (`attach_pair_channel`, the
+    /// host-control admission, a refusal's checks). One counted `in_handler`
+    /// is already admitted and is not refused: it finishes on a child the
+    /// retirement has already fenced. One warning says where the held slots
+    /// were waiting.
     async fn retire_full_pair(&self, signal_id: &str, pair: &Arc<PairContext>, full_for: Duration) {
+        // Separate reads taken one after another, not one snapshot: exact
+        // when the bound is stuck, approximate while slots are moving. A
+        // slot moving between waits can be counted at both or at neither,
+        // so `current` minus the four can even be negative. What that
+        // difference leaves is slots held elsewhere: a refusal waiting for
+        // its channel to open, and its send, and short lock waits inside
+        // admission, among them the host and peer maps, the handler lock and
+        // the controls map.
         let waits = &pair.bound_watch;
         let current = pair.pending_channels.load(Ordering::Acquire);
         let at_transition = waits.at_transition.load(Ordering::Relaxed);
@@ -3083,12 +3104,12 @@ pub(super) mod tests {
         .expect("nothing is left pending");
     }
 
-    /// The channels a retired connection still has parked are refused when
-    /// their wait ends, even for a session that is running then and would
-    /// have admitted them: the connection is no longer current. They hold
-    /// nothing of the device's new connection while they wait, and end when
-    /// their wait does. The session itself is untouched: the new connection
-    /// opens a window of it afterwards.
+    /// The channels a retired connection still has parked on a session's
+    /// transition are refused when their wait ends, even for a session that
+    /// is running then and would have admitted them: the connection is no
+    /// longer current. They hold nothing of the device's new connection
+    /// while they wait, and end when their wait does. The session itself is
+    /// untouched: the new connection opens a window of it afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn channels_parked_on_a_retired_connection_attach_nothing_when_their_wait_ends() {
         let sessions = RtcSessions::new();
@@ -3547,6 +3568,9 @@ pub(super) mod tests {
         let tmp = crate::support_log::capture::private_tempdir();
         let support = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
         let (logged, guard) = capture_module_warnings(Some(&support));
+        // A second dispatcher, so a callsite another test reaches first still
+        // logs here (as in the retirement test above).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let pair = standalone_pair([23; 32]);
         let other = standalone_pair([24; 32]);
         let full = |refused: u64| {
@@ -3632,6 +3656,9 @@ pub(super) mod tests {
     #[tokio::test]
     async fn only_wholesale_refusals_are_warned_of() {
         let (logged, _guard) = capture_module_warnings(None);
+        // A second dispatcher, so a callsite another test reaches first still
+        // logs here (as in the retirement test above).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         #[cfg(unix)]
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         #[cfg(windows)]
