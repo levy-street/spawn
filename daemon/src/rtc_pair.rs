@@ -35,6 +35,16 @@ const REFUSAL_OPEN_DEADLINE: Duration = Duration::from_secs(5);
 const REFUSAL_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 /// The least time between two warnings of one reason on one connection.
 const WHOLESALE_REFUSAL_WARNING_WINDOW: Duration = Duration::from_secs(60);
+/// How long after a refusal first finds a connection's pending bound full a
+/// later refusal for the full bound retires the connection, if the count has
+/// not fallen to `PENDING_BOUND_DRAINED` in between (`BoundWatch`).
+const PENDING_BOUND_FULL_LIMIT: Duration = Duration::from_secs(30);
+/// At or below this many pending channels the bound has drained: the clock
+/// a full bound started is cleared.
+const PENDING_BOUND_DRAINED: usize = MAX_PAIR_PENDING_CHANNELS / 2;
+/// Why a connection was retired for its full pending bound (`BoundWatch`):
+/// the server hears it with `unavailable`, and the warning says it.
+const PENDING_BOUND_STAYED_FULL: &str = "pending bound stayed full";
 
 /// Why a channel was refused for its connection's sake, not its own: every
 /// channel on the connection is refused the same way until that changes.
@@ -102,6 +112,88 @@ pub(super) struct PairContext {
     /// (`PendingChannel`), at most `MAX_PAIR_PENDING_CHANNELS`.
     pending_channels: AtomicUsize,
     wholesale_refusals: WholesaleRefusals,
+    bound_watch: BoundWatch,
+}
+
+/// Whether a connection's pending bound has stayed full, in the sense below,
+/// and where the slots it holds wait. On a working connection a handful of
+/// channels are pending for milliseconds. One whose bound stays full refuses
+/// every channel the device opens, and the device takes a refusal for an
+/// answer and retries on the same connection for ever; such a connection is
+/// retired, as one whose acceptor ended is, and the device builds a new one.
+///
+/// The clock starts at the first refusal that finds the bound full and,
+/// short of the retirement itself, is cleared only when the pending count
+/// falls to `PENDING_BOUND_DRAINED` (half the bound) or less, which happens
+/// in `PendingChannel`'s drop alone.
+/// So "stayed full" means the count has not fallen to half the bound or less
+/// since a refusal first found it full, not that it was full all that time:
+/// a count that sits between half and full keeps the clock running, and a
+/// later refusal for the full bound once the clock has run
+/// `PENDING_BOUND_FULL_LIMIT` retires the connection at once, however
+/// briefly the bound has been full again. The warning's `full_secs` is the
+/// time since that first refusal, not time spent continuously full. Nothing
+/// runs on a timer: the decision is made only on a refusal already happening.
+///
+/// The counts are held slots at each wait a slot can sit at for long, read
+/// only for the retirement's warning (`RtcSessions::retire_full_pair`).
+#[derive(Default)]
+struct BoundWatch {
+    /// A plain mutex, held for a load and a store and never across an await.
+    full_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Waiting for a session's generation transition.
+    at_transition: AtomicUsize,
+    /// Waiting for the daemon-wide admission lock.
+    at_admission: AtomicUsize,
+    /// In a refusal's file check, from before its blocking job is queued
+    /// until the job is done.
+    in_file_check: AtomicUsize,
+    /// In the session handler of an admitted attachment.
+    in_handler: AtomicUsize,
+}
+
+/// A held slot at one of `BoundWatch`'s waits, counted while this lives.
+struct AtWait<'a>(&'a AtomicUsize);
+
+impl<'a> AtWait<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for AtWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A refusal's file check and the slot it keeps, counted in
+/// `BoundWatch::in_file_check` until the blocking job is done with it.
+struct FileCheck(Arc<PendingChannel>);
+
+impl FileCheck {
+    fn begin(pending: &Arc<PendingChannel>) -> Self {
+        let check = Self(Arc::clone(pending));
+        check.count().fetch_add(1, Ordering::Relaxed);
+        check
+    }
+
+    fn registry(&self) -> &SessionRegistry {
+        let PendingChannel(pair) = &*self.0;
+        &pair.registry
+    }
+
+    fn count(&self) -> &AtomicUsize {
+        let PendingChannel(pair) = &*self.0;
+        &pair.bound_watch.in_file_check
+    }
+}
+
+impl Drop for FileCheck {
+    fn drop(&mut self) {
+        self.count().fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// One device channel from the moment its handler is called until its
@@ -122,7 +214,16 @@ impl PendingChannel {
 
 impl Drop for PendingChannel {
     fn drop(&mut self) {
-        self.0.pending_channels.fetch_sub(1, Ordering::AcqRel);
+        // The count moves by one at a time, so this is the moment it falls
+        // to the drained mark, however it got there.
+        if self.0.pending_channels.fetch_sub(1, Ordering::AcqRel) == PENDING_BOUND_DRAINED + 1 {
+            *self
+                .0
+                .bound_watch
+                .full_since
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
     }
 }
 
@@ -160,6 +261,35 @@ impl PairContext {
                 "device channels refused: their connection has as many terminal views as it may"
             ),
         }
+    }
+
+    /// A channel was refused for the full pending bound. The time since a
+    /// refusal first found it full, the count not having fallen to
+    /// `PENDING_BOUND_DRAINED` since (`BoundWatch`), when that has reached
+    /// `PENDING_BOUND_FULL_LIMIT` and the connection is to be retired for
+    /// it: said once, the clock starting afresh at the next such refusal.
+    fn bound_stayed_full(&self) -> Option<Duration> {
+        let now = tokio::time::Instant::now();
+        let mut since = self
+            .bound_watch
+            .full_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = *since else {
+            // Read under the lock, so no drain to the mark is missed: one
+            // before this read is seen here, and one after it clears the
+            // clock started here once this lets go.
+            if self.pending_channels.load(Ordering::Acquire) > PENDING_BOUND_DRAINED {
+                *since = Some(now);
+            }
+            return None;
+        };
+        let full_for = now.saturating_duration_since(at);
+        if full_for < PENDING_BOUND_FULL_LIMIT {
+            return None;
+        }
+        *since = None;
+        Some(full_for)
     }
 
     pub(super) fn retire(&self) {
@@ -324,6 +454,7 @@ impl RtcSessions {
             host_channels: std::sync::Mutex::new(Vec::new()),
             pending_channels: AtomicUsize::new(0),
             wholesale_refusals: WholesaleRefusals::default(),
+            bound_watch: BoundWatch::default(),
         });
         if let Err(error) = self
             .create_host_answer(
@@ -488,6 +619,9 @@ impl RtcSessions {
                         "device channel refused: as many of its connection's channels are waiting for admission already"
                     );
                     pair.refused_wholesale(Wholesale::PendingBound);
+                    if let Some(full_for) = pair.bound_stayed_full() {
+                        sessions.retire_full_pair(&signal_id, &pair, full_for).await;
+                    }
                     reject_channel(&dc).await;
                     return;
                 };
@@ -514,7 +648,10 @@ impl RtcSessions {
                     // carried out after it: closing a channel is an SCTP
                     // reset the device has to answer, and every offer and
                     // attach on the daemon waits on this lock.
-                    let admission = sessions.admission.lock().await;
+                    let admission = {
+                        let _waiting = AtWait::enter(&pair.bound_watch.at_admission);
+                        sessions.admission.lock().await
+                    };
                     if !sessions
                         .pair_is_current(&signal_id, &pc, pair.trust_epoch)
                         .await
@@ -656,9 +793,9 @@ impl RtcSessions {
                         return;
                     };
                     // A timed-out blocking lookup still counts against this peer.
-                    let job = Arc::clone(&pending);
+                    let job = FileCheck::begin(&pending);
                     let absent = tokio::task::spawn_blocking(move || {
-                        worker_files_absent(&job.0.registry, session_id)
+                        worker_files_absent(job.registry(), session_id)
                     })
                     .await
                     .unwrap_or(false);
@@ -718,6 +855,7 @@ impl RtcSessions {
                 .registry
                 .generation_transition_in_progress(label.session);
         let transition = if known {
+            let _waiting = AtWait::enter(&pair.bound_watch.at_transition);
             Some(
                 pair.registry
                     .lock_generation_transition(label.session)
@@ -729,6 +867,7 @@ impl RtcSessions {
         // Only inserting or joining a registered view needs admission. An
         // absent id still passes the same peer, stale-view and capacity checks.
         let _admission = if known {
+            let _waiting = AtWait::enter(&pair.bound_watch.at_admission);
             Some(self.admission.lock().await)
         } else {
             None
@@ -897,8 +1036,68 @@ impl RtcSessions {
             .context("closed attachment")?(dc);
         drop(_admission);
         drop(transition);
+        let _in_handler = AtWait::enter(&pair.bound_watch.in_handler);
         future.await;
         Ok(None)
+    }
+
+    /// Retire a device connection whose pending bound has stayed full in
+    /// `BoundWatch`'s sense, the way one whose channel acceptor ended is
+    /// retired (`retire_host_if_same`): out of the host map with its
+    /// attachments, `unavailable` to the server, which the device answers
+    /// with a new connection, and its transport closed in a tracked task.
+    /// Its channels still parked keep their slots on this connection's
+    /// count, never a new one's. One parked at a transition, at the
+    /// admission lock or in a refusal's file check is refused when its wait
+    /// ends: the connection is no longer current (`attach_pair_channel`, the
+    /// host-control admission, a refusal's checks). One counted `in_handler`
+    /// is already admitted and is not refused: it finishes on a child the
+    /// retirement has already fenced. One warning says where the held slots
+    /// were waiting.
+    async fn retire_full_pair(&self, signal_id: &str, pair: &Arc<PairContext>, full_for: Duration) {
+        // Separate reads taken one after another, not one snapshot: exact
+        // when the bound is stuck, approximate while slots are moving. A
+        // slot moving between waits can be counted at both or at neither,
+        // so `current` minus the four can even be negative. What that
+        // difference leaves is slots held elsewhere: a refusal waiting for
+        // its channel to open, and its send, and short lock waits inside
+        // admission, among them the host and peer maps, the handler lock and
+        // the controls map.
+        let waits = &pair.bound_watch;
+        let current = pair.pending_channels.load(Ordering::Acquire);
+        let at_transition = waits.at_transition.load(Ordering::Relaxed);
+        let at_admission = waits.at_admission.load(Ordering::Relaxed);
+        let in_file_check = waits.in_file_check.load(Ordering::Relaxed);
+        let in_handler = waits.in_handler.load(Ordering::Relaxed);
+        let pc = self
+            .host_peers
+            .lock()
+            .await
+            .get(signal_id)
+            .filter(|peer| {
+                peer.pair
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, pair))
+            })
+            .map(|peer| Arc::clone(&peer.pc));
+        let Some(pc) = pc else { return };
+        if !self
+            .retire_host_if_same(signal_id, &pc, Some(PENDING_BOUND_STAYED_FULL))
+            .await
+        {
+            return;
+        }
+        tracing::warn!(
+            reason = PENDING_BOUND_STAYED_FULL,
+            full_secs = full_for.as_secs(),
+            bound = MAX_PAIR_PENDING_CHANNELS,
+            current,
+            at_transition,
+            at_admission,
+            in_file_check,
+            in_handler,
+            "device connection retired: as many of its channels as may wait for admission stayed waiting"
+        );
     }
 }
 
@@ -2369,6 +2568,7 @@ pub(super) mod tests {
             host_channels: std::sync::Mutex::new(Vec::new()),
             pending_channels: AtomicUsize::new(0),
             wholesale_refusals: WholesaleRefusals::default(),
+            bound_watch: BoundWatch::default(),
         })
     }
 
@@ -2531,6 +2731,711 @@ pub(super) mod tests {
         );
     }
 
+    /// Wait until at least `expected` of a connection's channels are pending.
+    async fn wait_pending(pair: &PairContext, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while pair.pending_channels.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the channels reached their wait");
+    }
+
+    /// Wait for a refusal for the full bound to have started its clock.
+    async fn until_full_clock_started(pair: &PairContext) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pair.bound_watch.full_since.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("a channel was refused for the full bound and the clock started");
+    }
+
+    /// Move a running clock back by the limit: the bound has now been full
+    /// for that long, and the next refusal for it retires the connection.
+    fn backdate_full_clock(pair: &PairContext) {
+        let mut since = pair.bound_watch.full_since.lock().unwrap();
+        *since = since.and_then(|at| at.checked_sub(PENDING_BOUND_FULL_LIMIT));
+        assert!(since.is_some(), "the clock was running");
+    }
+
+    /// Wait until `channel` has closed.
+    async fn closes(channel: &Arc<RTCDataChannel>, wait: Duration) -> bool {
+        tokio::time::timeout(wait, async {
+            while channel.ready_state() != RTCDataChannelState::Closed {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The first status the server hears for `signal_id` that is not
+    /// `connected`: its status and message.
+    async fn goodbye(
+        signal_rx: &mut mpsc::Receiver<WsOutbound>,
+        signal_id: &str,
+    ) -> Option<(String, String)> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = signal_rx.recv().await {
+                let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+                if value["type"] == "rtc.status"
+                    && value["session_id"] == signal_id
+                    && value["status"] != "connected"
+                {
+                    return Some((
+                        value["status"].as_str().unwrap_or_default().to_owned(),
+                        value["message"].as_str().unwrap_or_default().to_owned(),
+                    ));
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// What production reported, on a real connection: a session's exit
+    /// holds its generation transition while it waits on the session's
+    /// control transaction, which a viewer request holds (here the test
+    /// holds it, in that request's place). Each retry of one window of the
+    /// exiting session parks two channels on that transition, and the
+    /// device closing them gives nothing back, so the connection's pending
+    /// bound fills and every channel on it is refused, a healthy session's
+    /// window too, until the exit finishes.
+    ///
+    /// Once the bound has stayed full for `PENDING_BOUND_FULL_LIMIT` (the
+    /// clock is moved back by that much, not waited out), the next refusal
+    /// retires the connection exactly as one whose acceptor ended is: it
+    /// leaves the host map, its slot returns to the cap, the server hears
+    /// `unavailable`, and the device sees its channels close. One warning
+    /// says where the held slots were waiting. A new connection from the
+    /// same device opens a window of a healthy session while the old
+    /// connection's channels are still parked, and they count against
+    /// nothing of it. When the exit finishes they end, having attached
+    /// nothing. On one thread, so that the daemon's tasks log where the
+    /// capture listens.
+    #[tokio::test]
+    async fn a_connection_whose_pending_bound_stays_full_is_retired_and_its_device_reconnects() {
+        let tmp = crate::support_log::capture::private_tempdir();
+        let support = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
+        let (logged, guard) = capture_module_warnings(Some(&support));
+        // With one scoped subscriber in the process, tracing-core takes a new
+        // callsite's interest from the default of whichever thread reaches it
+        // first: on a test running beside this one that is none, and the
+        // callsite stays silent here. With two it asks every live one.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let steady = Uuid::new_v4();
+        let exiting = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, steady),
+            spawn_replay_worker(&registry, exiting),
+        ];
+        let device = [23; 32];
+        let pc = connect_pair(&sessions, &registry, device).await;
+        let (signal_tx, mut signal_rx) = mpsc::channel(1024);
+        sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let (signal_id, old_pc, pair) = sessions
+            .host_peers
+            .lock()
+            .await
+            .iter()
+            .next()
+            .map(|(id, peer)| (id.clone(), Arc::clone(&peer.pc), peer.pair.clone().unwrap()))
+            .unwrap();
+        let pending = || pair.pending_channels.load(Ordering::Acquire);
+        // A host channel the device keeps open: what it sees of a retirement.
+        let (probe, mut probe_rx) = open_host_consumer(&pc).await;
+        assert!(
+            consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+        // The window is open on the device before its session exits.
+        let (_view_pty, _view_ctl) = attach_answered(&pc, exiting).await;
+        assert_eq!(pending(), 0, "nothing is waiting for admission at rest");
+
+        // A viewer request holds the session's control transaction, and the
+        // session exits as production handles it.
+        let stuck = sessions
+            .controls
+            .lock_transaction(exiting, "request history viewer=stuck")
+            .await;
+        let generation = registry.binding_for(exiting).unwrap().generation();
+        let (exit_tx, exit_rx) = oneshot::channel::<crate::pty::ExitReason>();
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let exit = tokio::spawn(crate::run::spawn_exit_forwarder(
+            exiting,
+            generation,
+            exit_rx,
+            registry.clone(),
+            sessions.clone(),
+            out_tx,
+        ));
+        drop(exit_tx);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions.controls.until_waiting(exiting, "remove_session"),
+        )
+        .await
+        .expect("the exit closed the window's peer and waits on the held transaction");
+        assert!(registry.generation_transition_in_progress(exiting));
+
+        // The device retries the window, as the apps do: both channels, and
+        // when they are not answered it closes them and tries again. The
+        // last retry's second channel is refused for the full bound.
+        let view = Uuid::new_v4();
+        let mut opened = 0;
+        while pending() < MAX_PAIR_PENDING_CHANNELS {
+            let suffix = format!("{exiting}/{view}/{}", Uuid::new_v4());
+            let pty = pc
+                .create_data_channel(&format!("spawn.pty/{suffix}"), None)
+                .await
+                .unwrap();
+            let ctl = pc
+                .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
+                .await
+                .unwrap();
+            opened += 2;
+            wait_pending(&pair, opened.min(MAX_PAIR_PENDING_CHANNELS)).await;
+            let _ = ctl.close().await;
+            let _ = pty.close().await;
+        }
+        until_full_clock_started(&pair).await;
+
+        // Full, but for less than the limit: refused, not retired.
+        let early = pc
+            .create_data_channel(
+                &format!("spawn.pty/{steady}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let early_refused = closes(&early, Duration::from_secs(10)).await;
+        let in_service_below_the_limit = sessions.host_peers.lock().await.contains_key(&signal_id);
+
+        // Past the limit: the next refusal retires the connection.
+        backdate_full_clock(&pair);
+        let _late = pc
+            .create_data_channel(
+                &format!("spawn.pty/{steady}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let said = goodbye(&mut signal_rx, &signal_id).await;
+        let resident = sessions.host_peers.lock().await.contains_key(&signal_id);
+        let slots_after_retirement = sessions.peer_admission.charged();
+        let device_saw_close = closes(&probe, Duration::from_secs(10)).await;
+        let parked_at_retirement = (pending(), registry.generation_transition_holders(exiting));
+
+        // The same device's new connection: a healthy window opens on it
+        // while the old connection's channels are still parked.
+        let new_pc = connect_pair(&sessions, &registry, device).await;
+        let new_pair = sessions
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .and_then(|peer| peer.pair.clone())
+            .unwrap();
+        let (_new_pty, new_ctl) =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&new_pc, steady))
+                .await
+                .expect("a window of a healthy session opens on the new connection");
+        wait_until_drained(&new_pair).await;
+        let parked_while_new_served = (
+            pending(),
+            registry.generation_transition_holders(exiting),
+            new_pair.pending_channels.load(Ordering::Acquire),
+        );
+
+        // The holder lets go: the exit finishes, and every parked channel is
+        // refused for its retired connection and ends.
+        drop(stuck);
+        let exit_done = tokio::time::timeout(Duration::from_secs(20), exit).await;
+        let parked_ended = tokio::time::timeout(Duration::from_secs(30), async {
+            while pending() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let holders_after = registry.generation_transition_holders(exiting);
+        let attached_to_old = sessions
+            .peers
+            .lock()
+            .await
+            .values()
+            .filter(|peer| Arc::ptr_eq(&peer.pc, &old_pc))
+            .count();
+        let new_still_answers = control_answers(&new_ctl, Duration::from_secs(5)).await;
+        let new_pending_after = new_pair.pending_channels.load(Ordering::Acquire);
+        let hosts_after = sessions.host_peers.lock().await.len();
+        let lines = logged.lines();
+        drop(guard);
+        assert!(support.flush(Duration::from_secs(10)));
+        let recorded: Vec<Value> =
+            std::fs::read_to_string(support.dir().join(crate::support_log::CURRENT))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|record: &Value| {
+                    record["level"] == "WARN"
+                        && record["target"] == "spawnd::rtc::pair"
+                        && record["fields"]["reason"] == PENDING_BOUND_STAYED_FULL
+                })
+                .collect();
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        let _ = new_pc.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+
+        assert!(early_refused, "a channel past the full bound was refused");
+        assert!(
+            in_service_below_the_limit,
+            "a connection full for less than the limit was retired"
+        );
+        // As for a connection full of failed streams.
+        assert_eq!(
+            said,
+            Some((
+                "unavailable".to_owned(),
+                PENDING_BOUND_STAYED_FULL.to_owned()
+            )),
+            "the server hears the retired connection is gone"
+        );
+        assert!(!resident, "the retired connection left the host map");
+        assert_eq!(slots_after_retirement, 0, "its slot went back to the cap");
+        assert!(device_saw_close, "the device saw its channels close");
+        assert_eq!(
+            parked_at_retirement,
+            (MAX_PAIR_PENDING_CHANNELS, 1 + MAX_PAIR_PENDING_CHANNELS),
+            "every held slot was parked on the exit's transition when the connection was retired"
+        );
+
+        let retired: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("device connection retired"))
+            .collect();
+        assert_eq!(retired.len(), 1, "{lines:#?}");
+        let line = retired[0];
+        let full_secs: u64 = line
+            .split_once("full_secs=")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .and_then(|secs| secs.parse().ok())
+            .unwrap();
+        assert!(full_secs >= PENDING_BOUND_FULL_LIMIT.as_secs(), "{line}");
+        assert!(
+            line.contains(
+                "device connection retired: as many of its channels as may wait for admission stayed waiting reason=\"pending bound stayed full\" full_secs="
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!(
+                " bound={MAX_PAIR_PENDING_CHANNELS} current={MAX_PAIR_PENDING_CHANNELS} at_transition={MAX_PAIR_PENDING_CHANNELS} at_admission=0 in_file_check=0 in_handler=0"
+            )),
+            "{line}"
+        );
+        assert_eq!(recorded.len(), 1, "{recorded:#?}");
+        assert_eq!(
+            recorded[0]["fields"],
+            json!({
+                "reason": PENDING_BOUND_STAYED_FULL,
+                "full_secs": full_secs,
+                "bound": MAX_PAIR_PENDING_CHANNELS,
+                "current": MAX_PAIR_PENDING_CHANNELS,
+                "at_transition": MAX_PAIR_PENDING_CHANNELS,
+                "at_admission": 0,
+                "in_file_check": 0,
+                "in_handler": 0,
+            })
+        );
+
+        assert_eq!(
+            parked_while_new_served,
+            (MAX_PAIR_PENDING_CHANNELS, 1 + MAX_PAIR_PENDING_CHANNELS, 0),
+            "the old connection's channels stayed parked, holding nothing of the new one"
+        );
+        assert!(
+            exit_done.is_ok(),
+            "the exit finishes once the holder lets go"
+        );
+        assert!(
+            parked_ended.is_ok(),
+            "the parked channels ended when their wait did"
+        );
+        assert_eq!(holders_after, 0, "nothing waits on the transition after");
+        assert_eq!(
+            attached_to_old, 0,
+            "nothing attached to the retired connection"
+        );
+        assert!(
+            new_still_answers,
+            "the new connection's window still answers"
+        );
+        assert_eq!(
+            new_pending_after, 0,
+            "nothing is pending on the new connection"
+        );
+        assert_eq!(
+            hosts_after, 1,
+            "the new connection is the device's only one"
+        );
+    }
+
+    /// Wait until nothing is pending on a connection.
+    async fn wait_until_drained(pair: &PairContext) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pair.pending_channels.load(Ordering::Acquire) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("nothing is left pending");
+    }
+
+    /// The channels a retired connection still has parked on a session's
+    /// transition are refused when their wait ends, even for a session that
+    /// is running then and would have admitted them: the connection is no
+    /// longer current. They hold nothing of the device's new connection
+    /// while they wait, and end when their wait does. The session itself is
+    /// untouched: the new connection opens a window of it afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channels_parked_on_a_retired_connection_attach_nothing_when_their_wait_ends() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let held = Uuid::new_v4();
+        let steady = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, held),
+            spawn_replay_worker(&registry, steady),
+        ];
+        let device = [26; 32];
+        let pc = connect_pair(&sessions, &registry, device).await;
+        let (signal_id, old_pc, pair) = sessions
+            .host_peers
+            .lock()
+            .await
+            .iter()
+            .next()
+            .map(|(id, peer)| (id.clone(), Arc::clone(&peer.pc), peer.pair.clone().unwrap()))
+            .unwrap();
+        let pending = || pair.pending_channels.load(Ordering::Acquire);
+
+        // A running session whose transition is held, as a restart holds
+        // it: windows of it park there until the bound is full.
+        let transition = registry.lock_generation_transition(held).await;
+        let mut parked = Vec::new();
+        while pending() < MAX_PAIR_PENDING_CHANNELS {
+            let suffix = format!("{held}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+            for kind in ["pty", "ctl"] {
+                parked.push(
+                    pc.create_data_channel(&format!("spawn.{kind}/{suffix}"), None)
+                        .await
+                        .unwrap(),
+                );
+            }
+            wait_pending(&pair, parked.len().min(MAX_PAIR_PENDING_CHANNELS)).await;
+        }
+        until_full_clock_started(&pair).await;
+        backdate_full_clock(&pair);
+        let _late = pc
+            .create_data_channel(
+                &format!("spawn.pty/{steady}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let retired = tokio::time::timeout(Duration::from_secs(10), async {
+            while sessions.host_peers.lock().await.contains_key(&signal_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let parked_at_retirement = (pending(), registry.generation_transition_holders(held));
+
+        let new_pc = connect_pair(&sessions, &registry, device).await;
+        let new_pair = sessions
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .and_then(|peer| peer.pair.clone())
+            .unwrap();
+        let steady_window =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&new_pc, steady)).await;
+        wait_until_drained(&new_pair).await;
+        let parked_while_new_served = (
+            pending(),
+            registry.generation_transition_holders(held),
+            new_pair.pending_channels.load(Ordering::Acquire),
+        );
+
+        // The transition is released with the session still running.
+        drop(transition);
+        let parked_ended = tokio::time::timeout(Duration::from_secs(30), async {
+            while pending() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let running = registry.contains(held);
+        let holders_after = registry.generation_transition_holders(held);
+        let (attached_to_old, attached_to_held) = {
+            let peers = sessions.peers.lock().await;
+            (
+                peers
+                    .values()
+                    .filter(|peer| Arc::ptr_eq(&peer.pc, &old_pc))
+                    .count(),
+                peers
+                    .values()
+                    .filter(|peer| peer.session.session_id() == held)
+                    .count(),
+            )
+        };
+        let new_pending_after = new_pair.pending_channels.load(Ordering::Acquire);
+        let held_window =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&new_pc, held)).await;
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        let _ = new_pc.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+
+        assert!(retired.is_ok(), "the connection was retired");
+        assert_eq!(
+            parked_at_retirement,
+            (MAX_PAIR_PENDING_CHANNELS, 1 + MAX_PAIR_PENDING_CHANNELS)
+        );
+        assert!(
+            steady_window.is_ok(),
+            "a window opens on the new connection while the old one's channels are parked"
+        );
+        assert_eq!(
+            parked_while_new_served,
+            (MAX_PAIR_PENDING_CHANNELS, 1 + MAX_PAIR_PENDING_CHANNELS, 0),
+            "the parked channels held nothing of the new connection"
+        );
+        assert!(
+            parked_ended.is_ok(),
+            "the parked channels ended when their wait did"
+        );
+        assert!(running, "the session was running when their wait ended");
+        assert_eq!(holders_after, 0, "nothing waits on the transition after");
+        assert_eq!(
+            (attached_to_old, attached_to_held),
+            (0, 0),
+            "a parked channel attached to the retired connection"
+        );
+        assert_eq!(
+            new_pending_after, 0,
+            "nothing is pending on the new connection"
+        );
+        assert!(
+            held_window.is_ok(),
+            "the session's window opens on the new connection afterwards"
+        );
+    }
+
+    /// The rule on its own clock, paused: a bound that fills and drains
+    /// before the limit retires nothing; one full for less than the limit
+    /// retires nothing; one full for the limit retires its connection, once.
+    /// The count falling to half the bound restarts the clock; falling to
+    /// one above half does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_bound_retires_its_connection_only_once_it_has_stayed_full() {
+        let pair = standalone_pair([25; 32]);
+        let fill = || std::iter::from_fn(|| PendingChannel::begin(&pair)).collect::<Vec<_>>();
+        let step = Duration::from_millis(1);
+
+        // A burst that fills the bound and drains before the limit.
+        let mut held = fill();
+        assert_eq!(held.len(), MAX_PAIR_PENDING_CHANNELS);
+        let burst = pair.bound_stayed_full();
+        held.clear();
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT).await;
+        held.extend(fill());
+        let refilled = pair.bound_stayed_full();
+
+        // Full for less than the limit, then for the limit.
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT - step).await;
+        let short = pair.bound_stayed_full();
+        tokio::time::advance(step).await;
+        let stayed = pair.bound_stayed_full();
+        // Said once: the next refusal starts the clock afresh.
+        let after = pair.bound_stayed_full();
+
+        // Down to half the bound and full again: the clock restarted.
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT / 2).await;
+        held.truncate(PENDING_BOUND_DRAINED);
+        held.extend(fill());
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT / 2).await;
+        let restarted = pair.bound_stayed_full();
+
+        // Down to one above half and full again: the clock kept running.
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT / 2).await;
+        held.truncate(PENDING_BOUND_DRAINED + 1);
+        held.extend(fill());
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT / 2).await;
+        let kept = pair.bound_stayed_full();
+
+        // A refusal that finds the bound already drained starts no clock.
+        held.clear();
+        let drained = pair.bound_stayed_full();
+        tokio::time::advance(PENDING_BOUND_FULL_LIMIT).await;
+        held.extend(fill());
+        let no_clock = pair.bound_stayed_full();
+
+        assert_eq!(burst, None, "the first refusal starts the clock");
+        assert_eq!(refilled, None, "a burst that drained left no clock running");
+        assert_eq!(short, None, "full for less than the limit");
+        assert_eq!(stayed, Some(PENDING_BOUND_FULL_LIMIT), "full for the limit");
+        assert_eq!(after, None, "a connection is retired for it once");
+        assert_eq!(restarted, None, "down to half the bound restarts the clock");
+        assert_eq!(
+            kept,
+            Some(PENDING_BOUND_FULL_LIMIT),
+            "one above half the bound keeps it running"
+        );
+        assert_eq!((drained, no_clock), (None, None));
+    }
+
+    /// The retirement's warning says where the held slots wait; each slot
+    /// is counted at the wait it is at, and only while it is there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_slots_are_counted_at_the_wait_they_are_at() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let held = Uuid::new_v4();
+        let steady = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, held),
+            spawn_replay_worker(&registry, steady),
+        ];
+        let pc = connect_pair(&sessions, &registry, [27; 32]).await;
+        let pair = sessions
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .and_then(|peer| peer.pair.clone())
+            .unwrap();
+        let counts = || {
+            let waits = &pair.bound_watch;
+            [
+                pair.pending_channels.load(Ordering::Acquire),
+                waits.at_transition.load(Ordering::Relaxed),
+                waits.at_admission.load(Ordering::Relaxed),
+                waits.in_file_check.load(Ordering::Relaxed),
+                waits.in_handler.load(Ordering::Relaxed),
+            ]
+        };
+        // The counts once they are `expected`, or as they are at a deadline.
+        let reaches = |expected: [usize; 5]| {
+            let counts = &counts;
+            async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    while counts() != expected {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                counts()
+            }
+        };
+
+        // A window of a session whose transition is held.
+        let transition = registry.lock_generation_transition(held).await;
+        let held_suffix = format!("{held}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let _held_pty = pc
+            .create_data_channel(&format!("spawn.pty/{held_suffix}"), None)
+            .await
+            .unwrap();
+        let held_ctl = pc
+            .create_data_channel(&format!("spawn.ctl/{held_suffix}"), None)
+            .await
+            .unwrap();
+        let at_transition = reaches([2, 2, 0, 0, 0]).await;
+
+        // A host channel and a window of another session, with admission
+        // held: the window's first channel takes its session's transition
+        // and waits for admission holding it, so its second waits on that.
+        let admission = Arc::clone(&sessions.admission).lock_owned().await;
+        let (consumer, mut consumer_rx) = open_host_consumer(&pc).await;
+        let steady_suffix = format!("{steady}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let _steady_pty = pc
+            .create_data_channel(&format!("spawn.pty/{steady_suffix}"), None)
+            .await
+            .unwrap();
+        let steady_ctl = pc
+            .create_data_channel(&format!("spawn.ctl/{steady_suffix}"), None)
+            .await
+            .unwrap();
+        let at_admission = reaches([5, 3, 2, 0, 0]).await;
+        drop(admission);
+        let consumer_admitted =
+            consumer_answers(&consumer, &mut consumer_rx, Duration::from_secs(5)).await;
+        let steady_attached = control_answers(&steady_ctl, Duration::from_secs(5)).await;
+        let admission_released = reaches([2, 2, 0, 0, 0]).await;
+        drop(transition);
+        let held_attached = control_answers(&held_ctl, Duration::from_secs(5)).await;
+        let transition_released = reaches([0, 0, 0, 0, 0]).await;
+
+        // A refusal's file check keeps its slot, and is counted, until its
+        // blocking job is done with it.
+        let slot = Arc::new(PendingChannel::begin(&pair).unwrap());
+        let check = FileCheck::begin(&slot);
+        drop(slot);
+        let in_file_check = counts();
+        drop(check);
+        let file_check_done = counts();
+
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+        assert_eq!(
+            at_transition,
+            [2, 2, 0, 0, 0],
+            "both parked on the transition"
+        );
+        assert_eq!(
+            at_admission,
+            [5, 3, 2, 0, 0],
+            "three at a transition, two at admission"
+        );
+        assert!(consumer_admitted && steady_attached && held_attached);
+        assert_eq!(
+            admission_released,
+            [2, 2, 0, 0, 0],
+            "nothing counted at admission once it is free"
+        );
+        assert_eq!(
+            transition_released,
+            [0, 0, 0, 0, 0],
+            "nothing counted once every channel is admitted"
+        );
+        assert_eq!(in_file_check, [1, 0, 0, 1, 0]);
+        assert_eq!(file_check_done, [0, 0, 0, 0, 0]);
+    }
+
     /// The close that ends a refusal queues its stream reset behind any
     /// writer on the association waiting for room, which a device that has
     /// stopped reading can make wait for ever. The slot goes back before that
@@ -2663,6 +3568,9 @@ pub(super) mod tests {
         let tmp = crate::support_log::capture::private_tempdir();
         let support = crate::support_log::SupportLog::open(&tmp.path().join("support")).unwrap();
         let (logged, guard) = capture_module_warnings(Some(&support));
+        // A second dispatcher, so a callsite another test reaches first still
+        // logs here (as in the retirement test above).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let pair = standalone_pair([23; 32]);
         let other = standalone_pair([24; 32]);
         let full = |refused: u64| {
@@ -2748,6 +3656,9 @@ pub(super) mod tests {
     #[tokio::test]
     async fn only_wholesale_refusals_are_warned_of() {
         let (logged, _guard) = capture_module_warnings(None);
+        // A second dispatcher, so a callsite another test reaches first still
+        // logs here (as in the retirement test above).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         #[cfg(unix)]
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         #[cfg(windows)]
@@ -3698,6 +4609,7 @@ pub(super) mod tests {
             host_channels: std::sync::Mutex::new(Vec::new()),
             pending_channels: AtomicUsize::new(0),
             wholesale_refusals: WholesaleRefusals::default(),
+            bound_watch: BoundWatch::default(),
         });
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),

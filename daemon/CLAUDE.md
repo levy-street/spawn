@@ -520,8 +520,9 @@ acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, a session that ended, was replaced,
-or is restarting, a device connection superseded by a newer one, and a host
-peer whose channel acceptor ended — tells
+or is restarting, a device connection superseded by a newer one, a device
+connection whose pending bound stayed full, and a host peer whose channel
+acceptor ended — tells
 the server `unavailable` for that binding, once it has claimed the peer
 (`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
 `take_device_pair`). The acceptor ends when the SCTP association does, and
@@ -959,6 +960,38 @@ could hold together: two per terminal attachment, its host consumers, its
 root), and one past that is refused there and then. A terminal label
 naming a session the daemon neither runs nor has a transition in progress
 for takes no generation transition and never waits on daemon-wide admission.
+
+A bound that stays full is never normal, and the device, which takes a
+refusal for an answer, would retry on that connection for ever, so the
+connection is retired (`BoundWatch` in `rtc_pair.rs`): the first refusal for
+the full bound starts a clock, only the count falling to half the bound or
+less clears it, and a refusal for the full bound once it has run
+`PENDING_BOUND_FULL_LIMIT` (30 s) retires the connection through
+`retire_host_if_same`, as an ended acceptor does, with `unavailable` and the
+reason `pending bound stayed full`. "Stayed full" therefore means the count
+has not fallen to half the bound or less since a refusal first found it
+full, not that it was full all that time: a count that sits between half
+and full keeps the clock running, and once it has run the limit a later
+refusal for the full bound retires the connection at once. Nothing checks
+this on a timer. One WARN says how long it has been since that first
+refusal (`full_secs`, not time spent continuously full) and how many held
+slots were at each wait: a session's transition, the admission lock, a
+refusal's file check, the session handler. Those counts are separate reads
+taken one after another: exact when the bound is stuck, approximate while
+slots are moving (a slot moving between waits can be counted twice or
+missed, so `current` minus the four can even be negative). The slots held
+elsewhere, which that difference stands for, are a refusal waiting for its
+channel to open and its send, and short lock waits inside admission, among
+them the host and peer maps, the handler lock and the controls map.
+Channels still parked on the retired connection hold only its slots. One
+parked at a transition, at the admission lock or in a refusal's file check
+is refused when its wait ends, since the connection is no longer current,
+and ends there; one counted in the session handler (`in_handler`) is
+already admitted and is not refused: it finishes on a child the retirement
+has already fenced. Retirements for this reason are not capped: each needs
+a new connection to fill its own bound and thirty seconds more. A retired
+connection's parked channels keep that connection in memory until their
+waits end.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed
