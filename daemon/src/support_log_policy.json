@@ -32,6 +32,14 @@
       "kind": "scalar",
       "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
     },
+    "at_admission": {
+      "kind": "scalar",
+      "why": "Count of a retired device connection's pending channels waiting for the admission lock; only numeric visitor values pass."
+    },
+    "at_transition": {
+      "kind": "scalar",
+      "why": "Count of a retired device connection's pending channels waiting for a session's generation transition; only numeric visitor values pass."
+    },
     "before": {
       "kind": "scalar",
       "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
@@ -138,6 +146,10 @@
       "kind": "scalar",
       "why": "Only numeric visitor values pass; peer strings and paths under this ambiguous name are withheld."
     },
+    "full_secs": {
+      "kind": "scalar",
+      "why": "Whole seconds a device connection's pending channel bound stayed full; only numeric visitor values pass."
+    },
     "generation": {
       "kind": "scalar",
       "why": "Count, size, duration, port, offset, generation or process id; only numeric/bool visitor values pass, never Debug/text."
@@ -165,6 +177,14 @@
     "host_id": {
       "kind": "id",
       "why": "Identifier or public-key fingerprint; restricted to UUID/hex components separated by colon or slash, then sanitised."
+    },
+    "in_file_check": {
+      "kind": "scalar",
+      "why": "Count of a retired device connection's pending channels in a refusal's file check; only numeric visitor values pass."
+    },
+    "in_handler": {
+      "kind": "scalar",
+      "why": "Count of a retired device connection's pending channels in an admitted attachment's session handler; only numeric visitor values pass."
     },
     "instance": {
       "kind": "id",
@@ -332,7 +352,8 @@
         "worker live-stream barrier timed out",
         "pending bound full",
         "connection retired or trust changed",
-        "view capacity full"
+        "view capacity full",
+        "pending bound stayed full"
       ]
     },
     "refreshed": {

@@ -520,8 +520,9 @@ acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, a session that ended, was replaced,
-or is restarting, a device connection superseded by a newer one, and a host
-peer whose channel acceptor ended — tells
+or is restarting, a device connection superseded by a newer one, a device
+connection whose pending bound stayed full, and a host peer whose channel
+acceptor ended — tells
 the server `unavailable` for that binding, once it has claimed the peer
 (`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
 `take_device_pair`). The acceptor ends when the SCTP association does, and
@@ -959,6 +960,20 @@ could hold together: two per terminal attachment, its host consumers, its
 root), and one past that is refused there and then. A terminal label
 naming a session the daemon neither runs nor has a transition in progress
 for takes no generation transition and never waits on daemon-wide admission.
+
+A bound that stays full is never normal, and the device, which takes a
+refusal for an answer, would retry on that connection for ever, so the
+connection is retired (`BoundWatch` in `rtc_pair.rs`): the first refusal for
+the full bound starts a clock, the count falling to half the bound clears
+it, and a refusal for the full bound once it has run
+`PENDING_BOUND_FULL_LIMIT` (30 s) retires the connection through
+`retire_host_if_same`, as an ended acceptor does, with `unavailable` and the
+reason `pending bound stayed full`. Nothing checks this on a timer. One WARN
+says for how long and how many held slots were at each wait: a session's
+transition, the admission lock, a refusal's file check, the session
+handler. Channels still parked on the retired connection hold only its
+slots; each is refused when its wait ends, since the connection is no
+longer current, and ends there.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed
