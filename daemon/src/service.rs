@@ -89,6 +89,8 @@ fn launch_bin(config_dir: &Path) -> Result<PathBuf> {
 /// Local, non-roaming state for one account instance. Windows deliberately
 /// keeps live PIDs, launch records, helpers, and endpoints out of `%APPDATA%`.
 pub fn instance_state_path(config_dir: &Path) -> Result<PathBuf> {
+    #[cfg(all(windows, test))]
+    use test_local_data as dirs;
     #[cfg(windows)]
     let base = dirs::data_local_dir()
         .context("cannot resolve the local application data directory")?
@@ -1166,6 +1168,21 @@ pub fn relaunch_after_update(config_dir: &Path) -> Result<()> {
     {
         let _ = config_dir;
         bail!("Windows update relaunch requested on a non-Windows host")
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(super) mod test_local_data {
+    use std::path::PathBuf;
+
+    tokio::task_local! {
+        pub(crate) static ROOT: PathBuf;
+    }
+
+    pub(super) fn data_local_dir() -> Option<PathBuf> {
+        ROOT.try_with(Clone::clone)
+            .ok()
+            .or_else(dirs::data_local_dir)
     }
 }
 
