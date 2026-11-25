@@ -403,6 +403,7 @@ enum TestEffectPoint {
     CloseAllSnapshot,
     ControlRequest,
     RefusalSend,
+    RefusalClose,
     /// Under the admission lock, before the device's own pair is taken;
     /// keyed by the device key in hex.
     HostAdmissionTake,
