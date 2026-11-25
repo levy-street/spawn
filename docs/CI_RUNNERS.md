@@ -46,6 +46,19 @@ checks may reclaim only approved unused tools on a verified hosted Ubuntu
 24.04 machine. Native fixture credentials and the disposable app are excluded
 from uploaded evidence. No production services are used by these fixtures.
 
+The Android acceptance build restores Gradle's downloaded dependency files and
+metadata and its wrapper distribution before compiling. The key is
+`mobile/package-lock.json`, because the generated `android/` project does not
+exist at checkout; a changed lockfile starts from the most recently saved set.
+Gradle's lock and `gc.properties` files, transforms, compiled scripts and build
+cache are not cached, so every APK is still built from the exact candidate. A
+successful build that did not restore its exact key saves the set before the
+emulator space is reclaimed. Runs on master, release acceptance among them,
+save caches every branch can restore; a pull request's cache serves only that
+pull request. If Gradle's output shows a package host refusing with HTTP 429,
+the build starts again in a new directory after about one and then three
+minutes, three attempts at most; any other failure fails at once.
+
 Release signing environments remain restricted to master. The rolling
 prebuilt release and deployment workflows publish or deploy and must not be
 manually dispatched for ordinary validation. Off-master `prebuilt.yml` builds

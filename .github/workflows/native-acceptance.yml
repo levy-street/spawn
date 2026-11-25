@@ -155,14 +155,73 @@ jobs:
         # Readiness above follows copying both executables into the fixture's
         # private bin directory; later activation no longer uses target/.
         run: cargo clean
+      - name: Restore Android Gradle dependencies
+        id: gradle_dependencies
+        if: matrix.platform == 'android'
+        # Only what Gradle downloads: dependency files and metadata (not the
+        # lock or gc.properties files Gradle says not to copy) and the wrapper
+        # distribution. No transforms, compiled scripts or build cache, so the
+        # APK is still built from the exact candidate. expo prebuild creates
+        # android/ during the build, so the key is the lockfile that decides
+        # its dependencies; a changed lockfile starts from the latest saved set.
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+            ~/.gradle/wrapper/dists
+          key: android-gradle-deps-v1-${{ runner.os }}-${{ hashFiles('mobile/package-lock.json') }}
+          restore-keys: |
+            android-gradle-deps-v1-${{ runner.os }}-
       - name: Build native Release acceptance shell
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
         run: |
-          if [[ "$NATIVE_PLATFORM" == android ]]; then
-            python3 mobile/e2e/android-disk-preflight.py build
+          if [[ "$NATIVE_PLATFORM" != android ]]; then
+            exec bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
           fi
-          bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
+          # Maven Central and the Gradle plugin portal refuse a busy shared
+          # runner address with HTTP 429. Only that refusal is retried, from a
+          # new build directory, after about one and then three minutes; any
+          # other failure fails at once. The script refuses an existing
+          # directory, and the old one holds nothing but that attempt's output.
+          set -o pipefail
+          if [[ "$ACCEPTANCE_BUILD" != "$RUNNER_TEMP/native-app" ]]; then
+            echo "::error::Unexpected Android build directory: $ACCEPTANCE_BUILD"
+            exit 1
+          fi
+          build_log="$RUNNER_TEMP/native-build-output.log"
+          rate_limited='Received status code 429 from server|Server returned HTTP response code: 429 for URL'
+          dependency_files() { find "$HOME/.gradle/caches/modules-2/files-2.1" -type f 2>/dev/null | wc -l || true; }
+          restored_files="$(dependency_files)"
+          for attempt in 1 2 3; do
+            python3 mobile/e2e/android-disk-preflight.py build
+            status=0
+            bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD" 2>&1 \
+              | tee "$build_log" || status=$?
+            if (( status == 0 )); then
+              echo "Gradle dependency files: $restored_files before the build, $(dependency_files) after"
+              exit 0
+            fi
+            if (( attempt == 3 )) || ! grep -Eq "$rate_limited" "$build_log"; then
+              exit "$status"
+            fi
+            delay=$(( attempt == 1 ? 60 : 180 ))
+            echo "::warning::Attempt $attempt: a package host refused with HTTP 429; building again in $delay seconds"
+            rm -rf -- "$ACCEPTANCE_BUILD"
+            sleep "$delay"
+          done
+      - name: Save Android Gradle dependencies
+        # After the build that completed the set and before the reclaim step;
+        # an exact restore is already saved, and caches are immutable.
+        if: matrix.platform == 'android' && steps.gradle_dependencies.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+            ~/.gradle/wrapper/dists
+          key: ${{ steps.gradle_dependencies.outputs.cache-primary-key }}
       - name: Reclaim disposable Android build space for the emulator
         if: matrix.platform == 'android'
         timeout-minutes: 5
