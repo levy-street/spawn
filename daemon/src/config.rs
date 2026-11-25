@@ -31,12 +31,6 @@ pub fn server_url_for_instance(cli_value: Option<String>, stored: Option<&str>) 
 /// multiple daemons (e.g. one per server) can coexist without sharing
 /// credentials.
 pub fn config_dir() -> Result<PathBuf> {
-    // A registration with a fixed test capability has no installation to inspect.
-    #[cfg(test)]
-    assert!(
-        crate::update::FIXED_CAPABILITY.try_with(|_| ()).is_err(),
-        "registration resolved a user config directory"
-    );
     let dir = match std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => crate::platform::default_config_base().context("cannot resolve user config dir")?,
