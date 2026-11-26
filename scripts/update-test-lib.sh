@@ -457,7 +457,8 @@ update_test_start_server() {
       SPAWN_PREBUILT_DIR="$UPDATE_PREBUILT" \
       SPAWN_DAEMON_AUTO_UPDATE="$auto_update" \
       "$UPDATE_REPO_ROOT/server/.venv/bin/python" -m uvicorn \
-        spawn_server.main:app --host 127.0.0.1 --port "$UPDATE_SERVER_PORT"
+        spawn_server.main:app --host 127.0.0.1 --port "$UPDATE_SERVER_PORT" \
+        --ws websockets-sansio
   ) >>"$UPDATE_SERVER_LOG" 2>&1 &
   UPDATE_SERVER_PID=$!
   local deadline=$((SECONDS + 30))

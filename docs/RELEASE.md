@@ -1725,7 +1725,8 @@ default-false `hosts.support_log_capable` column. Old server code tolerates all
 three additions. Leave `SPAWN_SUPPORT_LOG_DIR` unset to keep support logs off.
 To switch them on, create an empty private directory (mode 0700) on local
 disk outside the checkout and database backups. Set `SPAWN_SUPPORT_LOG_DIR` to
-its absolute path, add `--ws websockets-sansio` to the server launch command,
+its absolute path, add `--ws websockets-sansio` to the server launch command
+(the steps are under "The websocket implementation" in "Production network"),
 and restart the server. This backend can answer a daemon Ping while an
 application write is paused without closing the connection.
 Startup checks the launch flag before a worker checks the directory's locking
@@ -1777,7 +1778,8 @@ exposed.
 ## Production network
 
 Read [NETWORK.md](NETWORK.md) before changing nginx, firewall rules, WebSocket
-timeouts, ICE/TURN settings, coturn, or the `spawn-server` worker count. It
+timeouts, ICE/TURN settings, coturn, the `spawn-server` worker count, or its
+websocket implementation. It
 records the verified production topology and the checked-in nginx/coturn
 examples. Two constraints are release blockers:
 
@@ -1814,6 +1816,88 @@ Do not broaden this to any program or the Public profile. Test both direct ICE
 and TURN fallback, and inspect the actual allow/block rules created when the
 first-listen prompt is accepted, declined, or dismissed by administrator and
 standard-user accounts.
+
+### The websocket implementation
+
+Production starts the server from the `spawn-server` systemd unit on the
+production host. That unit is edited by hand there and this repository does
+not manage it. A deploy restarts it with whatever `ExecStart` it already has,
+so merging or deploying a change here never changes how production starts the
+server.
+
+Production currently runs uvicorn's default websocket implementation, which is
+the legacy one. Every launcher in this repository runs the sans-I/O one
+instead, and `scripts/check-ws-sansio-launch.sh` keeps it that way. So the
+smokes, updater tests, canary cohorts, native acceptance runs and the Windows
+smoke all exercise it. [NETWORK.md](NETWORK.md) ("The websocket implementation") says
+what differs and what to watch. Moving production is one change to the unit,
+made by a person with sudo on the production host:
+
+1. Do it when the commit production runs has passed `test.yml`,
+   `acceptance.yml` and `windows.yml` with the launchers on the sans-I/O
+   implementation, and at a quiet hour. Every connection drops and reconnects,
+   as on any deploy.
+2. Run `systemctl cat spawn-server` to see the unit file's path. Copy that file
+   somewhere outside systemd's directories, for example your home directory,
+   so the old line can be put back exactly.
+3. Run `systemctl show -p ExecStart spawn-server` and confirm the command has
+   no `--ws` option yet. `--ws-max-size` is a different option.
+4. Edit the unit file (`sudoedit <path>`). Add ` --ws websockets-sansio` to the
+   end of the `ExecStart=` line, so the command ends like this, and change
+   nothing else:
+
+   ```
+   uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port 8001 --ws-max-size 67108864 --ws websockets-sansio
+   ```
+
+5. Run `sudo systemctl daemon-reload`.
+6. Run `sudo systemctl restart spawn-server`.
+
+Then check, in this order:
+
+- `systemctl is-active spawn-server` says `active`, and
+  `pgrep -af -- '--ws websockets-sansio'` shows the running server with the
+  option.
+- `curl -fsS http://127.0.0.1:8001/healthz` on the host answers.
+- `SPAWN_HEALTH_PUBLIC_ORIGIN=https://spawnd.dev scripts/health-check.sh --probe-websocket https://spawnd.dev`
+  passes. It needs HTTP 101 and then close 1008 through nginx and Next, which
+  is the new implementation's close path. `scripts/health-check.sh` on the
+  host passes too.
+- `journalctl -u spawn-server --since "-15 min"` shows a burst of
+  `"WebSocket /ws/daemon…" [accepted]` lines as the hosts reconnect, then
+  quiet. A count of those lines that keeps rising afterwards means hosts are
+  flapping. There is no `Exception in ASGI application`. The `connection
+  closed` lines stop appearing, which is expected: only the legacy
+  implementation logs them.
+- The Hosts page shows each host online. Open a terminal on one host from a
+  browser and from the phone, and type in it.
+- `scripts/verify-release.sh https://spawnd.dev`, from a checkout at the
+  deployed commit, still passes. The identities do not change; this proves
+  the API still serves them.
+- Over the next day, the memory line of `systemctl status spawn-server` stays
+  near where it was before. The next deploy's restart takes seconds, not
+  minutes.
+
+A bad outcome looks like one of these:
+
+- The unit does not start, and the journal shows uvicorn refusing `--ws`.
+  The lock pins uvicorn 0.46.0, which knows the option, so the host's
+  environment is older than the lock.
+- Hosts flap: the same host reconnects again and again, hosts go offline and
+  online on the Hosts page, terminals fail to open or drop.
+- Browsers and phones keep reconnecting, or the WebSocket probe fails.
+- The server's memory climbs and does not come back down.
+- A restart hangs at `Waiting for connections to close` until the unit's stop
+  timeout kills it. NETWORK.md explains why a stalled connection can do that
+  on this implementation.
+
+To roll back, edit the unit again and remove ` --ws websockets-sansio` from
+`ExecStart`, or put the copied file back. Then run
+`sudo systemctl daemon-reload` and `sudo systemctl restart spawn-server`, and
+run the same checks. Support log storage needs the option. If
+`SPAWN_SUPPORT_LOG_DIR` is set, a rollback turns storage off again with one
+logged error, `SPAWN D support logs require --ws websockets-sansio`. Nothing
+else depends on it.
 
 ## Release checklist
 

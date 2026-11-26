@@ -96,7 +96,8 @@ printf '%s\n' "smoke-local-http-surface: starting API server on $server_url"
     SPAWN_JWT_SECRET=smoke-http-surface-secret-with-enough-length \
     SPAWN_PUBLIC_URL="$web_url" \
     SPAWN_CORS_ORIGINS="$web_url" \
-    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port"
+    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port" \
+      --ws websockets-sansio
 ) >"$server_log" 2>&1 &
 server_pid=$!
 

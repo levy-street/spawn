@@ -97,7 +97,7 @@ printf '%s\n' "smoke-install-prebuilt: starting install server on $base_url"
     SPAWN_JWT_SECRET=smoke-install-secret-with-enough-length \
     SPAWN_PUBLIC_URL="$base_url" \
     uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$port" \
-      >"$server_log" 2>&1
+      --ws websockets-sansio >"$server_log" 2>&1
 ) &
 server_pid=$!
 

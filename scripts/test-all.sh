@@ -80,6 +80,10 @@ printf '%s\n' "== daemon support log guard =="
 scripts/check-support-log.sh --self-test
 scripts/check-support-log.sh
 
+printf '%s\n' "== server websocket implementation launch guard =="
+scripts/check-ws-sansio-launch.sh --self-test
+scripts/check-ws-sansio-launch.sh
+
 printf '%s\n' "== CLAUDE.md structure guard =="
 scripts/check-claude-md.sh --self-test
 scripts/check-claude-md.sh

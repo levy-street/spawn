@@ -180,7 +180,8 @@ printf '%s\n' "smoke-local-browser-live: starting API server on $base_url"
     SPAWN_PUBLIC_URL="$web_url" \
     SPAWN_CORS_ORIGINS="$web_url" \
     SPAWN_WEBRTC_ENABLED=1 \
-    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port"
+    uv run uvicorn spawn_server.main:app --host 127.0.0.1 --port "$server_port" \
+      --ws websockets-sansio
 ) >"$server_log" 2>&1 &
 server_pid=$!
 wait_for_url "$base_url/healthz" "API server"

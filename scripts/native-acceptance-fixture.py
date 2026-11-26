@@ -1016,6 +1016,7 @@ async def run(args: argparse.Namespace) -> None:
                 ApiRequestTrace(app, fixture.output / "api-requests.jsonl"),
                 host="127.0.0.1",
                 port=args.port,
+                ws="websockets-sansio",
                 log_level="warning",
                 access_log=False,
                 timeout_graceful_shutdown=10,
