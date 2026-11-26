@@ -785,16 +785,24 @@ async def test_registration_transcript_is_unchanged_with_the_setting_on_and_off(
 # Trying an interrupted update again (issue #170).
 
 INTERRUPTED = offers_mod.INTERRUPTED_UPDATE_ERROR
-SIX_MINUTES = offers_mod.RETRY_AFTER_SECONDS
+RETRY_AFTER = offers_mod.RETRY_AFTER_SECONDS
+SPACING = offers_mod.RETRY_SPACING
 TREE_C = "c" * 40
 
 
 class Clock:
+    """The task's two clocks, moved together: `now` in seconds for how long a
+    connection has been seen, and `wall()` for comparing stored offer times."""
+
     def __init__(self) -> None:
         self.now = 1000.0
+        self.start = datetime.now(UTC)
 
     def __call__(self) -> float:
         return self.now
+
+    def wall(self) -> datetime:
+        return self.start + timedelta(seconds=self.now - 1000.0)
 
 
 class WatchedSocket(Socket):
@@ -833,11 +841,14 @@ async def interrupted(
 ) -> tuple[str, Socket]:
     """A host whose update to the active release registration recorded as
     interrupted: offered it when it registered, then registered again on its
-    old build with no result in between. `socket` is the second connection."""
+    old build with no result in between. `socket` is the second connection.
+    The offer is backdated by `RETRY_SPACING`, so only the connection's own
+    wait holds a retry back."""
     host_id, first = await fleet.connect(host_id, **fields)
     assert trees(first) == [TREE_B]
     await fleet.close(first)
     _, ws = await fleet.connect(host_id, socket=socket, **fields)
+    await set_host(host_id, update_requested_at=datetime.now(UTC) - SPACING)
     row = await host_row(host_id)
     assert (row.update_state, row.update_tree, row.update_error) == ("failed", TREE_B, INTERRUPTED)
     assert release.host_update_state(row).state == "failed"
@@ -853,7 +864,7 @@ def retry_records(caplog) -> list[str]:
     ]
 
 
-async def test_an_interrupted_update_is_tried_again_after_six_minutes_on_one_connection(
+async def test_an_interrupted_update_is_tried_again_after_sixteen_minutes_on_one_connection(
     fleet, prebuilts, monkeypatch, caplog
 ):
     caplog.set_level(logging.INFO, logger=LOGGER)
@@ -873,7 +884,7 @@ async def test_an_interrupted_update_is_tried_again_after_six_minutes_on_one_con
     offers = DaemonReleaseOffers(pause=pauses, clock=clock)
     await offers.poll_once()
 
-    clock.now += SIX_MINUTES - 1
+    clock.now += RETRY_AFTER - 1
     await offers.poll_once()
     assert ws.pings() == [] and ws.updates() == []
     assert update_fields(await host_row(host_id)) == before
@@ -890,8 +901,10 @@ async def test_an_interrupted_update_is_tried_again_after_six_minutes_on_one_con
     assert release.host_update_state(row).state == "updating"
 
     # The same connection is not used again, even if its row read as
-    # interrupted once more.
-    await set_host(host_id, update_state="failed", update_error=INTERRUPTED)
+    # interrupted once more with an offer old enough.
+    await set_host(
+        host_id, update_state="failed", update_error=INTERRUPTED, update_requested_at=before[3]
+    )
     clock.now += 10 * 60
     await offers.poll_once()
     await offers.poll_once()
@@ -901,6 +914,122 @@ async def test_an_interrupted_update_is_tried_again_after_six_minutes_on_one_con
         "daemon update retry 1 of 3: failure cleared; handed to the offer function"
     ]
     assert not any(host_id in record.getMessage() for record in offer_records(caplog))
+
+
+async def test_a_retry_waits_until_the_last_offer_is_an_hour_old_on_the_same_connection(
+    fleet, prebuilts, caplog
+):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    prebuilts.stage("b", TREE_B, 200)
+    prebuilts.activate("b")
+    host_id, ws = await interrupted(fleet)
+    clock = Clock()
+    offers = DaemonReleaseOffers(pause=Pauses(), clock=clock, wall_clock=clock.wall)
+    # The last offer to this host was made just now.
+    await set_host(host_id, update_requested_at=clock.wall())
+    await offers.poll_once()
+
+    clock.now += RETRY_AFTER
+    await offers.poll_once()
+    clock.now += SPACING.total_seconds() - RETRY_AFTER - 1
+    await offers.poll_once()
+    assert ws.pings() == [] and ws.updates() == []
+    assert (await host_row(host_id)).update_error == INTERRUPTED
+
+    # Held back only by the spacing, the connection was not used up.
+    clock.now += 1
+    await offers.poll_once()
+    assert len(ws.pings()) == 1 and trees(ws) == [TREE_B]
+    assert retry_records(caplog) == [
+        "daemon update retry 1 of 3: failure cleared; handed to the offer function"
+    ]
+
+
+async def test_a_restarted_server_keeps_the_spacing_from_the_last_offer(fleet, prebuilts):
+    prebuilts.stage("b", TREE_B, 200)
+    prebuilts.activate("b")
+    host_id, ws = await interrupted(fleet)
+    clock = Clock()
+    offers = DaemonReleaseOffers(pause=Pauses(), clock=clock, wall_clock=clock.wall)
+    await offers.poll_once()
+    clock.now += RETRY_AFTER
+    await offers.poll_once()
+    assert trees(ws) == [TREE_B]
+    offered_at = (await host_row(host_id)).update_requested_at
+
+    # That download is interrupted too, and the server restarts: a new task
+    # that remembers nothing.
+    await fleet.close(ws)
+    _, ws = await fleet.connect(host_id)
+    row = await host_row(host_id)
+    assert (row.update_state, row.update_error, row.update_requested_at) == (
+        "failed",
+        INTERRUPTED,
+        offered_at,
+    )
+    clock = Clock()
+    restarted = DaemonReleaseOffers(pause=Pauses(), clock=clock, wall_clock=clock.wall)
+    await restarted.poll_once()
+    clock.now += RETRY_AFTER
+    await restarted.poll_once()
+    assert ws.pings() == [] and ws.updates() == []
+
+    clock.now += SPACING.total_seconds() - RETRY_AFTER
+    await restarted.poll_once()
+    assert trees(ws) == [TREE_B]
+
+
+async def test_no_retry_on_a_poll_that_makes_a_release_pass(fleet, prebuilts, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    prebuilts.stage("b", TREE_B, 200)
+    prebuilts.stage("b2", TREE_B, 201)
+    prebuilts.activate("b")
+    host_id, ws = await interrupted(fleet)
+    clock = Clock()
+    offers = DaemonReleaseOffers(pause=Pauses(), clock=clock)
+    await offers.poll_once()
+
+    # The host is due a retry, but this poll makes a release pass: the same
+    # tree under a new counter, which the pass leaves alone as failed.
+    clock.now += RETRY_AFTER
+    prebuilts.activate("b2")
+    await offers.poll_once()
+    assert ws.pings() == [] and retry_records(caplog) == []
+    assert "daemon release offer pass: 1 connections considered, 0 tried" in [
+        record.getMessage() for record in offer_records(caplog)
+    ]
+
+    await offers.poll_once()
+    assert trees(ws) == [TREE_B]
+
+
+async def test_a_daemon_that_reconnects_after_the_write_gets_its_offer_from_registration(
+    fleet, prebuilts, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    prebuilts.stage("b", TREE_B, 200)
+    prebuilts.activate("b")
+    host_id, ws = await interrupted(fleet)
+    clock = Clock()
+    offers = DaemonReleaseOffers(pause=Pauses(), clock=clock)
+    real_clear, replacement = offers._clear_interrupted, Socket()
+
+    async def clear_then_reconnect(*args):
+        cleared = await real_clear(*args)
+        fleet.open(host_id, socket=replacement)
+        await asyncio.wait_for(replacement.idle.wait(), 10)
+        return cleared
+
+    monkeypatch.setattr(offers, "_clear_interrupted", clear_then_reconnect)
+    await offers.poll_once()
+    clock.now += RETRY_AFTER
+    await offers.poll_once()
+
+    assert ws.updates() == [] and trees(replacement) == [TREE_B]
+    assert retry_records(caplog) == [
+        "daemon update retry 1 of 3: failure cleared; the daemon reconnected, "
+        "so its registration makes the offer"
+    ]
 
 
 async def test_only_an_interrupted_update_to_the_active_release_is_tried_again(
@@ -945,7 +1074,7 @@ async def test_only_an_interrupted_update_to_the_active_release_is_tried_again(
     offers = DaemonReleaseOffers(pause=pauses, clock=clock)
     await offers.poll_once()
 
-    clock.now += SIX_MINUTES
+    clock.now += RETRY_AFTER
     await offers.poll_once()
 
     assert trees(control_ws) == [TREE_B] and len(control_ws.pings()) == 1
@@ -966,7 +1095,7 @@ async def test_automatic_update_off_tries_nothing_again(fleet, prebuilts, monkey
     offers = DaemonReleaseOffers(pause=Pauses(), clock=clock)
     await offers.poll_once()
 
-    clock.now += SIX_MINUTES
+    clock.now += RETRY_AFTER
     await offers.poll_once()
 
     assert ws.pings() == [] and ws.updates() == []
@@ -996,7 +1125,7 @@ async def test_a_retry_whose_ping_fails_writes_nothing_and_the_pass_continues(
     offers = DaemonReleaseOffers(pause=pauses, clock=clock)
     await offers.poll_once()
 
-    clock.now += SIX_MINUTES
+    clock.now += RETRY_AFTER
     await offers.poll_once()
 
     assert len(silent_ws.pings()) == 1
@@ -1013,14 +1142,16 @@ async def test_a_retry_whose_ping_fails_writes_nothing_and_the_pass_continues(
     ]
 
     # Each connection is pinged for a retry once, whatever the answer.
-    clock.now += SIX_MINUTES
+    clock.now += RETRY_AFTER
     await offers.poll_once()
     assert len(silent_ws.pings()) == 1
     assert silent_ws.updates() == [] and refusing_ws.updates() == []
     assert update_fields(await host_row(silent)) == before[silent]
 
 
-@pytest.mark.parametrize("change", ["registration", "try again", "reported failure"])
+@pytest.mark.parametrize(
+    "change", ["registration", "try again", "try again, then the same text", "reported failure"]
+)
 async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
     owned_fleet, client, prebuilts, monkeypatch, caplog, change
 ):
@@ -1047,12 +1178,27 @@ async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
             monkeypatch.setattr(broker, "accept_daemon_owner", accept)
             fleet.open(host_id, socket=replacement)
             await asyncio.wait_for(activated.wait(), 2)
-        elif change == "try again":
+        elif change.startswith("try again"):
             response = await client.post(
                 f"/api/hosts/{host_id}/update",
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert response.status_code == 202, response.text
+            if change != "try again":
+                # A daemon that names no stage has its error stored as sent:
+                # the row reads as interrupted on this connection again, but
+                # its offer is new, so the write's spacing matches nothing.
+                handled = await daemon_mod._handle_daemon_update_result(
+                    conn,
+                    {
+                        "type": "daemon.update_result",
+                        "request_id": "owner",
+                        "ok": False,
+                        "tree": TREE_B,
+                        "error": INTERRUPTED,
+                    },
+                )
+                assert handled is True
         else:
             handled = await daemon_mod._handle_daemon_update_result(
                 conn,
@@ -1083,7 +1229,7 @@ async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
     clock = Clock()
     offers = DaemonReleaseOffers(pause=Pauses(), clock=clock)
     await offers.poll_once()
-    clock.now += SIX_MINUTES
+    clock.now += RETRY_AFTER
     await offers.poll_once()
 
     assert pinged == 1
@@ -1098,7 +1244,7 @@ async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
         assert broker.get_daemon_for_host(host_id).websocket is replacement
         assert row.daemon_connection_id == broker.get_daemon_for_host(host_id).id
         # Nothing was lost: the replacement registered on the old build, the
-        # failure stands, and the replacement's own six minutes begin.
+        # failure stands, and the replacement's own sixteen minutes begin.
         assert (row.update_state, row.update_tree, row.update_error) == (
             "failed",
             TREE_B,
@@ -1106,13 +1252,20 @@ async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
         )
         assert ws.updates() == [] and replacement.updates() == []
         await offers.poll_once()
-        clock.now += SIX_MINUTES
+        clock.now += RETRY_AFTER
         await offers.poll_once()
         assert trees(replacement) == [TREE_B]
     elif change == "try again":
         # The owner's offer is the only one.
         assert trees(ws) == [TREE_B]
         assert (row.update_state, row.update_tree, row.update_error) == ("updating", TREE_B, None)
+    elif change == "try again, then the same text":
+        assert trees(ws) == [TREE_B]
+        assert (row.update_state, row.update_tree, row.update_error) == (
+            "failed",
+            TREE_B,
+            INTERRUPTED,
+        )
     else:
         assert ws.updates() == []
         assert (row.update_state, row.update_tree, row.update_error) == (
@@ -1125,23 +1278,35 @@ async def test_a_row_that_changes_before_the_write_is_left_as_it_became(
         await fleet.close(ws)
         _, later = await fleet.connect(host_id)
         await offers.poll_once()
-        clock.now += SIX_MINUTES
+        clock.now += RETRY_AFTER
         await offers.poll_once()
         assert later.pings() == [] and later.updates() == []
         row = await host_row(host_id)
         assert row.update_error == "download: request failed"
 
 
-async def test_three_retries_per_host_and_release_then_a_new_release_starts_again(
-    fleet, prebuilts
+async def test_three_retries_per_host_and_tree_then_a_new_release_starts_again(
+    fleet, prebuilts, caplog
 ):
+    caplog.set_level(logging.INFO, logger=LOGGER)
     prebuilts.stage("b", TREE_B, 200)
+    # The same tree released again under a new counter.
+    prebuilts.stage("b2", TREE_B, 201)
     prebuilts.stage("c", TREE_C, 300)
     prebuilts.activate("b")
     host_id, ws = await interrupted(fleet)
     clock, pauses = Clock(), Pauses()
-    offers = DaemonReleaseOffers(pause=pauses, clock=clock)
+    offers = DaemonReleaseOffers(pause=pauses, clock=clock, wall_clock=clock.wall)
     await offers.poll_once()
+    # Past both the connection's wait and the spacing since the last offer.
+    hour = SPACING.total_seconds()
+
+    def warnings() -> list[str]:
+        return [
+            record.getMessage()
+            for record in offer_records(caplog)
+            if record.levelno == logging.WARNING
+        ]
 
     async def interrupted_again(ws: Socket, tree: str) -> Socket:
         # The machine sleeps during the download; its daemon registers again
@@ -1158,17 +1323,32 @@ async def test_three_retries_per_host_and_release_then_a_new_release_starts_agai
         return ws
 
     for _ in range(offers_mod.RETRIES_PER_RELEASE):
-        clock.now += SIX_MINUTES
+        assert warnings() == []
+        clock.now += hour
         await offers.poll_once()
         assert trees(ws) == [TREE_B]
         ws = await interrupted_again(ws, TREE_B)
+    # Using the last one is the one line a person can see, without identifiers.
+    assert warnings() == [
+        "daemon update retry 3 of 3 made for one host; it gets no more for "
+        "this release while the server runs"
+    ]
+    assert host_id not in warnings()[0]
 
-    clock.now += 10 * SIX_MINUTES
+    clock.now += 10 * hour
     await offers.poll_once()
     assert offers_mod.RETRIES_PER_RELEASE == 3
     assert ws.pings() == [] and ws.updates() == []
     row = await host_row(host_id)
     assert (row.update_state, row.update_error) == ("failed", INTERRUPTED)
+
+    # A re-release of the same tree counts as the same release: its pass
+    # finds the host failed for that tree, and no retry follows.
+    prebuilts.activate("b2")
+    await offers.poll_once()
+    clock.now += hour
+    await offers.poll_once()
+    assert ws.pings() == [] and ws.updates() == []
 
     # A newer release is offered by the release pass, as before, and its own
     # retries start from none.
@@ -1176,12 +1356,13 @@ async def test_three_retries_per_host_and_release_then_a_new_release_starts_agai
     await offers.poll_once()
     assert trees(ws) == [TREE_C]
     ws = await interrupted_again(ws, TREE_C)
-    clock.now += SIX_MINUTES
+    clock.now += hour
     await offers.poll_once()
     assert trees(ws) == [TREE_C]
+    assert len(warnings()) == 1
 
 
-async def test_a_connection_that_drops_and_returns_starts_its_six_minutes_again(
+async def test_a_connection_that_drops_and_returns_starts_its_sixteen_minutes_again(
     fleet, prebuilts
 ):
     prebuilts.stage("b", TREE_B, 200)
@@ -1191,7 +1372,7 @@ async def test_a_connection_that_drops_and_returns_starts_its_six_minutes_again(
     offers = DaemonReleaseOffers(pause=Pauses(), clock=clock)
     await offers.poll_once()
 
-    clock.now += SIX_MINUTES - 60
+    clock.now += RETRY_AFTER - 60
     await fleet.close(first)
     _, second = await fleet.connect(host_id)
     # Registration leaves a failed row as it is.
@@ -1201,7 +1382,7 @@ async def test_a_connection_that_drops_and_returns_starts_its_six_minutes_again(
     await offers.poll_once()
     assert first.pings() == [] and second.pings() == [] and second.updates() == []
 
-    clock.now += SIX_MINUTES - 120
+    clock.now += RETRY_AFTER - 120
     await offers.poll_once()
     assert trees(second) == [TREE_B]
 

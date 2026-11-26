@@ -431,23 +431,35 @@ previous binary", whether or not any update result arrived. That is how an
 update ends when the machine sleeps or loses its network during the download;
 the ping covers only an offer sent into a connection that is already dead. The
 second way tries such an interrupted update again (issue #170): once the
-daemon's connection has stayed registered for six minutes, longer than the
-daemon's own five-minute download limit, it pings the daemon and, if the host's
-row is still exactly as it read it, clears that failure and makes the same
-offer. It does this once per connection and at most three times per host and
-release while the server runs, one host at a time, and never during a release
+daemon's connection has stayed registered for sixteen minutes and the host's
+last offer is at least an hour old, it pings the daemon and, if the host's row
+is still exactly as it read it, clears that failure and makes the same offer.
+An earlier attempt on the machine can take about fifteen and a half minutes of
+the daemon's awake time (two manifest fetches of up to five minutes each, the
+downloads capped at five, two fifteen-second version checks); sixteen minutes
+is longer than that. Registration leaves a failed row's update fields alone, so
+the failure may have been recorded on any earlier connection, and the first
+deploy of this retry also retries every host already stored with that failure
+for the active release, once its connection has been up for sixteen minutes
+and its last offer is an hour old. The second way retries a host once per
+connection, at most once an hour (the hour is read from the host's row, so a
+server restart does not shorten it), at most three times per host and daemon
+tree while the server runs, one host at a time, and never during a release
 pass. Until then the owner's SPAWN D apps show the update as failed; then as
-updating, and as current once the new build registers. Any other failure for a
-release, such as a verify error or a health revert that the daemon reported in
-its own words, and an interrupted update that has used its three retries, are
-not offered to the host again until its owner chooses Try again or a newer
-release is published. Registration's repair of a mismatched worker pair is the
-exception to the skips: it is offered whatever the host's update state. The
-second way also leaves a host with a mismatched worker pair to registration,
-which repairs it, and never retries one. It offers nothing while the manifest
-is unreadable, and makes no pass for a release it has already seen or one with
-a lower counter than one it has seen; a retry only repeats, for the active
-release, an offer already made to that host.
+updating, and as current once the new build registers. A retry that still
+finds the daemon busy with an earlier attempt leaves "precondition: busy"
+stored, which the second way never retries: unless that earlier attempt brings
+the new build up, the owner's Try again or the next release clears it. Any
+other failure for a release, such as a verify error or a health revert that the
+daemon reported in its own words, and an interrupted update that has used its
+three retries, are not offered to the host again until its owner chooses Try
+again or a newer release is published. Registration's repair of a mismatched
+worker pair is the exception to the skips: it is offered whatever the host's
+update state. The second way also leaves a host with a mismatched worker pair
+to registration, which repairs it, and never retries one. It offers nothing
+while the manifest is unreadable, and makes no pass for a release it has
+already seen or one with a lower counter than one it has seen; a retry only
+repeats, for the active release, an offer already made to that host.
 `SPAWN_DAEMON_AUTO_UPDATE=false` stops both ways, except that repair.
 `SPAWN_DAEMON_RELEASE_OFFERS=false` stops only the second, its retries
 included. `server/CLAUDE.md` ("Daemon release offers") has the details.
