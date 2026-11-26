@@ -90,11 +90,12 @@ registers again while the previous release is still active. Without a second
 path, a connected daemon would get each release one registration late, which
 usually means at the next deploy.
 
-`daemon_release_offers.py` is that second path. It is one lifespan task,
-started and stopped like the support log pump. Every 15 seconds it reads the
-active manifest in a worker thread, because the first read of a new release
-hashes every binary the manifest lists. The tree and the release counter name
-a release. At startup the task records the active release and offers nothing.
+`daemon_release_offers.py` is that second path, and it also tries again an
+update that a sleeping or disconnected machine interrupted (below). It is one
+lifespan task, started and stopped like the support log pump. Every 15
+seconds it reads the active manifest in a worker thread, because the first
+read of a new release hashes every binary the manifest lists. The tree and the
+release counter name a release. At startup the task records the active release and offers nothing.
 When the release changes, it calls the registration's own offer function for
 each connected daemon, one host at a time, with two seconds between offers. It
 calls it only for hosts that function would give an ordinary update: automatic
@@ -122,14 +123,71 @@ and whose machine then sleeps or loses its network during the download ends
 the same way, with or without this task: when it registers again on its old
 build, registration's activation write records the update as failed
 ("restarted on the previous binary"), whether or not any update result
-arrived, and that release is not offered to the host again until its owner
-chooses Try again or a newer release is published. Issue #170 is about that
-case.
+arrived. The task tries that one failure again (issue #170, below). Any other
+failure for a release is not offered to the host again until its owner chooses
+Try again or a newer release is published.
+
+On a poll that makes no release pass, the task looks for an interrupted
+update to try again. It does so only for a host whose row says exactly: failed,
+"restarted on the previous binary", for the active release's tree, owned by
+the connection the daemon is on now; whose last offer (`update_requested_at`,
+which every offer sets) is at least an hour old; and whose daemon is still
+behind that release, can update itself and has no mismatched worker pair, with
+automatic updates on. The owner check means only that this connection now owns
+the row. Registration stamps its own connection on the row and leaves a failed
+row's update fields alone, so a failure recorded on any earlier connection is
+tried again too. That connection must have been seen by the task's polls for
+sixteen minutes without a break. The task keeps those first-seen times itself,
+in memory, so a connection that drops and returns starts again. An earlier
+attempt on the machine can take about fifteen and a half minutes of the
+daemon's awake time: two manifest fetches of up to five minutes each, the
+downloads capped at five, and two fifteen-second version checks. Sixteen
+minutes is longer than that, and far longer than a sleeping laptop's brief
+wake. The daemon must answer the ping, as before an offer. Then one conditional
+write clears the state and its text, only if the row still holds exactly what
+was read, the hour's spacing included: a registration since then (another
+connection), the owner's Try again (updating, with a new offer time) or a
+failure the daemon reported (another text, or the same text with a new offer
+time) makes it match nothing, and nothing is written. The attempted tree and
+the offer time are kept, so a failure reported after the write still reads as
+failed for this release and the offer function leaves it alone. Then the
+registration's offer function, unchanged, makes the offer or decides not to.
+The owner's apps show the host as failed until then, as updating for up to
+three minutes (the state function's limit; after it, available), and as
+current once the new build registers. A real failure (a verify error, a health
+revert) is reported by the daemon in its own words, replaces the row and stays
+for the owner. A retry that still finds the daemon busy with an earlier attempt
+is refused by it, and "precondition: busy" is stored. The task never retries
+that text: unless the earlier attempt itself brings the new build up, it is the
+owner's Try again or the next release that clears it. The conditional write
+cannot see a Try again that read the failed row before it and writes after it,
+since that route writes without a condition; if that write also lands after the
+offer function's read, both send, and the daemon refuses the second as busy,
+which is stored as "precondition: busy" until the first attempt's own result or
+the new build's registration replaces what the apps show.
+
+Each connection is used for at most one retry, whatever the ping's answer. The
+hour's spacing is checked while the row is judged, before the connection is
+marked used, so a host held back only by it is tried on the same connection
+once the hour has passed. The spacing is read from the row, so it survives a
+server restart: a host on a link that always drops mid-download is asked again
+at most once an hour, however often the server restarts. Each host also gets at
+most three retries per daemon tree for the life of the server process; that
+count is in memory, and keyed by tree alone, as failures are, so a re-release
+of the same tree under a new counter does not reset it. One host at a time,
+with the two-second gap between hosts pinged. Never during a release pass: a
+poll that makes one makes no retry. Each attempt logs one INFO line with its
+outcome and, once the failure is cleared, its count, and no host identifiers.
+Production does not emit INFO lines, so a host's third retry for a tree also
+logs one WARNING, with counts only. A host that has used its three, or whose
+update failed in any other way, is left to its owner's Try again or a newer
+release.
 
 Nothing is offered while the manifest is unreadable or missing. Nothing is
 offered when the release changes to one the task has already seen, or to one
 whose counter is lower than any it has seen. The daemon refuses a downgrade as
-well.
+well. A retry only repeats, for the active release, an offer already made to
+that host.
 
 Registration's offer reads the host, then writes it, then sends. Two callers
 inside that window could both send. So the task offers only to a connection the
@@ -143,10 +201,11 @@ offer or manifest read in progress. Each pass logs one INFO line
 with the number of connections considered and of hosts handed to the offer
 function, which does not report whether it sent, and no host identifiers.
 
-`SPAWN_DAEMON_RELEASE_OFFERS=false` means the task is never started, and only
-registration offers a release. `SPAWN_DAEMON_AUTO_UPDATE=false` stops the task
-from offering anything, and stops registration's offers except its repair of a
-mismatched worker pair.
+`SPAWN_DAEMON_RELEASE_OFFERS=false` means the task is never started: only
+registration offers a release, and nothing interrupted is tried again.
+`SPAWN_DAEMON_AUTO_UPDATE=false` stops the task from offering or retrying
+anything, and stops registration's offers except its repair of a mismatched
+worker pair.
 
 ## Support log delivery and storage
 
