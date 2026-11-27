@@ -2542,6 +2542,11 @@ mod tests {
         let history = ViewerHistory::default();
         let cause = "reading /tmp/history/seg-00000001.log: No such file or directory (os error 2)";
         let error = anyhow::Error::new(WorkerReplayRefused::new(cause.to_owned()));
+        // With one scoped subscriber in the process, tracing-core takes a new
+        // callsite's interest from the default of whichever thread reaches it
+        // first: the viewer replay tests reach these with none, and the
+        // callsite stays silent here. With two it asks every live one.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         tracing::subscriber::with_default(tracing_subscriber::registry().with(log.layer()), || {
             let session_id = Uuid::new_v4();
             history.report(session_id, true, &error);

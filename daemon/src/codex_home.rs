@@ -1128,6 +1128,10 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
                     .with_writer(move || CapturedStderr(sink.clone())),
             )
             .with(log.layer());
+        // A second dispatcher, so the warning still logs here when the
+        // unparseable-config test below reaches its callsite first, with no
+        // subscriber (why: the support log test in pty.rs).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let merged = tracing::subscriber::with_default(subscriber, || {
             merged_config(Some(&broken), None, &[], None)
         });
