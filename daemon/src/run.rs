@@ -4906,6 +4906,19 @@ mod tests {
         reply(reads.try_recv().unwrap(), active.generation);
         assert!(futures_util::poll!(&mut connect).is_pending());
         reply(reads.try_recv().unwrap(), active.generation);
+        // The handshake below is real loopback I/O. Whenever the runtime would
+        // park, the paused clock jumps to the next timer, finished I/O or not,
+        // so a handshake the kernel completes a moment late (macOS) loses to
+        // the attempt's own deadlines: the monitor read this test never
+        // answers fails it. Tokio does not auto-advance while a blocking task
+        // runs, so park one (as `support::tests::freeze_time` does): no
+        // deadline moves until the listener accepts. Dropping `_frozen` lets
+        // it go, on a panic too; after 30 s it lets go by itself and the
+        // clock moves again.
+        let (_frozen, parked) = std_mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = parked.recv_timeout(Duration::from_secs(30));
+        });
         tokio::select! {
             _ = &mut connect => panic!("supervisor exited before connecting"),
             accepted = listener.accept() => { accepted.unwrap(); }

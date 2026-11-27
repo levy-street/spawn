@@ -951,6 +951,10 @@ fn the_real_worker_error_callsite_keeps_replay_io_but_withholds_other_causes() {
         .without_time()
         .with_ansi(false)
         .with_writer(move || writer.clone());
+    // A second dispatcher, so the worker-error callsites still log here when
+    // a test with a real worker reaches them first, with no subscriber (why:
+    // the support log test in pty.rs).
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     tracing::subscriber::with_default(
         tracing_subscriber::registry()
             .with(stderr)

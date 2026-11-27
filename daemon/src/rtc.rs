@@ -12103,6 +12103,10 @@ mod tests {
 
     #[tokio::test]
     async fn linearized_mutations_may_finish_after_bounded_close_without_publication() {
+        // A guard against a hang only: each wait it bounds is for a step this
+        // test has just set going, which a starved runner can take seconds to
+        // schedule. The close's 500 ms is the property under test, not this.
+        const HANG_GUARD: Duration = Duration::from_secs(30);
         let cases = [
             (
                 HostOperationKind::Mkdir,
@@ -12161,12 +12165,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                hooks.wait_effect_boundary_entered(kind),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("{label} did not reach the effect linearization boundary"));
+            tokio::time::timeout(HANG_GUARD, hooks.wait_effect_boundary_entered(kind))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{label} did not reach the effect linearization boundary")
+                });
 
             let closing_channel = Arc::clone(&channel);
             let close = tokio::spawn(async move { closing_channel.close().await });
@@ -12179,7 +12182,7 @@ mod tests {
             assert!(!root.path().join("renamed.txt").exists(), "{label}");
             assert!(root.path().join("victim.txt").exists(), "{label}");
             hooks.release_effect_boundary(kind);
-            tokio::time::timeout(Duration::from_secs(2), hooks.wait_blocking_finished(kind))
+            tokio::time::timeout(HANG_GUARD, hooks.wait_blocking_finished(kind))
                 .await
                 .unwrap_or_else(|_| panic!("{label} authorized effect did not finish"));
             close.await.unwrap().unwrap();
