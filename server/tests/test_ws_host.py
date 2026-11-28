@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -1123,3 +1124,215 @@ async def test_statuses_after_a_rebind_reach_the_browser_from_the_current_owner(
         await asyncio.wait_for(browser_task, timeout=1)
         for task in list(daemon_mod._daemon_orphan_expiry_tasks):
             task.cancel()
+
+
+# A short-lived attach socket says why it ended (#176). Its clock is a fake one
+# that moves only when the client's close arrives; nothing here waits on time.
+
+
+class _Clock:
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _TimedWebSocket(FakeWebSocket):
+    """A browser socket that stays open `lifetime` seconds of the fake clock."""
+
+    def __init__(self, clock: _Clock, *, lifetime: float, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.clock = clock
+        self.lifetime = lifetime
+
+    async def receive(self) -> dict[str, Any]:
+        message = await super().receive()
+        if message["type"] == "websocket.disconnect":
+            self.clock.now += self.lifetime
+        return message
+
+    def queue_close(self, code: int) -> None:
+        self._incoming.put_nowait({"type": "websocket.disconnect", "code": code})
+
+    def queue_bytes(self, payload: bytes) -> None:
+        self._incoming.put_nowait({"type": "websocket.receive", "bytes": payload})
+
+
+def _short_lived_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "spawn.ws.host"
+        and record.levelname == "WARNING"
+        and record.getMessage().startswith("short-lived host signaling socket")
+    ]
+
+
+def _assert_names_no_one(lines: list[str], *secrets: str) -> None:
+    assert lines
+    for line in lines:
+        for secret in secrets:
+            assert secret not in line
+        # No id, key, e-mail or address of any shape.
+        assert (
+            re.search(r"[0-9a-f]{8}-|[0-9a-f]{16}|[A-Za-z0-9_-]{32}|@|\d+\.\d+\.\d+", line) is None
+        )
+
+
+@pytest.fixture
+def short_lived_clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    from spawn_server.ws import host as host_mod
+
+    clock = _Clock()
+    monkeypatch.setattr(host_mod, "_socket_clock", clock)
+    monkeypatch.setattr(host_mod, "_short_lived_sockets", host_mod._ShortLivedSockets())
+    return clock
+
+
+async def test_a_short_lived_host_socket_says_why_it_ended(client, short_lived_clock, caplog):
+    user_id, token = await _signup(client, "host-ws-short-lived@example.com")
+    host_id = await _create_host(user_id, "short-lived")
+    ws = _TimedWebSocket(short_lived_clock, lifetime=0.4, authorization=f"Bearer {token}")
+    session_id = str(uuid.uuid4())
+    ws.queue_text({"type": "pong", "ts": 1})
+    ws.queue_text(
+        {"type": "rtc.offer", "session_id": session_id, "sdp": "v=0\r\n", **_metadata(host_id)}
+    )
+    # A type the client made up is counted, never named.
+    ws.queue_text({"type": f"probe-{host_id}", **_metadata(host_id), "session_id": session_id})
+    ws.queue_close(1000)
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
+
+    # No daemon: the server itself answered the offer.
+    statuses = [frame for frame in _json_messages(ws) if frame.get("type") == "rtc.status"]
+    assert [frame["status"] for frame in statuses] == ["unavailable"]
+    assert _short_lived_lines(caplog) == [
+        "short-lived host signaling socket: ended 0.4 s after accept; client close code 1000; "
+        "rtc.config sent; received other=1, pong=1, rtc.offer=1; "
+        "last rtc.status sent unavailable (from the server); "
+        "this line stands for 1 such socket of one account and host"
+    ]
+    _assert_names_no_one(_short_lived_lines(caplog), host_id, user_id, token, session_id)
+
+
+async def test_short_lived_host_sockets_are_told_once_a_minute_per_account_and_host(
+    client, short_lived_clock, caplog
+):
+    user_id, token = await _signup(client, "host-ws-short-lived-pacing@example.com")
+    first_host = await _create_host(user_id, "short-lived-first")
+    second_host = await _create_host(user_id, "short-lived-second")
+
+    async def attach(host_id: str, lifetime: float = 1.0) -> None:
+        ws = _TimedWebSocket(short_lived_clock, lifetime=lifetime, authorization=f"Bearer {token}")
+        ws.queue_close(1001)
+        await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
+
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        await attach(first_host)
+        assert len(_short_lived_lines(caplog)) == 1
+        short_lived_clock.now += 10
+        await attach(first_host)  # within the minute: counted, not written
+        assert len(_short_lived_lines(caplog)) == 1
+        await attach(second_host)  # another host has its own minute
+        assert len(_short_lived_lines(caplog)) == 2
+        short_lived_clock.now += 60
+        await attach(first_host)
+
+    lines = _short_lived_lines(caplog)
+    assert len(lines) == 3
+    assert lines[0].endswith("this line stands for 1 such socket of one account and host")
+    assert lines[1].endswith("this line stands for 1 such socket of one account and host")
+    assert lines[2].endswith("this line stands for 2 such sockets of one account and host")
+    assert all(
+        "client close code 1001; rtc.config sent; received nothing;" in line for line in lines
+    )
+    assert all("last rtc.status sent none;" in line for line in lines)
+    _assert_names_no_one(lines, first_host, second_host, user_id, token)
+
+
+async def test_a_long_lived_host_socket_says_nothing_and_is_not_counted(
+    client, short_lived_clock, caplog
+):
+    user_id, token = await _signup(client, "host-ws-long-lived@example.com")
+    host_id = await _create_host(user_id, "long-lived")
+
+    async def attach(lifetime: float) -> None:
+        ws = _TimedWebSocket(short_lived_clock, lifetime=lifetime, authorization=f"Bearer {token}")
+        ws.queue_close(1000)
+        await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
+
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        await attach(30.0)
+        assert _short_lived_lines(caplog) == []
+        await attach(1.0)
+    lines = _short_lived_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0].endswith("this line stands for 1 such socket of one account and host")
+
+
+async def test_a_relayed_status_is_reported_as_the_daemons(short_lived_clock, caplog):
+    from spawn_server.ws import host as host_mod
+
+    conn = HostBrowserConn("owner", "host-1", FakeWebSocket())  # type: ignore[arg-type]
+    conn.accepted_at = short_lived_clock.now
+    binding = BrowserRtcSession("relayed", "a" * 32, 1, "1" * 32, float("inf"))
+    assert await _forward_if_exact_binding(
+        conn,
+        {
+            "type": "rtc.status",
+            "session_id": "relayed",
+            "binding_nonce": binding.nonce,
+            "status": "connected",
+        },
+        binding,
+        {"relayed": binding},
+        {},
+        asyncio.Lock(),
+        connected=True,
+    )
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        host_mod._log_short_lived_socket(conn, short_lived_clock.now + 2.5)
+    assert _short_lived_lines(caplog) == [
+        "short-lived host signaling socket: ended 2.5 s after accept; client close code none; "
+        "rtc.config not sent; received nothing; "
+        "last rtc.status sent connected (relayed from the daemon); "
+        "this line stands for 1 such socket of one account and host"
+    ]
+
+
+async def test_a_failure_in_the_short_lived_bookkeeping_changes_nothing(
+    client, short_lived_clock, monkeypatch, caplog
+):
+    from spawn_server.ws import host as host_mod
+
+    user_id, token = await _signup(client, "host-ws-short-lived-failure@example.com")
+    host_id = await _create_host(user_id, "short-lived-failure")
+
+    async def binary_frame() -> _TimedWebSocket:
+        ws = _TimedWebSocket(short_lived_clock, lifetime=0.0, authorization=f"Bearer {token}")
+        ws.queue_text({"type": "pong", "ts": 1})
+        ws.queue_bytes(b"\x00")
+        await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
+        return ws
+
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        healthy = await binary_frame()
+    assert healthy.closed == (4002, "binary frames are not allowed on the signaling websocket")
+    assert len(_short_lived_lines(caplog)) == 1
+    caplog.clear()
+
+    def broken(*_args: object) -> int:
+        raise RuntimeError("bookkeeping broke")
+
+    monkeypatch.setattr(host_mod._short_lived_sockets, "note", broken)
+    with caplog.at_level("WARNING", logger="spawn.ws.host"):
+        failing = await binary_frame()
+    assert failing.closed == healthy.closed
+    assert [frame.get("type") for frame in _json_messages(failing)] == [
+        frame.get("type") for frame in _json_messages(healthy)
+    ]
+    assert _short_lived_lines(caplog) == []
+    assert "crashed" not in caplog.text
+    assert "bookkeeping broke" not in caplog.text

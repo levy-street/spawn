@@ -34,6 +34,18 @@ interface RetirableSocket {
   retire(): void;
 }
 
+function parseFrameRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string") return null;
+  try {
+    const frame = JSON.parse(value) as unknown;
+    return typeof frame === "object" && frame !== null && !Array.isArray(frame)
+      ? (frame as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 const SOCKET_REGISTRY = new Set<RetirableSocket>();
 const PROTOCOL_REQUIRED_LISTENERS = new Set<() => void>();
 
@@ -70,6 +82,14 @@ export interface ReconnectingSocketOptions {
   reconnectDelayMs?: (attempt: number, random: number) => number;
   random?: () => number;
   watchdogFrameTypes?: readonly string[];
+  /**
+   * Whether a server frame proves this socket useful, not merely open. Only
+   * such a frame restarts the reconnect backoff: a socket the server accepts
+   * and then ends keeps backing off. By default the server's keepalive
+   * (`watchdogFrameTypes`), which a socket hears only after staying open
+   * through one keepalive interval.
+   */
+  provesUseful?: (frame: Record<string, unknown>) => boolean;
   authorization?: () => Promise<AuthTokenSnapshot>;
   createWebSocket?: (
     url: string,
@@ -89,6 +109,7 @@ export class ReconnectingSocket<Outbound = unknown> {
     maxReconnectAttempt: number;
     reconnectDelayMs: ((attempt: number, random: number) => number) | null;
     watchdogFrameTypes: readonly string[];
+    provesUseful: ((frame: Record<string, unknown>) => boolean) | null;
     authorization: (() => Promise<AuthTokenSnapshot>) | null;
   };
 
@@ -101,6 +122,11 @@ export class ReconnectingSocket<Outbound = unknown> {
   private intentionallyClosed = false;
   private hasConnected = false;
   private watchdogStarted = false;
+  // Set once the current socket has proved useful (`provesUseful`).
+  private provenUseful = false;
+  // A 4010 close (the server lost its subscription) earns one reopen at once.
+  // A second one before any socket has proved useful waits like any failure.
+  private immediateReopenUsed = false;
   private closeInfoValue: SocketCloseInfo | null = null;
   private readonly stateListeners = new Set<Listener<SocketState>>();
   private readonly messageListeners = new Set<Listener<unknown>>();
@@ -115,6 +141,7 @@ export class ReconnectingSocket<Outbound = unknown> {
       maxReconnectAttempt: options.maxReconnectAttempt ?? 6,
       reconnectDelayMs: options.reconnectDelayMs ?? null,
       watchdogFrameTypes: options.watchdogFrameTypes ?? ["ping", "alerts.ping"],
+      provesUseful: options.provesUseful ?? null,
       authorization: options.authorization ?? null,
       random: options.random ?? Math.random,
       createWebSocket:
@@ -259,19 +286,26 @@ export class ReconnectingSocket<Outbound = unknown> {
         return;
       }
 
+      // Open is not useful: the backoff restarts only on `provesUseful`.
       this.hasConnected = true;
-      this.reconnectAttemptValue = 0;
       this.closeInfoValue = null;
       this.watchdogStarted = false;
+      this.provenUseful = false;
       this.setState("open");
     };
     socket.onmessage = (event) => {
       if (!this.isCurrent(socket, generation)) {
         return;
       }
-      if (this.watchdogStarted || this.isWatchdogStartFrame(event.data)) {
+      const frame = this.watchdogStarted && this.provenUseful ? null : parseFrameRecord(event.data);
+      if (this.watchdogStarted || this.isWatchdogStartFrame(frame)) {
         this.watchdogStarted = true;
         this.armWatchdog(generation);
+      }
+      if (!this.provenUseful && frame && this.frameProvesUseful(frame)) {
+        this.provenUseful = true;
+        this.reconnectAttemptValue = 0;
+        this.immediateReopenUsed = false;
       }
       for (const listener of this.messageListeners) {
         try {
@@ -305,7 +339,8 @@ export class ReconnectingSocket<Outbound = unknown> {
         this.setState("failed");
         return;
       }
-      if (event.code === 4010) {
+      if (event.code === 4010 && !this.immediateReopenUsed) {
+        this.immediateReopenUsed = true;
         void this.startConnection(true);
         return;
       }
@@ -313,16 +348,15 @@ export class ReconnectingSocket<Outbound = unknown> {
     };
   }
 
-  private isWatchdogStartFrame(value: unknown): boolean {
-    if (typeof value !== "string") return false;
+  private isWatchdogStartFrame(frame: Record<string, unknown> | null): boolean {
+    const type = frame?.["type"];
+    return typeof type === "string" && this.options.watchdogFrameTypes.includes(type);
+  }
+
+  private frameProvesUseful(frame: Record<string, unknown>): boolean {
+    if (!this.options.provesUseful) return this.isWatchdogStartFrame(frame);
     try {
-      const frame = JSON.parse(value) as { type?: unknown };
-      return (
-        typeof frame === "object" &&
-        frame !== null &&
-        typeof frame.type === "string" &&
-        this.options.watchdogFrameTypes.includes(frame.type)
-      );
+      return this.options.provesUseful(frame);
     } catch {
       return false;
     }

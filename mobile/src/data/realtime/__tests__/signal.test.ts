@@ -179,4 +179,78 @@ describe("signalling relays", () => {
     expect(useConnectionStore.getState().sessionTransports["session-1"]).toBe("closed");
     channel.close();
   });
+
+  describe("reconnect backoff", () => {
+    let random: jest.SpyInstance<number, []>;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      // No jitter: every delay is the schedule's own.
+      random = jest.spyOn(Math, "random").mockReturnValue(0.5);
+    });
+
+    afterEach(() => {
+      random.mockRestore();
+      jest.useRealTimers();
+    });
+
+    async function settle(): Promise<void> {
+      for (let round = 0; round < 10; round += 1) await Promise.resolve();
+    }
+
+    async function delayUntilNextSocket(): Promise<number> {
+      const before = FakeWebSocket.instances.length;
+      const from = Date.now();
+      for (let step = 0; step < 20 && FakeWebSocket.instances.length === before; step += 1) {
+        jest.advanceTimersToNextTimer();
+        await settle();
+      }
+      expect(FakeWebSocket.instances).toHaveLength(before + 1);
+      return Date.now() - from;
+    }
+
+    /** Accepted and greeted as the server greets every socket, then ended. */
+    function acceptThenEnd(...frames: string[]): void {
+      const socket = FakeWebSocket.instances.at(-1);
+      socket?.open();
+      socket?.message('{"type":"rtc.config","enabled":true}');
+      for (const frame of frames) socket?.message(frame);
+      socket?.close(1011);
+    }
+
+    it.each([
+      ["host", () => openHostSignal("host-backoff")],
+      ["session", () => openSessionSignal("session-backoff")],
+    ])("a %s socket the server accepts and then ends keeps backing off", async (_name, open) => {
+      const channel = open();
+      await settle();
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        acceptThenEnd('{"type":"ping","ts":1}', '{"type":"rtc.status","status":"unavailable"}');
+        expect(await delayUntilNextSocket()).toBe(500 * 2 ** attempt);
+      }
+      channel.close();
+    });
+
+    it.each([
+      ["host", () => openHostSignal("host-proof")],
+      ["session", () => openSessionSignal("session-proof")],
+    ])(
+      "a %s socket restarts its backoff on a confirmed resume or a connected peer",
+      async (_name, open) => {
+        const channel = open();
+        await settle();
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          acceptThenEnd();
+          await delayUntilNextSocket();
+        }
+        acceptThenEnd('{"type":"rtc.status","status":"resumed"}');
+        expect(await delayUntilNextSocket()).toBe(500);
+        acceptThenEnd();
+        expect(await delayUntilNextSocket()).toBe(1_000);
+        acceptThenEnd('{"type":"rtc.status","status":"connected"}');
+        expect(await delayUntilNextSocket()).toBe(500);
+        channel.close();
+      },
+    );
+  });
 });

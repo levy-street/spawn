@@ -64,6 +64,13 @@ export type AlertFrame =
   | { type: "alerts.ping" }
   | { type: "protocol.required"; protocol: "spawn.alerts.v1"; version: 1 };
 
+/**
+ * The server sends nothing when it accepts this socket. Its keepalive comes
+ * only after the socket has stayed open for one interval (25 seconds), and an
+ * event only through a working subscription: either proves the socket useful.
+ */
+const USEFUL_ALERT_FRAMES = new Set(["alerts.ping", "alert", "trust", "data"]);
+
 type AlertListener = (alert: AlertEvent) => void;
 type TrustListener = (event: TrustEvent) => void;
 type FrameListener = (frame: AlertFrame) => void;
@@ -228,6 +235,10 @@ export class AlertSocketClient {
       protocol: ALERT_PROTOCOL,
       ...(createWebSocket ? {} : { authorization: () => authToken.snapshot() }),
       watchdogFrameTypes: ["alerts.ping"],
+      provesUseful: (frame) => {
+        const type = frame["type"];
+        return typeof type === "string" && USEFUL_ALERT_FRAMES.has(type);
+      },
       ...(createWebSocket ? { createWebSocket } : {}),
     });
     this.unsubscribeMessage = this.socket.onMessage((value) => {
