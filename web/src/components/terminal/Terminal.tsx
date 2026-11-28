@@ -34,6 +34,7 @@ import {
   LiveTerminalWriteBuffer,
   PostRenderLiveWriteBuffer,
 } from "@/components/terminal/live-write-buffer";
+import { createRitualSpinner } from "@/components/terminal/ritual-spinner.mjs";
 import { socketAcceptingInput } from "@/components/terminal/terminal-input";
 import { openTerminalLink } from "@/components/terminal/terminal-link";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
@@ -326,6 +327,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // the browser keeps WebGL contexts for, and a context it takes back by force
   // left its terminal drawing nothing (see `gpu-renderer.ts`).
   const webglAddonRef = useRef<WebglAddon | null>(null);
+  // Claude Code's spinner drawn as a ritual when its word is a ritual phrase
+  // (ritual-spinner.mjs). Foreground terminals only, like the GPU renderer.
+  const ritualSpinnerRef = useRef<ReturnType<typeof createRitualSpinner> | null>(null);
   /** This terminal's identity in the page's GPU budget. */
   const gpuOwnerRef = useRef({});
   /**
@@ -428,6 +432,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     activePrevRef.current = active;
     activeRef.current = active;
     syncWebglRenderer(active);
+    // A parked terminal animates nothing; the next settled write after it
+    // returns to the foreground finds the spinner again.
+    ritualSpinnerRef.current?.setActive(active);
     if (!active) displayClaimOwedRef.current = false;
     if (active && !was) {
       // Brought to the foreground from a parked state: that is an opening, so
@@ -1269,6 +1276,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     reportAgentNotice(detectAgentNotice(screenLines(rows)));
   }, [reportAgentNotice]);
   const scheduleAgentNoticeScan = useCallback(() => {
+    // The ritual spinner reads the same screen at the same settled moments,
+    // on its own shorter timer.
+    ritualSpinnerRef.current?.schedule();
     if (!onAgentNoticeRef.current || agentNoticeTimerRef.current !== null) return;
     agentNoticeTimerRef.current = window.setTimeout(() => {
       agentNoticeTimerRef.current = null;
@@ -1905,6 +1915,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     term.open(containerRef.current);
     termRef.current = term;
     fitRef.current = fit;
+    ritualSpinnerRef.current = createRitualSpinner(term);
+    ritualSpinnerRef.current.setActive(activeRef.current);
     // Track whether the viewport sits at the live edge so the "jump to latest"
     // button can appear only when the reader has scrolled up. State is written
     // only on transitions. Detection is doubled up for reliability across
@@ -3041,6 +3053,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       predictorRef.current.clear();
       releaseGpuRendererRef.current(false);
+      ritualSpinnerRef.current?.dispose();
+      ritualSpinnerRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
