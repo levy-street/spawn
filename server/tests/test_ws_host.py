@@ -1211,13 +1211,13 @@ async def test_a_short_lived_host_socket_says_why_it_ended(client, short_lived_c
     assert _short_lived_lines(caplog) == [
         "short-lived host signaling socket: ended 0.4 s after accept; client close code 1000; "
         "rtc.config sent; received other=1, pong=1, rtc.offer=1; "
-        "last rtc.status sent unavailable (from the server); "
-        "this line stands for 1 such socket of one account and host"
+        "last rtc.status sent unavailable (this socket's answer to a frame); "
+        "this line stands for 1 such socket of one account and host since the last line like this"
     ]
     _assert_names_no_one(_short_lived_lines(caplog), host_id, user_id, token, session_id)
 
 
-async def test_short_lived_host_sockets_are_told_once_a_minute_per_account_and_host(
+async def test_short_lived_host_sockets_are_told_once_every_ten_minutes_per_account_and_host(
     client, short_lived_clock, caplog
 ):
     user_id, token = await _signup(client, "host-ws-short-lived-pacing@example.com")
@@ -1229,22 +1229,28 @@ async def test_short_lived_host_sockets_are_told_once_a_minute_per_account_and_h
         ws.queue_close(1001)
         await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
 
+    # Each socket lives one second of the fake clock; the first line is
+    # written at 1001.
     with caplog.at_level("WARNING", logger="spawn.ws.host"):
         await attach(first_host)
         assert len(_short_lived_lines(caplog)) == 1
-        short_lived_clock.now += 10
-        await attach(first_host)  # within the minute: counted, not written
+        short_lived_clock.now += 70
+        await attach(first_host)  # 71 s on, past a minute: counted, not written
         assert len(_short_lived_lines(caplog)) == 1
-        await attach(second_host)  # another host has its own minute
+        await attach(second_host)  # another host has its own ten minutes
         assert len(_short_lived_lines(caplog)) == 2
-        short_lived_clock.now += 60
-        await attach(first_host)
+        short_lived_clock.now += 520
+        await attach(first_host)  # 593 s on: still counted, not written
+        assert len(_short_lived_lines(caplog)) == 2
+        short_lived_clock.now += 10
+        await attach(first_host)  # 604 s on: written, standing for all three
 
     lines = _short_lived_lines(caplog)
     assert len(lines) == 3
-    assert lines[0].endswith("this line stands for 1 such socket of one account and host")
-    assert lines[1].endswith("this line stands for 1 such socket of one account and host")
-    assert lines[2].endswith("this line stands for 2 such sockets of one account and host")
+    since = "of one account and host since the last line like this"
+    assert lines[0].endswith(f"this line stands for 1 such socket {since}")
+    assert lines[1].endswith(f"this line stands for 1 such socket {since}")
+    assert lines[2].endswith(f"this line stands for 3 such sockets {since}")
     assert all(
         "client close code 1001; rtc.config sent; received nothing;" in line for line in lines
     )
@@ -1269,10 +1275,16 @@ async def test_a_long_lived_host_socket_says_nothing_and_is_not_counted(
         await attach(1.0)
     lines = _short_lived_lines(caplog)
     assert len(lines) == 1
-    assert lines[0].endswith("this line stands for 1 such socket of one account and host")
+    assert lines[0].endswith(
+        "this line stands for 1 such socket of one account and host since the last line like this"
+    )
 
 
-async def test_a_relayed_status_is_reported_as_the_daemons(short_lived_clock, caplog):
+async def test_a_status_from_the_signal_channel_is_not_credited_to_the_daemon(
+    short_lived_clock, caplog
+):
+    # The host's signal channel carries the daemon's statuses and the ones the
+    # server makes on its behalf, with nothing to tell them apart.
     from spawn_server.ws import host as host_mod
 
     conn = HostBrowserConn("owner", "host-1", FakeWebSocket())  # type: ignore[arg-type]
@@ -1297,8 +1309,9 @@ async def test_a_relayed_status_is_reported_as_the_daemons(short_lived_clock, ca
     assert _short_lived_lines(caplog) == [
         "short-lived host signaling socket: ended 2.5 s after accept; client close code none; "
         "rtc.config not sent; received nothing; "
-        "last rtc.status sent connected (relayed from the daemon); "
-        "this line stands for 1 such socket of one account and host"
+        "last rtc.status sent connected "
+        "(through the host's signal channel, from the daemon or the server); "
+        "this line stands for 1 such socket of one account and host since the last line like this"
     ]
 
 

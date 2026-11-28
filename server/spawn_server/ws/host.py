@@ -85,11 +85,13 @@ WS_CLOSE_BINARY = WS_CLOSE_CONTENT_FORBIDDEN
 MAX_HOST_RTC_BINDING_IDENTITIES = 256
 
 # A socket that ends this soon after it was accepted gets one WARNING saying
-# why (#176), at most once a minute per account and host. The line names no
-# account, host, device key, address or token: a duration, a close code, and
-# counts of frame and status names taken from fixed lists.
+# why (#176), at most once every ten minutes per account and host, so a tab
+# left open on a host whose daemon is away writes a few lines an hour rather
+# than one a minute. The line names no account, host, device key, address or
+# token: a duration, a close code, and counts of frame and status names taken
+# from fixed lists.
 SHORT_LIVED_SOCKET_SECONDS = 30.0
-SHORT_LIVED_LOG_INTERVAL_SECONDS = 60.0
+SHORT_LIVED_LOG_INTERVAL_SECONDS = 600.0
 SHORT_LIVED_TRACKED_PAIRS = 4096
 _COUNTED_FRAME_TYPES = frozenset(
     {"pong", "rtc.config.request", "rtc.resume", "rtc.offer", "rtc.candidate", "rtc.close"}
@@ -108,8 +110,9 @@ class _ShortLivedSockets:
         self._pairs: OrderedDict[tuple[str, str], tuple[float, int]] = OrderedDict()
 
     def note(self, user_id: str, host_id: str, now: float) -> int | None:
-        """Count one short-lived socket: how many a line written now stands
-        for, or None while the last line for this pair is under a minute old."""
+        """Count one short-lived socket: how many have ended since the last
+        line for this pair, this one included, if a line is due now; None
+        while that last line is under ten minutes old."""
         key = (user_id, host_id)
         last_logged, unlogged = self._pairs.pop(key, (None, 0))
         if last_logged is not None and now - last_logged < SHORT_LIVED_LOG_INTERVAL_SECONDS:
@@ -136,6 +139,10 @@ def _count_frame(conn: HostBrowserConn, kind: str) -> None:
 
 
 def _note_status(conn: HostBrowserConn, status_value: object, *, relayed: bool) -> None:
+    """`relayed` is True for a status that came through the host's signal
+    channel. That is the daemon's, or one the server made on its behalf
+    (rebound, unavailable, signalling lost, expired and the rest): the dispatch
+    does not say which, so the line never claims either."""
     conn.last_status = (
         status_value
         if isinstance(status_value, str) and status_value in HOST_RTC_STATUS_ALLOWLIST
@@ -155,12 +162,17 @@ def _log_short_lived_socket(conn: HostBrowserConn, now: float) -> None:
     if conn.last_status is None:
         last_status = "none"
     else:
-        origin = "relayed from the daemon" if conn.last_status_relayed else "from the server"
+        origin = (
+            "through the host's signal channel, from the daemon or the server"
+            if conn.last_status_relayed
+            else "this socket's answer to a frame"
+        )
         last_status = f"{conn.last_status} ({origin})"
     log.warning(
         "short-lived host signaling socket: ended %.1f s after accept; client close code %s; "
         "rtc.config %s; received %s; last rtc.status sent %s; "
-        "this line stands for %d such socket%s of one account and host",
+        "this line stands for %d such socket%s of one account and host "
+        "since the last line like this",
         lived,
         "none" if conn.client_close_code is None else conn.client_close_code,
         "sent" if conn.rtc_config_sent else "not sent",
