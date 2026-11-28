@@ -293,4 +293,68 @@ describe("AlertSocketClient", () => {
       globalThis.WebSocket = original;
     }
   });
+
+  describe("reconnect backoff", () => {
+    let random: jest.SpyInstance<number, []>;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      // No jitter: every delay is the schedule's own.
+      random = jest.spyOn(Math, "random").mockReturnValue(0.5);
+    });
+
+    afterEach(() => {
+      random.mockRestore();
+      jest.useRealTimers();
+    });
+
+    async function settle(): Promise<void> {
+      for (let round = 0; round < 10; round += 1) await Promise.resolve();
+    }
+
+    async function delayUntilNextSocket(sockets: FakeWebSocket[]): Promise<number> {
+      const before = sockets.length;
+      const from = Date.now();
+      for (let step = 0; step < 20 && sockets.length === before; step += 1) {
+        jest.advanceTimersToNextTimer();
+        await settle();
+      }
+      expect(sockets).toHaveLength(before + 1);
+      return Date.now() - from;
+    }
+
+    it("restarts only on its keepalive or an event, never on opening", async () => {
+      const sockets: FakeWebSocket[] = [];
+      const client = new AlertSocketClient(
+        () => "wss://spawn.test/ws/alerts",
+        () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket as unknown as WebSocket;
+        },
+      );
+      client.connect();
+      await settle();
+      // Opened, then ended by the server: 1 s, 2 s, 4 s.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        sockets.at(-1)?.open();
+        sockets.at(-1)?.close(1011);
+        expect(await delayUntilNextSocket(sockets)).toBe(1_000 * 2 ** attempt);
+      }
+      // An event arrives only through a working subscription.
+      sockets.at(-1)?.open();
+      sockets.at(-1)?.message('{"type":"data","resource":"hosts"}');
+      sockets.at(-1)?.close(1011);
+      expect(await delayUntilNextSocket(sockets)).toBe(1_000);
+      sockets.at(-1)?.open();
+      sockets.at(-1)?.close(1011);
+      expect(await delayUntilNextSocket(sockets)).toBe(2_000);
+      // The keepalive arrives only after a socket has stayed open 25 s.
+      sockets.at(-1)?.open();
+      sockets.at(-1)?.message('{"type":"alerts.ping"}');
+      sockets.at(-1)?.close(1011);
+      expect(await delayUntilNextSocket(sockets)).toBe(1_000);
+      client.close();
+    });
+  });
 });

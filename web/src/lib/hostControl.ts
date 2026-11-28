@@ -398,7 +398,11 @@ export class HostControlClient {
   private bindingNonce: string | null = null;
   private bindingGeneration: number | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Grows with every failed attempt; only `connectionWorks` sets it back.
   private reconnectAttempt = 0;
+  // A 4010 close (the server lost its subscription) earns one reopen at once.
+  // A second one with no working connection since waits like any failure.
+  private immediateReopenUsed = false;
   private connectionAttempt = 0;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private signalWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1714,7 +1718,6 @@ export class HostControlClient {
       if (pingSeen) armWatchdog();
       if (parsed.type === "ping") {
         pingSeen = true;
-        this.reconnectAttempt = 0;
         armWatchdog();
         if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
           ws.send(JSON.stringify({ type: "pong", ts: parsed.ts }));
@@ -1722,7 +1725,6 @@ export class HostControlClient {
         return;
       }
       if (parsed.type === "error") {
-        this.reconnectAttempt = 0;
         if (this.resumeInFlight) this.fallBackFromResume();
         return;
       }
@@ -1739,7 +1741,10 @@ export class HostControlClient {
         if (message.type === "rtc.answer" && this.signedRtcSession !== null) this.failRtc();
         return;
       }
-      this.reconnectAttempt = 0;
+      // An accepted socket, its `rtc.config`, a ping or an error frame says
+      // nothing about whether the host can be reached: the server sends the
+      // config the moment it accepts, daemon or no daemon. None of them
+      // restarts the reconnect backoff (#176).
       if (message.type === "rtc.config" && message.enabled) {
         if (!this.hasHealthyRtc()) this.setState("open");
         this.latestIceServers = sanitizeIceServers(message.ice_servers ?? []);
@@ -1821,7 +1826,10 @@ export class HostControlClient {
         }
         this.captureBindingMetadata(message);
         if (["resumed", "rebound", "signalling_lost", "connected"].includes(message.status)) {
-          if (message.status === "resumed") this.clearRtcResumeTimer();
+          if (message.status === "resumed") {
+            this.clearRtcResumeTimer();
+            this.connectionWorks();
+          }
           return;
         }
         if (this.resumeInFlight && message.status === "unavailable") {
@@ -1881,10 +1889,15 @@ export class HostControlClient {
         return;
       }
       if (action === "reconnect_immediately") {
+        // The first reopens at once, as a 4010 always has. A second with no
+        // working connection since reopens the same way, on the schedule.
+        if (this.immediateReopenUsed && this.reconnectTimer) return;
+        const delay = this.immediateReopenUsed ? this.nextReconnectDelay() : 0;
+        this.immediateReopenUsed = true;
         this.reconnectTimer = setTimeout(() => {
           this.reconnectTimer = null;
           this.openWebSocket();
-        }, 0);
+        }, delay);
         return;
       }
       if (!this.stopped) this.scheduleReconnect();
@@ -1974,6 +1987,7 @@ export class HostControlClient {
     pc.onconnectionstatechange = () => {
       if (this.sessionId !== sessionId || this.pc !== pc) return;
       if (pc.connectionState === "connected") {
+        this.connectionWorks();
         if (
           this.options.deviceConnection &&
           this.capabilities.size &&
@@ -2336,7 +2350,7 @@ export class HostControlClient {
     if (message.type === "hello" && message.protocol === HOST_CONTROL_PROTOCOL) {
       this.helloReceived = true;
       this.clearConnectDeadline();
-      this.reconnectAttempt = 0;
+      this.connectionWorks();
       // Parsed before `ready` so no subscriber can observe a ready client with
       // an empty capability set and decide the host supports nothing. A
       // malformed list degrades to "offers nothing extra" rather than failing
@@ -2802,15 +2816,7 @@ export class HostControlClient {
       return;
     this.clearConnectDeadline();
     const attempt = this.connectionAttempt;
-    const delay = backoffDelay(
-      this.reconnectAttempt,
-      {
-        base: Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS),
-        cap: 30_000,
-      },
-      this.options.reconnectRandom,
-    );
-    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 30);
+    const delay = this.nextReconnectDelay();
     const timer = setTimeout(() => {
       if (this.reconnectTimer !== timer) return;
       this.reconnectTimer = null;
@@ -2825,6 +2831,20 @@ export class HostControlClient {
       this.openWebSocket();
     }, delay);
     this.reconnectTimer = timer;
+  }
+
+  /** The wait before the next attempt; each call counts one more failure. */
+  private nextReconnectDelay(): number {
+    const delay = backoffDelay(
+      this.reconnectAttempt,
+      {
+        base: Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS),
+        cap: 30_000,
+      },
+      this.options.reconnectRandom,
+    );
+    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 30);
+    return delay;
   }
 
   private failRtc(expectedSessionId?: string): void {
@@ -2875,11 +2895,21 @@ export class HostControlClient {
     resolve?.();
   }
 
+  /**
+   * Evidence that the connection works: the daemon's hello, a resume the
+   * server confirmed, or the peer reaching connected. Only this restarts the
+   * reconnect backoff. A deliberate restart (Retry, a pin change, a wake) may
+   * still try at once, but leaves the schedule where it was.
+   */
+  private connectionWorks(): void {
+    this.reconnectAttempt = 0;
+    this.immediateReopenUsed = false;
+  }
+
   private redialNow(): void {
     const ws = this.ws;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.reconnectAttempt = 0;
     if (ws) {
       this.ws = null;
       this.detachWebSocket(ws);

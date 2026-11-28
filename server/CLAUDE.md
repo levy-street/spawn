@@ -80,6 +80,18 @@ authorization and durable-state requirements for their replacement.
   host-v1 and session-v2 routes remain supported. The daemon advertises
   `supports_device_connections`; an old daemon must produce an explicit update
   refusal. Session channel attachment never becomes a server signaling route.
+- A `/ws/host` socket that ends within 30 seconds of being accepted logs one
+  WARNING, at most once every ten minutes per account and host (#176): how
+  long it lived, the close code the client sent, whether `rtc.config` went
+  out, the frames received by type, the last `rtc.status` the server sent on
+  it and whether that was this socket's own answer to a frame or came through
+  the host's signal channel (the daemon's, or one the server made on its
+  behalf; the dispatch does not say which), and how many such sockets of that
+  account and host have ended since the last line like this, however long ago
+  that was. It names no account, host, device key, address or token; frame
+  and status names come from fixed lists. The bookkeeping is plain values on
+  `HostBrowserConn`, read once in the handler's `finally` inside a guard, so
+  it never changes how a socket is handled or closed.
 
 ## Daemon release offers
 

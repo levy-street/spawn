@@ -127,6 +127,15 @@ class HostBrowserConn:
     rtc_protocol_version: int = 1
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # What `/ws/host` says about a socket that ends soon after it was
+    # accepted (ws/host.py): plain values written as frames pass, read once
+    # when the socket ends, and never consulted for its handling.
+    accepted_at: float = field(default_factory=time.monotonic)
+    rtc_config_sent: bool = False
+    frames_received: dict[str, int] = field(default_factory=dict)
+    last_status: str | None = None
+    last_status_relayed: bool = False
+    client_close_code: int | None = None
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:

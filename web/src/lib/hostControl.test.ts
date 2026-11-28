@@ -1,5 +1,5 @@
 // @ts-nocheck -- focused browser API fakes; production code remains fully type-checked.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 
 /** Poll until `cond` holds (deadline-bounded) — fixed sleeps flake on loaded
  * CI runners when a 5ms client timeout races an 8ms wall-clock nap. */
@@ -22,6 +22,7 @@ import {
   signSignedSignalTranscript,
 } from "./signed-signal";
 import { signRtcSignalWire } from "./signed-signal-wire";
+import { backoffDelay } from "./ws";
 
 class FakeDataChannel {
   label: string;
@@ -736,55 +737,65 @@ describe("HostControlClient", () => {
     }
   });
 
-  test("the first config frame resets websocket backoff after an unavailable host", async () => {
-    const client = new HostControlClient(hostId, {
-      connectTimeoutMs: 1000,
-      reconnectBaseDelayMs: 20,
-      reconnectRandom: () => 0.5,
-    });
-    client.connect();
-    const firstWs = FakeWebSocket.instances[0];
-    firstWs.onopen?.();
-    firstWs.receive({
-      type: "rtc.config",
-      enabled: true,
-      ice_servers: [],
-      ice_transport_policy: "all",
-      ...metadata,
-    });
-    await Promise.resolve();
-    await Promise.resolve();
-    const firstOffer = JSON.parse(firstWs.sent.at(-1));
-    firstWs.receive({
-      type: "rtc.status",
-      session_id: firstOffer.session_id,
-      status: "unavailable",
-      ...metadata,
-    });
-    await Bun.sleep(25);
-    expect(FakeWebSocket.instances).toHaveLength(2);
+  test("a config frame does not reset websocket backoff after an unavailable host", async () => {
+    // The server sends rtc.config the moment it accepts a socket, daemon or no
+    // daemon, so it proves nothing about the host (#176).
+    jest.useFakeTimers();
+    try {
+      const client = new HostControlClient(hostId, {
+        connectTimeoutMs: 1000,
+        reconnectBaseDelayMs: 20,
+        reconnectRandom: () => 0.5,
+      });
+      client.connect();
+      const firstWs = FakeWebSocket.instances[0];
+      firstWs.onopen?.();
+      firstWs.receive({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        ice_transport_policy: "all",
+        ...metadata,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      const firstOffer = JSON.parse(firstWs.sent.at(-1));
+      firstWs.receive({
+        type: "rtc.status",
+        session_id: firstOffer.session_id,
+        status: "unavailable",
+        ...metadata,
+      });
+      jest.advanceTimersByTime(25);
+      expect(FakeWebSocket.instances).toHaveLength(2);
 
-    const secondWs = FakeWebSocket.instances[1];
-    secondWs.onopen?.();
-    secondWs.receive({
-      type: "rtc.config",
-      enabled: true,
-      ice_servers: [],
-      ice_transport_policy: "all",
-      ...metadata,
-    });
-    await Promise.resolve();
-    await Promise.resolve();
-    const secondOffer = JSON.parse(secondWs.sent.at(-1));
-    secondWs.receive({
-      type: "rtc.status",
-      session_id: secondOffer.session_id,
-      status: "unavailable",
-      ...metadata,
-    });
-    await Bun.sleep(25);
-    expect(FakeWebSocket.instances).toHaveLength(3);
-    client.close();
+      const secondWs = FakeWebSocket.instances[1];
+      secondWs.onopen?.();
+      secondWs.receive({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        ice_transport_policy: "all",
+        ...metadata,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      const secondOffer = JSON.parse(secondWs.sent.at(-1));
+      secondWs.receive({
+        type: "rtc.status",
+        session_id: secondOffer.session_id,
+        status: "unavailable",
+        ...metadata,
+      });
+      // The second failure waits twice as long (40 ms), config frame or not.
+      jest.advanceTimersByTime(25);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      jest.advanceTimersByTime(20);
+      expect(FakeWebSocket.instances).toHaveLength(3);
+      client.close();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("channel, daemon, and browser loss each schedule only one reconnect", async () => {
@@ -1898,6 +1909,326 @@ describe("HostControlClient", () => {
     expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
     source.client.close();
     destination.client.close();
+  });
+});
+
+describe("HostControlClient reconnect backoff", () => {
+  // The client's own schedule: its default base delay and its cap.
+  const schedule = { base: 500, cap: 30_000 };
+  const v2 = { ...metadata, protocol_version: 2 };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  /** Let promise chains settle without letting any time pass. */
+  async function settle(rounds = 20): Promise<void> {
+    for (let round = 0; round < rounds; round += 1) await Promise.resolve();
+  }
+
+  /** The next frame of `type` the socket sends. Waits on the client's own
+   *  work (signing an offer), never on the clock. */
+  function nextSent(ws, type): Promise<Record<string, unknown>> {
+    return new Promise((resolve) => {
+      const send = ws.send.bind(ws);
+      ws.send = (value: string) => {
+        send(value);
+        const frame = JSON.parse(value);
+        if (frame.type !== type) return;
+        ws.send = send;
+        resolve(frame);
+      };
+    });
+  }
+
+  /** Run the fake clock to the next socket the client opens; how long it took. */
+  function delayUntilNextSocket(): number {
+    const before = FakeWebSocket.instances.length;
+    const from = Date.now();
+    for (let step = 0; step < 50 && FakeWebSocket.instances.length === before; step += 1) {
+      jest.advanceTimersToNextTimer();
+    }
+    expect(FakeWebSocket.instances).toHaveLength(before + 1);
+    return Date.now() - from;
+  }
+
+  /** A delay is the helper's for that failed attempt, inside its jitter bounds.
+   *  The fake clock counts whole milliseconds, so allow one. */
+  function expectScheduled(delay: number, attempt: number, random: number): void {
+    const ceiling = Math.min(schedule.cap, schedule.base * 2 ** attempt);
+    expect(delay).toBeGreaterThanOrEqual(Math.floor(ceiling * 0.7) - 1);
+    expect(delay).toBeLessThanOrEqual(Math.ceil(ceiling * 1.3));
+    expect(Math.abs(delay - backoffDelay(attempt, schedule, () => random))).toBeLessThanOrEqual(1);
+  }
+
+  /** The default schedule with no jitter: 500 ms, then doubling. */
+  function plainDelay(attempt: number): number {
+    return backoffDelay(attempt, schedule, () => 0.5);
+  }
+
+  function unsignedClient(): HostControlClient {
+    return new HostControlClient(hostId, { reconnectRandom: () => 0.5 });
+  }
+
+  /** The server accepts the newest socket and greets it; the client offers. */
+  async function acceptAndOffer() {
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    await settle();
+    const pc = FakePeerConnection.instances.at(-1);
+    return { ws, pc, offer: framesOf(ws, "rtc.offer").at(-1) };
+  }
+
+  /** `times` offers refused for want of a daemon, each retry on schedule. */
+  async function refuseOffers(times: number): Promise<void> {
+    for (let attempt = 0; attempt < times; attempt += 1) {
+      const { ws, offer } = await acceptAndOffer();
+      ws.receive({
+        type: "rtc.status",
+        session_id: offer.session_id,
+        status: "unavailable",
+        ...metadata,
+      });
+      expect(Math.abs(delayUntilNextSocket() - plainDelay(attempt))).toBeLessThanOrEqual(1);
+    }
+  }
+
+  function hello(pc): void {
+    pc.channel.onopen?.();
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "hello",
+        protocol: HOST_CONTROL_PROTOCOL,
+        capabilities: ["ping"],
+      }),
+    );
+  }
+
+  test("a host with no daemon: accepted, configured, offered, refused, and each retry waits longer up to the cap", async () => {
+    // The production chain (#176): the server accepts the attach socket and
+    // sends rtc.config; the client fetches the account's endorsements and
+    // sends a signed offer; the server answers unavailable, as there is no
+    // daemon; the client tries again. Before, every retry came half a second
+    // later, for as long as the tab stayed open.
+    const signed = await signedRtcTrust();
+    const randoms = [0, 1, 0.5];
+    let draws = 0;
+    let endorsementFetches = 0;
+    const client = new HostControlClient(hostId, {
+      deviceConnection: true,
+      reconnectRandom: () => randoms[draws++ % randoms.length],
+      resolveSignedRtcTrust: async () => ({ mode: "signed", capability: signed.trust }),
+      loadCarriedEndorsements: async () => {
+        endorsementFetches += 1;
+        return [];
+      },
+    });
+    client.connect();
+    const failures = 9;
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < failures; attempt += 1) {
+      const ws = FakeWebSocket.instances.at(-1);
+      const offered = nextSent(ws, "rtc.offer");
+      ws.onopen?.();
+      ws.receive({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [{ urls: ["turn:relay.example"] }],
+        ice_transport_policy: "relay",
+        ...v2,
+      });
+      const offer = await offered;
+      expect(offer).toHaveProperty("signed_envelope");
+      ws.receive({
+        type: "rtc.status",
+        session_id: offer.session_id,
+        status: "unavailable",
+        ...v2,
+      });
+      const delay = delayUntilNextSocket();
+      expectScheduled(delay, attempt, randoms[attempt % randoms.length]);
+      delays.push(delay);
+    }
+    // 350, 1300, 2000, 2800, 10400, 16000, 21000, 39000, 30000 ms: under the
+    // jitter, the ceiling doubles from 500 ms and holds at 30 s.
+    const ceilings = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
+    const observed = delays.map(
+      (delay, attempt) => delay / (0.7 + randoms[attempt % randoms.length] * 0.6),
+    );
+    expect(observed.every((ceiling, attempt) => Math.abs(ceiling - ceilings[attempt]) <= 2)).toBe(
+      true,
+    );
+    // Every accepted socket carried exactly one endorsement fetch and one offer.
+    expect(endorsementFetches).toBe(failures);
+    expect(
+      FakeWebSocket.instances.slice(0, failures).map((ws) => framesOf(ws, "rtc.offer").length),
+    ).toEqual(Array(failures).fill(1));
+    client.close();
+  });
+
+  test("the daemon's hello restarts the schedule", async () => {
+    const client = unsignedClient();
+    client.connect();
+    await refuseOffers(3);
+    const { pc } = await acceptAndOffer();
+    hello(pc);
+    expect(client.getState()).toBe("ready");
+    pc.channel.onclose?.();
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(0))).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("a resume the server confirms restarts the schedule", async () => {
+    const client = unsignedClient();
+    client.connect();
+    await refuseOffers(2);
+    // A peer that is up (the fake starts connected, its channel open) without
+    // anything having reset the schedule: no hello, no connection event.
+    const { ws, offer } = await acceptAndOffer();
+    const binding = { binding_nonce: "f".repeat(32), binding_generation: 3 };
+    ws.receive({
+      type: "rtc.status",
+      session_id: offer.session_id,
+      status: "connected",
+      ...binding,
+      ...metadata,
+    });
+    ws.onclose?.({ code: 1012 });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(2))).toBeLessThanOrEqual(1);
+    const resumedWs = FakeWebSocket.instances.at(-1);
+    const resuming = nextSent(resumedWs, "rtc.resume");
+    resumedWs.onopen?.();
+    resumedWs.receive({ type: "rtc.config", enabled: true, ice_servers: [], ...metadata });
+    const resume = await resuming;
+    expect(resume).toMatchObject({ session_id: offer.session_id, ...binding });
+    resumedWs.receive({
+      type: "rtc.status",
+      session_id: offer.session_id,
+      status: "resumed",
+      ...binding,
+      ...metadata,
+    });
+    resumedWs.onclose?.({ code: 1012 });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(0))).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("the peer reaching connected restarts the schedule", async () => {
+    const client = unsignedClient();
+    client.connect();
+    await refuseOffers(3);
+    const { pc } = await acceptAndOffer();
+    pc.connectionState = "connected";
+    pc.onconnectionstatechange?.();
+    pc.channel.onclose?.();
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(0))).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("pings and error frames do not restart the schedule", async () => {
+    const client = unsignedClient();
+    client.connect();
+    await refuseOffers(2);
+    const { ws, offer } = await acceptAndOffer();
+    ws.receive({ type: "ping", ts: 1 });
+    ws.receive({ type: "error", code: "invalid_frame" });
+    ws.receive({ type: "ping", ts: 2 });
+    ws.receive({
+      type: "rtc.status",
+      session_id: offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(2))).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("Retry, a pin change and a wake still try at once, and the schedule carries on", async () => {
+    const client = unsignedClient();
+    client.connect();
+    await refuseOffers(4);
+
+    // Retry, and a pin change, both reach the client as retryConnection(). It
+    // opens a socket without waiting out the 8 s the last failure earned.
+    let { ws, offer } = await acceptAndOffer();
+    ws.receive({
+      type: "rtc.status",
+      session_id: offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    let sockets = FakeWebSocket.instances.length;
+    client.retryConnection();
+    expect(FakeWebSocket.instances).toHaveLength(sockets + 1);
+    ({ ws, offer } = await acceptAndOffer());
+    ws.receive({
+      type: "rtc.status",
+      session_id: offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(5))).toBeLessThanOrEqual(1);
+
+    // The page becoming visible, or the network returning, while a lost
+    // socket waits for its turn: redialNow opens one at once.
+    for (const wake of [
+      () => document.dispatchEvent(new Event("visibilitychange")),
+      () => window.dispatchEvent(new Event("online")),
+    ]) {
+      FakeWebSocket.instances.at(-1).onclose?.({ code: 1006 });
+      sockets = FakeWebSocket.instances.length;
+      wake();
+      expect(FakeWebSocket.instances).toHaveLength(sockets + 1);
+    }
+    // The schedule is where the failures left it.
+    FakeWebSocket.instances.at(-1).onclose?.({ code: 1006 });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(8))).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("one 4010 reopens at once; a second in a row waits its turn", async () => {
+    const client = unsignedClient();
+    client.connect();
+    FakeWebSocket.instances.at(-1).onopen?.();
+    FakeWebSocket.instances.at(-1).onclose?.({ code: 4010 });
+    expect(delayUntilNextSocket()).toBeLessThanOrEqual(1);
+
+    FakeWebSocket.instances.at(-1).onopen?.();
+    FakeWebSocket.instances.at(-1).onclose?.({ code: 4010 });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(0))).toBeLessThanOrEqual(1);
+    FakeWebSocket.instances.at(-1).onclose?.({ code: 4010 });
+    expect(Math.abs(delayUntilNextSocket() - plainDelay(1))).toBeLessThanOrEqual(1);
+
+    // A working connection in between earns the next 4010 its quick reopen.
+    const { ws, pc } = await acceptAndOffer();
+    hello(pc);
+    ws.onclose?.({ code: 4010 });
+    expect(delayUntilNextSocket()).toBeLessThanOrEqual(1);
+    client.close();
+  });
+
+  test("a refused handshake (error, then close) still backs off", () => {
+    const client = unsignedClient();
+    client.connect();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const ws = FakeWebSocket.instances.at(-1);
+      ws.onerror?.();
+      ws.onclose?.({ code: 1006 });
+      expect(Math.abs(delayUntilNextSocket() - plainDelay(attempt))).toBeLessThanOrEqual(1);
+    }
+    client.close();
   });
 });
 

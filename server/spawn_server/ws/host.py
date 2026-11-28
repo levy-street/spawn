@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import time
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Annotated
 
@@ -81,6 +83,104 @@ HOST_WS_SUBPROTOCOL = "spawn.host.v1"
 MAX_SIGNAL_FRAME_BYTES = MAX_RTC_ROUTING_FRAME_BYTES
 WS_CLOSE_BINARY = WS_CLOSE_CONTENT_FORBIDDEN
 MAX_HOST_RTC_BINDING_IDENTITIES = 256
+
+# A socket that ends this soon after it was accepted gets one WARNING saying
+# why (#176), at most once every ten minutes per account and host, so a tab
+# left open on a host whose daemon is away writes a few lines an hour rather
+# than one a minute. The line names no account, host, device key, address or
+# token: a duration, a close code, and counts of frame and status names taken
+# from fixed lists.
+SHORT_LIVED_SOCKET_SECONDS = 30.0
+SHORT_LIVED_LOG_INTERVAL_SECONDS = 600.0
+SHORT_LIVED_TRACKED_PAIRS = 4096
+_COUNTED_FRAME_TYPES = frozenset(
+    {"pong", "rtc.config.request", "rtc.resume", "rtc.offer", "rtc.candidate", "rtc.close"}
+)
+
+
+def _socket_clock() -> float:
+    return time.monotonic()
+
+
+class _ShortLivedSockets:
+    """Per account and host: when the last line was written, and how many
+    short-lived sockets have ended since without one. In memory, bounded."""
+
+    def __init__(self) -> None:
+        self._pairs: OrderedDict[tuple[str, str], tuple[float, int]] = OrderedDict()
+
+    def note(self, user_id: str, host_id: str, now: float) -> int | None:
+        """Count one short-lived socket: how many have ended since the last
+        line for this pair, this one included, if a line is due now; None
+        while that last line is under ten minutes old."""
+        key = (user_id, host_id)
+        last_logged, unlogged = self._pairs.pop(key, (None, 0))
+        if last_logged is not None and now - last_logged < SHORT_LIVED_LOG_INTERVAL_SECONDS:
+            self._pairs[key] = (last_logged, unlogged + 1)
+            return None
+        self._pairs[key] = (now, 0)
+        while len(self._pairs) > SHORT_LIVED_TRACKED_PAIRS:
+            self._pairs.popitem(last=False)
+        return unlogged + 1
+
+
+_short_lived_sockets = _ShortLivedSockets()
+
+
+def _frame_kind(frame_type: object) -> str:
+    """A received frame's type as the line may name it: never a client's string."""
+    if isinstance(frame_type, str) and frame_type in _COUNTED_FRAME_TYPES:
+        return frame_type
+    return "other"
+
+
+def _count_frame(conn: HostBrowserConn, kind: str) -> None:
+    conn.frames_received[kind] = conn.frames_received.get(kind, 0) + 1
+
+
+def _note_status(conn: HostBrowserConn, status_value: object, *, relayed: bool) -> None:
+    """`relayed` is True for a status that came through the host's signal
+    channel. That is the daemon's, or one the server made on its behalf
+    (rebound, unavailable, signalling lost, expired and the rest): the dispatch
+    does not say which, so the line never claims either."""
+    conn.last_status = (
+        status_value
+        if isinstance(status_value, str) and status_value in HOST_RTC_STATUS_ALLOWLIST
+        else "other"
+    )
+    conn.last_status_relayed = relayed
+
+
+def _log_short_lived_socket(conn: HostBrowserConn, now: float) -> None:
+    lived = now - conn.accepted_at
+    if lived >= SHORT_LIVED_SOCKET_SECONDS:
+        return
+    sockets = _short_lived_sockets.note(conn.user_id, conn.host_id, now)
+    if sockets is None:
+        return
+    received = ", ".join(f"{kind}={count}" for kind, count in sorted(conn.frames_received.items()))
+    if conn.last_status is None:
+        last_status = "none"
+    else:
+        origin = (
+            "through the host's signal channel, from the daemon or the server"
+            if conn.last_status_relayed
+            else "this socket's answer to a frame"
+        )
+        last_status = f"{conn.last_status} ({origin})"
+    log.warning(
+        "short-lived host signaling socket: ended %.1f s after accept; client close code %s; "
+        "rtc.config %s; received %s; last rtc.status sent %s; "
+        "this line stands for %d such socket%s of one account and host "
+        "since the last line like this",
+        lived,
+        "none" if conn.client_close_code is None else conn.client_close_code,
+        "sent" if conn.rtc_config_sent else "not sent",
+        received or "nothing",
+        last_status,
+        sockets,
+        "" if sockets == 1 else "s",
+    )
 
 
 @dataclass(frozen=True)
@@ -226,6 +326,8 @@ async def _forward_if_exact_binding(
                 expires_at=now + RTC_CONNECTED_SESSION_TTL_SECONDS,
             )
         await conn.send_text(signal)
+        if signal.get("type") == "rtc.status":
+            _note_status(conn, signal.get("status"), relayed=True)
         return True
 
 
@@ -262,6 +364,7 @@ async def _send_status(
             **values,
         )
     )
+    _note_status(conn, status_value, relayed=False)
 
 
 async def _binding_is_current_owner(host_id: str, binding: BrowserRtcSession) -> bool:
@@ -335,6 +438,7 @@ async def _pump_browser_signals(
             if binding is None:
                 if retired_expiry:
                     await conn.send_text(signal)
+                    _note_status(conn, signal.get("status"), relayed=True)
                 continue
             if not (
                 dispatch.session_connection_id == binding.daemon_connection_id
@@ -463,6 +567,7 @@ async def host_ws(
         )
         return
     await websocket.accept(subprotocol=HOST_WS_SUBPROTOCOL)
+    accepted_at = _socket_clock()
     user = await _resolve_user(websocket, token)
     if user is None:
         return
@@ -475,7 +580,11 @@ async def host_ws(
             return
 
     conn = HostBrowserConn(
-        user_id=user.id, host_id=host_id, websocket=websocket, rtc_protocol_version=rtc_version
+        user_id=user.id,
+        host_id=host_id,
+        websocket=websocket,
+        rtc_protocol_version=rtc_version,
+        accepted_at=accepted_at,
     )
 
     def signal_payload(
@@ -549,11 +658,15 @@ async def host_ws(
             await websocket.close(code=WS_CLOSE_SUBSCRIPTION_LOST, reason="subscription lost")
             return
         await conn.send_text(rtc_config_payload())
+        conn.rtc_config_sent = True
         while True:
             message = await receive_with_signal_pump(websocket, pump_task)
             if message["type"] == "websocket.disconnect":
+                close_code = message.get("code")
+                conn.client_close_code = close_code if isinstance(close_code, int) else None
                 break
             if message.get("bytes") is not None:
+                _count_frame(conn, "binary")
                 await websocket.close(
                     code=WS_CLOSE_BINARY,
                     reason="binary frames are not allowed on the signaling websocket",
@@ -563,17 +676,21 @@ async def host_ws(
             if raw is None:
                 continue
             if len(raw.encode("utf-8")) > MAX_SIGNAL_FRAME_BYTES:
+                _count_frame(conn, "oversized")
                 await websocket.close(code=1009, reason="signaling frame too large")
                 break
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
+                _count_frame(conn, "invalid")
                 await errors.send("invalid_frame", None)
                 continue
             if not isinstance(obj, dict):
+                _count_frame(conn, "invalid")
                 await errors.send("invalid_frame", None)
                 continue
             frame_type = obj.get("type")
+            _count_frame(conn, _frame_kind(frame_type))
             if frame_type == "pong":
                 continue
             if frame_type == "rtc.config.request":
@@ -662,6 +779,7 @@ async def host_ws(
                         status="resumed",
                     )
                 )
+                _note_status(conn, "resumed", relayed=False)
             elif frame_type == "rtc.offer":
                 if not get_settings().webrtc_enabled:
                     await _send_status(conn, host_id, session_id, "failed")
@@ -906,6 +1024,10 @@ async def host_ws(
     except Exception as exc:  # noqa: BLE001
         log.exception("host signaling websocket crashed: %s", exc)
     finally:
+        # Synchronous and never raises out: it cannot delay or change the
+        # cleanup below, whatever goes wrong inside it.
+        with suppress(Exception):
+            _log_short_lived_socket(conn, _socket_clock())
         async with sessions_lock:
             remaining = list(sessions.values())
             sessions.clear()

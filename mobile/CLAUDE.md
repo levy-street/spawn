@@ -61,6 +61,15 @@ scripts/, docs/   build helpers and app-specific notes
   version — a server that requires a different one refuses the socket with a
   `protocol.required` frame, which is what routes into the update path. Read
   "The wire protocols" in `docs/RELEASE.md` before changing one.
+  `ReconnectingSocket` (`data/realtime/socket.ts`) waits longer after each
+  failed attempt and starts the wait over only on a frame its caller names as
+  proof the socket is useful (`provesUseful`), never because it opened (#176):
+  for the host and session signalling sockets a resume the server confirmed or
+  the daemon's word that its peer connected, for alerts the server's keepalive
+  (sent only after 25 seconds open) or any event. A 4010 close reopens at
+  once, but not twice in a row without a useful socket in between. Opening on
+  the owner's request (`connect`, `hardReconnect`) is still immediate. The
+  host transport's own reconnect budget (`terminal/transport/`) is separate.
 - Tests colocate in the nearest `__tests__/` directory (jest).
 - `e2e/NATIVE_ACCEPTANCE.md` describes the GitHub-hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a

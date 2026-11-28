@@ -14,6 +14,16 @@ function signalReconnectDelay(attempt: number, random: number): number {
   return Math.round(base * (0.7 + Math.max(0, Math.min(1, random)) * 0.6));
 }
 
+/**
+ * The server greets every accepted socket with `rtc.config` and the session's
+ * status, daemon or no daemon, so neither proves anything (#176). A resume the
+ * server confirmed does, and so does the daemon saying its peer connected.
+ */
+function signalProvesUseful(frame: Record<string, unknown>): boolean {
+  const status = frame["status"];
+  return frame["type"] === "rtc.status" && (status === "resumed" || status === "connected");
+}
+
 export interface SignalChannel {
   readonly state: SocketState;
   readonly closeInfo: import("@/data/realtime/socket").SocketCloseInfo | null;
@@ -72,6 +82,7 @@ class SessionSignalChannel implements SignalChannel {
       authorization: () => authToken.snapshot(),
       watchdogMs: 80_000,
       watchdogFrameTypes: ["ping"],
+      provesUseful: signalProvesUseful,
       reconnectDelayMs: signalReconnectDelay,
       maxReconnectAttempt: 64,
     });

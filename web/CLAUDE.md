@@ -140,6 +140,14 @@ from the catalogue. Every claim about spawnd survives a diff against
   the server's recent word that the host is online, and with a backoff every
   tab shares. A snapshot whose owner's name does not end in its term comes from
   a deposed tab on page code from before #101 and is never followed.
+  The owner's signalling socket (`/ws/host`, in `lib/hostControl.ts`) waits
+  longer after each failed attempt, up to 30 seconds, and starts the wait
+  over only once the connection has worked: the daemon's hello, a resume the
+  server confirmed, or the peer connecting. Being accepted proves nothing —
+  the server sends `rtc.config` at once, daemon or no daemon — and neither
+  does a ping or an error frame (#176). Retry, a pin change and a wake still
+  try at once, without starting the wait over. A 4010 close reopens at once,
+  but not twice in a row without a working connection in between.
   Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
 
 ## Account settings

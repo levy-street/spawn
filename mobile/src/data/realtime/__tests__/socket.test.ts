@@ -78,6 +78,18 @@ async function flushPromises(): Promise<void> {
   await Promise.resolve();
 }
 
+/** Run the fake clock to the next socket and return how long that took. */
+async function delayUntilNextSocket(sockets: FakeWebSocket[]): Promise<number> {
+  const before = sockets.length;
+  const from = Date.now();
+  for (let step = 0; step < 20 && sockets.length === before; step += 1) {
+    jest.advanceTimersToNextTimer();
+    await flushPromises();
+  }
+  expect(sockets).toHaveLength(before + 1);
+  return Date.now() - from;
+}
+
 describe("ReconnectingSocket", () => {
   beforeEach(() => {
     jest.useFakeTimers();
@@ -164,7 +176,7 @@ describe("ReconnectingSocket", () => {
     expect(sockets).toHaveLength(2);
   });
 
-  it("uses exponential jitter and resets its attempt after a successful open", async () => {
+  it("uses exponential jitter and resets its attempt only once a socket proves useful", async () => {
     const { socket, sockets } = harness(0);
     socket.connect();
     await flushPromises();
@@ -184,10 +196,134 @@ describe("ReconnectingSocket", () => {
     await flushPromises();
     expect(sockets).toHaveLength(3);
 
+    // Opening proves nothing; the server's keepalive does (the default).
     sockets[2]?.open();
+    expect(socket.reconnectAttempt).toBe(2);
+    sockets[2]?.message('{"type":"ping","ts":1}');
     expect(socket.reconnectAttempt).toBe(0);
     sockets[2]?.serverClose();
     expect(socket.reconnectAttempt).toBe(1);
+  });
+
+  it("keeps backing off, up to its cap, while sockets open and then end", async () => {
+    const { socket, sockets } = harness(0.5);
+    socket.connect();
+    await flushPromises();
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      sockets.at(-1)?.open();
+      sockets.at(-1)?.message('{"type":"rtc.config"}');
+      sockets.at(-1)?.serverClose(1011);
+      delays.push(await delayUntilNextSocket(sockets));
+    }
+    const ceilings = [1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000, 15_000];
+    for (const [attempt, delay] of delays.entries()) {
+      const ceiling = ceilings[attempt] ?? 0;
+      expect(delay).toBeGreaterThanOrEqual(Math.floor(ceiling * SOCKET_TIMING.jitterMin) - 1);
+      expect(delay).toBeLessThanOrEqual(Math.ceil(ceiling * SOCKET_TIMING.jitterMax));
+      expect(Math.abs(delay - ceiling)).toBeLessThanOrEqual(1);
+    }
+    socket.close();
+  });
+
+  it("restarts the backoff on the frame its caller names, and on nothing else", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const socket = new ReconnectingSocket({
+      url: () => "wss://spawn.test/ws",
+      protocol: "spawn.test.v1",
+      random: () => 0.5,
+      provesUseful: (frame) => frame["type"] === "rtc.status" && frame["status"] === "resumed",
+      createWebSocket: (url, protocol) => {
+        const fake = new FakeWebSocket(url, protocol);
+        sockets.push(fake);
+        return fake as unknown as WebSocket;
+      },
+    });
+    socket.connect();
+    await flushPromises();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      sockets.at(-1)?.serverClose();
+      await delayUntilNextSocket(sockets);
+    }
+    sockets.at(-1)?.open();
+    sockets.at(-1)?.message('{"type":"ping","ts":1}');
+    sockets.at(-1)?.message('{"type":"error","code":"invalid_frame"}');
+    sockets.at(-1)?.message('{"type":"rtc.status","status":"unavailable"}');
+    expect(socket.reconnectAttempt).toBe(3);
+    sockets.at(-1)?.message('{"type":"rtc.status","status":"resumed"}');
+    expect(socket.reconnectAttempt).toBe(0);
+    sockets.at(-1)?.serverClose();
+    expect(await delayUntilNextSocket(sockets)).toBe(SOCKET_TIMING.reconnectBaseMs);
+    socket.close();
+  });
+
+  it("reopens at once after one 4010, and backs off after a second in a row", async () => {
+    const { socket, sockets } = harness(0.5);
+    socket.connect();
+    await flushPromises();
+    sockets[0]?.open();
+    sockets[0]?.serverClose(4010);
+    await flushPromises();
+    expect(sockets).toHaveLength(2);
+
+    sockets[1]?.open();
+    sockets[1]?.serverClose(4010);
+    await flushPromises();
+    expect(sockets).toHaveLength(2);
+    expect(await delayUntilNextSocket(sockets)).toBe(SOCKET_TIMING.reconnectBaseMs);
+    sockets[2]?.serverClose(4010);
+    expect(await delayUntilNextSocket(sockets)).toBe(SOCKET_TIMING.reconnectBaseMs * 2);
+
+    // A socket that proved useful in between earns the next 4010 its reopen.
+    sockets[3]?.open();
+    sockets[3]?.message('{"type":"ping","ts":1}');
+    sockets[3]?.serverClose(4010);
+    await flushPromises();
+    expect(sockets).toHaveLength(5);
+    socket.close();
+  });
+
+  it("still opens at once when its owner reconnects it, without restarting the backoff", async () => {
+    const { socket, sockets } = harness(0.5);
+    socket.connect();
+    await flushPromises();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      sockets.at(-1)?.serverClose();
+      await delayUntilNextSocket(sockets);
+    }
+    sockets.at(-1)?.serverClose();
+    expect(socket.state).toBe("reconnecting");
+    socket.hardReconnect();
+    await flushPromises();
+    expect(sockets).toHaveLength(5);
+
+    socket.retire();
+    socket.connect();
+    await flushPromises();
+    expect(sockets).toHaveLength(6);
+    // Four failures so far: the fifth waits 16 s, capped at 15.
+    sockets[5]?.serverClose();
+    expect(await delayUntilNextSocket(sockets)).toBe(SOCKET_TIMING.reconnectCapMs);
+    socket.close();
+  });
+
+  it("backs off a refused handshake (error, then close) as before", async () => {
+    const { socket, sockets } = harness(0.5);
+    socket.connect();
+    await flushPromises();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      sockets
+        .at(-1)
+        ?.onerror?.call(
+          sockets.at(-1) as unknown as WebSocket,
+          {} as Parameters<NonNullable<WebSocket["onerror"]>>[0],
+        );
+      sockets.at(-1)?.serverClose(1006);
+      expect(await delayUntilNextSocket(sockets)).toBe(
+        SOCKET_TIMING.reconnectBaseMs * 2 ** attempt,
+      );
+    }
+    socket.close();
   });
 
   it("discards callbacks from retired generations", async () => {
