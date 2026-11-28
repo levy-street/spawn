@@ -6,6 +6,7 @@ import { listHosts } from "@/data/api/endpoints/hosts";
 import { listSessions } from "@/data/api/endpoints/sessions";
 import { getWorkspace, patchWorkspace } from "@/data/api/endpoints/workspaces";
 import type { WorkspaceOut, WorkspacePatch } from "@/data/api/schemas/workspaces";
+import { layoutGroups } from "@/data/layout/tab-groups";
 import { qk } from "@/data/queryKeys";
 import type { Workspace } from "@/data/types/domain";
 import type { WorkspaceLayoutV3 } from "@/data/types/layout";
@@ -109,9 +110,13 @@ export async function commitWorkspaceLayout(
   }
 }
 
-function layoutForWire(layout: WorkspaceLayoutV3): NonNullable<WorkspacePatch["layout"]> {
+export function layoutForWire(layout: WorkspaceLayoutV3): NonNullable<WorkspacePatch["layout"]> {
+  // `groups` always travels, `[]` when there are none: the server reads a
+  // layout without the key as an older client's and keeps what it had stored,
+  // which would bring back a group this one just dissolved.
+  const wire = { ...layout, groups: layoutGroups(layout) };
   // The domain keeps unknown future widget fields; today's server schema accepts files widgets.
-  return layout as unknown as NonNullable<WorkspacePatch["layout"]>;
+  return wire as unknown as NonNullable<WorkspacePatch["layout"]>;
 }
 
 export interface WorkspaceReorderDebouncerOptions {

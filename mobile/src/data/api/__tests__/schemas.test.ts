@@ -214,6 +214,7 @@ it("round-trips workspace layout response JSON", () => {
           cwd: "/Users/me/project",
         },
       ],
+      groups: [{ id: "g1", name: "Agents", color: "orange", collapsed: true, tab_ids: ["main"] }],
     },
     position: 0,
     icon: null,
@@ -246,6 +247,7 @@ it("keeps a pane kind from a newer SPAWN D, verbatim, through read and save", ()
         cwd: null,
       },
     ],
+    groups: [],
   };
   const parsed = WorkspaceOutSchema.parse({
     id: UUID_A,
@@ -263,6 +265,72 @@ it("keeps a pane kind from a newer SPAWN D, verbatim, through read and save", ()
   expect(parsed.layout).toEqual(layout);
   // A layout saved from this phone carries both back exactly as they came.
   expect(WorkspacePatchSchema.parse({ layout }).layout).toEqual(layout);
+});
+
+describe("workspace tab groups", () => {
+  const tab = (id: string) => ({
+    id,
+    name: id,
+    layout: { version: 3, tiles: [] },
+    host_id: null,
+    cwd: null,
+  });
+  const workspace = (layout: Record<string, unknown>) => ({
+    id: UUID_A,
+    name: "Project",
+    host_id: null,
+    cwd: null,
+    layout,
+    position: 0,
+    icon: null,
+    icon_source: null,
+    archived_at: null,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+
+  it("reads a layout from a server without groups as having none", () => {
+    const parsed = WorkspaceOutSchema.parse(
+      workspace({ version: 3, active_tab: "a", tabs: [tab("a")] }),
+    );
+    expect(parsed.layout.groups).toEqual([]);
+  });
+
+  it("reads stored groups leniently against the strip rather than failing the workspace", () => {
+    const parsed = WorkspaceOutSchema.parse(
+      workspace({
+        version: 3,
+        active_tab: "a",
+        tabs: [tab("a"), tab("b")],
+        groups: [
+          { id: "g1", name: 5, color: "#FF8800", collapsed: "yes", tab_ids: ["b", "gone"] },
+          "not a group",
+        ],
+      }),
+    );
+    expect(parsed.layout.groups).toEqual([
+      { id: "g1", name: "", color: "#ff8800", collapsed: false, tab_ids: ["b"] },
+    ]);
+  });
+
+  it("always sends groups on a layout PATCH, canonical for its strip", () => {
+    const bare = WorkspacePatchSchema.parse({
+      layout: { version: 3, active_tab: "a", tabs: [tab("a")] },
+    });
+    expect(bare.layout?.groups).toEqual([]);
+    const reordered = WorkspacePatchSchema.parse({
+      layout: {
+        version: 3,
+        active_tab: "a",
+        tabs: [tab("a"), tab("b")],
+        groups: [{ id: "g", name: "x", color: "red", collapsed: false, tab_ids: ["b", "a"] }],
+      },
+    });
+    expect(reordered.layout?.groups).toEqual([
+      { id: "g", name: "x", color: "red", collapsed: false, tab_ids: ["a", "b"] },
+    ]);
+    expect(WorkspacePatchSchema.parse({ name: "Renamed" })).not.toHaveProperty("layout");
+  });
 });
 
 it("still refuses a files pane that is not well formed", () => {

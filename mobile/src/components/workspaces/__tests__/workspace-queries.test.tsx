@@ -45,6 +45,7 @@ function workspace(overrides: Partial<WorkspaceOut> = {}): WorkspaceOut {
     layout: {
       version: 3,
       active_tab: "tab-1",
+      groups: [],
       tabs: [
         {
           id: "tab-1",

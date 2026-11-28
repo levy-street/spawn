@@ -9,10 +9,10 @@ import Animated, {
 } from "react-native-reanimated";
 import Svg, { Circle, Path } from "react-native-svg";
 import { useReducedMotionPreference } from "@/components/ui/status-dot";
-import { alpha, type Colors, spacing, useTheme } from "@/theme";
+import { alpha, type ColorToken, spacing, useTheme } from "@/theme";
 
 export interface SpinnerProps {
-  color?: keyof Colors;
+  color?: ColorToken;
   label?: string;
   size?: number;
   testID?: string;

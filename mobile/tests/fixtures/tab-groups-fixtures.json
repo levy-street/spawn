@@ -1,0 +1,297 @@
+{
+  "_doc": "Cross-language conformance suite for workspace tab groups (proto/README.md, \"Tab groups\"). server/spawn_server/tab_groups.py, web/src/lib/tab-groups.ts and mobile/src/data/layout/tab-groups.ts must reproduce every expected value exactly (deep equality on parsed JSON, array order included). The mobile suite reads a byte-identical copy at mobile/tests/fixtures/tab-groups-fixtures.json. Ops: color (normalizeColor: the stored form of a colour, or null), normalize (the lenient read: what a stored or carried-over `groups` value becomes against a strip), validate (the strict write check: null when valid, else an error code), regroup (after a tab moves or is inserted, what its group membership becomes). `tab_ids` on a case is the strip, left to right.",
+  "version": 1,
+  "cases": [
+    { "op": "color", "name": "a preset is kept", "input": "orange", "expected": "orange" },
+    { "op": "color", "name": "every preset is valid", "input": "gray", "expected": "gray" },
+    { "op": "color", "name": "a custom hex is kept", "input": "#1a2b3c", "expected": "#1a2b3c" },
+    { "op": "color", "name": "a custom hex is lowercased", "input": "#A1B2C3", "expected": "#a1b2c3" },
+    { "op": "color", "name": "a preset is case-sensitive", "input": "Blue", "expected": null },
+    { "op": "color", "name": "an unknown name is refused", "input": "teal", "expected": null },
+    { "op": "color", "name": "short hex is not a stored form", "input": "#abc", "expected": null },
+    { "op": "color", "name": "hex needs its hash", "input": "a1b2c3", "expected": null },
+    { "op": "color", "name": "non-hex digits are refused", "input": "#12345g", "expected": null },
+    { "op": "color", "name": "an alpha channel is refused", "input": "#a1b2c3ff", "expected": null },
+    { "op": "color", "name": "not a string", "input": 7, "expected": null },
+
+    {
+      "op": "normalize",
+      "name": "no groups",
+      "tab_ids": ["a", "b"],
+      "groups": [],
+      "expected": []
+    },
+    {
+      "op": "normalize",
+      "name": "a missing or malformed groups value reads as none",
+      "tab_ids": ["a", "b"],
+      "groups": null,
+      "expected": []
+    },
+    {
+      "op": "normalize",
+      "name": "a valid group is returned in canonical shape",
+      "tab_ids": ["a", "b", "c"],
+      "groups": [{ "id": "g1", "name": "Agents", "color": "orange", "collapsed": true, "tab_ids": ["b", "c"] }],
+      "expected": [{ "id": "g1", "name": "Agents", "color": "orange", "collapsed": true, "tab_ids": ["b", "c"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "tab ids come back in strip order",
+      "tab_ids": ["a", "b", "c"],
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["c", "b"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a closed tab leaves its group",
+      "tab_ids": ["a", "c"],
+      "groups": [{ "id": "g1", "name": "x", "color": "red", "collapsed": false, "tab_ids": ["a", "b", "c"] }],
+      "expected": [{ "id": "g1", "name": "x", "color": "red", "collapsed": false, "tab_ids": ["a", "c"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a group whose tabs are all gone is dropped",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "x", "color": "red", "collapsed": false, "tab_ids": ["b"] }],
+      "expected": []
+    },
+    {
+      "op": "normalize",
+      "name": "a split group keeps its longest run",
+      "tab_ids": ["a", "b", "x", "c", "d", "e"],
+      "groups": [{ "id": "g1", "name": "", "color": "green", "collapsed": false, "tab_ids": ["a", "b", "c", "d", "e"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "green", "collapsed": false, "tab_ids": ["c", "d", "e"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a split group of equal runs keeps the first",
+      "tab_ids": ["a", "x", "b"],
+      "groups": [{ "id": "g1", "name": "", "color": "green", "collapsed": false, "tab_ids": ["a", "b"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "green", "collapsed": false, "tab_ids": ["a"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a tab claimed by two groups belongs to the first listed",
+      "tab_ids": ["a", "b", "c"],
+      "groups": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["b", "c"] }
+      ],
+      "expected": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c"] }
+      ]
+    },
+    {
+      "op": "normalize",
+      "name": "groups are listed in strip order",
+      "tab_ids": ["a", "b", "c"],
+      "groups": [
+        { "id": "late", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c"] },
+        { "id": "early", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] }
+      ],
+      "expected": [
+        { "id": "early", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] },
+        { "id": "late", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c"] }
+      ]
+    },
+    {
+      "op": "normalize",
+      "name": "malformed fields read leniently",
+      "tab_ids": ["a", "b"],
+      "groups": [
+        { "id": "g1", "name": 5, "color": "teal", "collapsed": "yes", "tab_ids": ["a", 3] },
+        { "id": "", "name": "no id", "color": "red", "collapsed": false, "tab_ids": ["b"] },
+        "not a group",
+        { "id": "g1", "name": "duplicate id", "color": "red", "collapsed": false, "tab_ids": ["b"] }
+      ],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a custom colour survives and is lowercased",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "", "color": "#FF8800", "collapsed": false, "tab_ids": ["a"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "#ff8800", "collapsed": false, "tab_ids": ["a"] }]
+    },
+    {
+      "op": "normalize",
+      "name": "a long name is cut to 64 characters",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij", "color": "blue", "collapsed": false, "tab_ids": ["a"] }],
+      "expected": [{ "id": "g1", "name": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd", "color": "blue", "collapsed": false, "tab_ids": ["a"] }]
+    },
+
+    {
+      "op": "validate",
+      "name": "valid groups pass",
+      "tab_ids": ["a", "b", "c"],
+      "groups": [
+        { "id": "g1", "name": "x", "color": "blue", "collapsed": false, "tab_ids": ["b", "a"] },
+        { "id": "g2", "name": "", "color": "#00aaff", "collapsed": true, "tab_ids": ["c"] }
+      ],
+      "expected": null
+    },
+    {
+      "op": "validate",
+      "name": "no groups pass",
+      "tab_ids": ["a"],
+      "groups": [],
+      "expected": null
+    },
+    {
+      "op": "validate",
+      "name": "duplicate group ids",
+      "tab_ids": ["a", "b"],
+      "groups": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] },
+        { "id": "g1", "name": "", "color": "red", "collapsed": false, "tab_ids": ["b"] }
+      ],
+      "expected": "duplicate_group_id"
+    },
+    {
+      "op": "validate",
+      "name": "a group naming no tab",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "zz"] }],
+      "expected": "unknown_tab"
+    },
+    {
+      "op": "validate",
+      "name": "a tab in two groups",
+      "tab_ids": ["a", "b"],
+      "groups": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["a", "b"] }
+      ],
+      "expected": "tab_in_two_groups"
+    },
+    {
+      "op": "validate",
+      "name": "a tab listed twice in one group",
+      "tab_ids": ["a", "b"],
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "a"] }],
+      "expected": "tab_in_two_groups"
+    },
+    {
+      "op": "validate",
+      "name": "a group with no tabs",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": [] }],
+      "expected": "empty_group"
+    },
+    {
+      "op": "validate",
+      "name": "a split group",
+      "tab_ids": ["a", "x", "b"],
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] }],
+      "expected": "split_group"
+    },
+    {
+      "op": "validate",
+      "name": "a colour outside the presets and hex",
+      "tab_ids": ["a"],
+      "groups": [{ "id": "g1", "name": "", "color": "teal", "collapsed": false, "tab_ids": ["a"] }],
+      "expected": "bad_color"
+    },
+
+    {
+      "op": "regroup",
+      "name": "a tab dropped between two tabs of a group joins it",
+      "tab_ids": ["a", "b", "x", "c"],
+      "moved": "x",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "x", "c"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a tab dropped at a group's edge stays out",
+      "tab_ids": ["x", "b", "c"],
+      "moved": "x",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a grouped tab reordered within its group stays in",
+      "tab_ids": ["c", "b", "a"],
+      "moved": "b",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["c", "b"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a grouped tab still touching its group at the edge stays in",
+      "tab_ids": ["a", "b", "x", "c", "d"],
+      "moved": "x",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["x", "c", "d"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["x", "c", "d"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "the first tab of a group dragged out to the left leaves",
+      "tab_ids": ["b", "a", "c", "d"],
+      "moved": "b",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c", "d"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["c", "d"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a grouped tab moved to the far end leaves",
+      "tab_ids": ["c", "d", "a", "b"],
+      "moved": "b",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b", "c", "d"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["c", "d"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a group's only tab carries the group with it",
+      "tab_ids": ["a", "c", "b"],
+      "moved": "b",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a lone grouped tab dropped inside another group joins it",
+      "tab_ids": ["c", "b", "d"],
+      "moved": "b",
+      "groups": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["b"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c", "d"] }
+      ],
+      "expected": [{ "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c", "b", "d"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a grouped tab dropped inside another group moves to it",
+      "tab_ids": ["a", "c", "b", "d"],
+      "moved": "b",
+      "groups": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c", "d"] }
+      ],
+      "expected": [
+        { "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a"] },
+        { "id": "g2", "name": "", "color": "red", "collapsed": false, "tab_ids": ["c", "b", "d"] }
+      ]
+    },
+    {
+      "op": "regroup",
+      "name": "a new tab inserted inside a group joins it",
+      "tab_ids": ["a", "n", "b"],
+      "moved": "n",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "n", "b"] }]
+    },
+    {
+      "op": "regroup",
+      "name": "a new tab appended after a group stays out",
+      "tab_ids": ["a", "b", "n"],
+      "moved": "n",
+      "groups": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] }],
+      "expected": [{ "id": "g1", "name": "", "color": "blue", "collapsed": false, "tab_ids": ["a", "b"] }]
+    }
+  ]
+}

@@ -4,7 +4,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceDetail } from "@/components/workspace-detail/workspace-detail";
 import type { AgentIdentity, Session } from "@/data/types/domain";
-import type { Tile, WorkspaceTab } from "@/data/types/layout";
+import type { TabGroup, Tile, WorkspaceTab } from "@/data/types/layout";
 import { ThemeProvider } from "@/theme";
 
 import { makeSession, makeTab, makeWorkspace } from "./fixtures";
@@ -20,6 +20,8 @@ interface CapturedGroups {
   movePane?: CapturedProps;
   movePaneHost?: CapturedProps;
   tabActions?: CapturedProps;
+  tabGroupPicker?: CapturedProps;
+  tabGroupSheet?: CapturedProps;
   workspaceActions?: CapturedProps;
   rename?: CapturedProps;
   confirm?: CapturedProps;
@@ -64,6 +66,13 @@ const mockWorkspaceActions = {
   reorderPane: jest.fn(),
   removePane: jest.fn(async () => mockWorkspace),
   duplicatePane: jest.fn(async () => mockWorkspace),
+  createGroup: jest.fn(() => ({ groupId: "group-new", saved: Promise.resolve(mockWorkspace) })),
+  addToGroup: jest.fn(async () => mockWorkspace),
+  removeFromGroup: jest.fn(async () => mockWorkspace),
+  ungroup: jest.fn(async () => mockWorkspace),
+  updateGroup: jest.fn(async () => mockWorkspace),
+  toggleCollapsed: jest.fn(async () => mockWorkspace),
+  createTabInGroup: jest.fn(async () => mockWorkspace),
   flushReorders: jest.fn(async () => null),
 };
 
@@ -183,8 +192,19 @@ jest.mock("@/components/workspace-detail/action-sheets", () => ({
     mockCaptured.tabActions = props;
     return null;
   },
+  TabGroupPickerSheet: (props: CapturedProps) => {
+    mockCaptured.tabGroupPicker = props;
+    return null;
+  },
   WorkspaceActionsSheet: (props: CapturedProps) => {
     mockCaptured.workspaceActions = props;
+    return null;
+  },
+}));
+
+jest.mock("@/components/workspace-detail/tab-group-sheet", () => ({
+  TabGroupSheet: (props: CapturedProps) => {
+    mockCaptured.tabGroupSheet = props;
     return null;
   },
 }));
@@ -576,6 +596,189 @@ describe("workspace action wiring", () => {
 
     expect(mockCaptured.paneList?.["onPaneDragBegin"]).toBeUndefined();
     expect(mockCaptured.paneList?.["paneDrag"]).toBeUndefined();
+    await screen.unmount();
+  });
+});
+
+describe("tab group wiring", () => {
+  const agents: TabGroup = {
+    id: "agents",
+    name: "Agents",
+    color: "orange",
+    collapsed: false,
+    tab_ids: ["tests", "server"],
+  };
+
+  function groupedWorkspace(group: TabGroup = agents) {
+    const workspace = makeWorkspace([
+      makeTab("main"),
+      makeTab("tests"),
+      makeTab("server"),
+      makeTab("docs"),
+    ]);
+    return { ...workspace, layout: { ...workspace.layout, groups: [group] } };
+  }
+
+  async function renderDetail() {
+    return render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+  }
+
+  function call<Args extends unknown[]>(
+    group: keyof CapturedGroups,
+    name: string,
+    ...args: Args
+  ): unknown {
+    const handler = mockCaptured[group]?.[name] as ((...values: Args) => unknown) | undefined;
+    expect(handler).toBeDefined();
+    return handler?.(...args);
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSessions = [];
+    for (const key of Object.keys(mockCaptured) as Array<keyof CapturedGroups>) {
+      delete mockCaptured[key];
+    }
+  });
+
+  it("hands the strip the groups, and toggles a group's collapse from its label", async () => {
+    mockWorkspace = groupedWorkspace();
+    const screen = await renderDetail();
+
+    expect(mockCaptured.tabStrip?.["groups"]).toEqual([agents]);
+    await act(async () => {
+      call("tabStrip", "onToggleGroup", agents);
+    });
+    expect(mockWorkspaceActions.toggleCollapsed).toHaveBeenCalledWith(mockWorkspace, "agents");
+    await screen.unmount();
+  });
+
+  it("opens the group's sheet in manage mode from a held label", async () => {
+    mockWorkspace = groupedWorkspace();
+    const screen = await renderDetail();
+
+    expect(mockCaptured.tabGroupSheet?.["visible"]).toBe(false);
+    await act(async () => {
+      call("tabStrip", "onManageGroup", agents);
+    });
+    expect(mockCaptured.tabGroupSheet?.["visible"]).toBe(true);
+    expect(mockCaptured.tabGroupSheet?.["mode"]).toBe("manage");
+    expect(mockCaptured.tabGroupSheet?.["group"]).toEqual(agents);
+
+    await act(async () => {
+      call("tabGroupSheet", "onUpdate", "agents", { name: "Bots" });
+    });
+    expect(mockWorkspaceActions.updateGroup).toHaveBeenCalledWith(mockWorkspace, "agents", {
+      name: "Bots",
+    });
+    await act(async () => {
+      call("tabGroupSheet", "onToggleCollapsed", agents);
+      call("tabGroupSheet", "onUngroup", agents);
+    });
+    expect(mockWorkspaceActions.toggleCollapsed).toHaveBeenCalledWith(mockWorkspace, "agents");
+    expect(mockWorkspaceActions.ungroup).toHaveBeenCalledWith(mockWorkspace, "agents");
+
+    await act(async () => {
+      call("tabGroupSheet", "onNewTab", agents);
+    });
+    await waitFor(() =>
+      expect(mockWorkspaceActions.createTabInGroup).toHaveBeenCalledWith(mockWorkspace, "agents"),
+    );
+
+    await act(async () => {
+      call("tabGroupSheet", "onDismiss");
+    });
+    expect(mockCaptured.tabGroupSheet?.["visible"]).toBe(false);
+    await screen.unmount();
+  });
+
+  it("makes a new group from the tab menu and opens it in create mode, where Cancel ungroups", async () => {
+    mockWorkspace = groupedWorkspace();
+    const created = {
+      ...mockWorkspace,
+      layout: {
+        ...mockWorkspace.layout,
+        groups: [
+          agents,
+          { id: "group-new", name: "", color: "blue", collapsed: false, tab_ids: ["docs"] },
+        ],
+      },
+    };
+    const screen = await renderDetail();
+    const docs = mockWorkspace.layout.tabs[3];
+
+    await act(async () => {
+      call("tabActions", "onNewGroup", docs);
+    });
+    expect(mockWorkspaceActions.createGroup).toHaveBeenCalledWith(mockWorkspace, "docs");
+    // The cache now holds the group the action put there.
+    mockWorkspace = created;
+    await act(async () => {
+      // Any render reads it; selecting another tab is one.
+      call("tabStrip", "onSelect", 1);
+    });
+    expect(mockCaptured.tabGroupSheet?.["mode"]).toBe("create");
+    expect(mockCaptured.tabGroupSheet?.["visible"]).toBe(true);
+    expect(mockCaptured.tabGroupSheet?.["group"]).toMatchObject({ id: "group-new" });
+
+    await act(async () => {
+      call("tabGroupSheet", "onCancel", created.layout.groups[1]);
+    });
+    expect(mockWorkspaceActions.ungroup).toHaveBeenCalledWith(created, "group-new");
+    await screen.unmount();
+  });
+
+  it("picks a group for a tab and takes one out of its group", async () => {
+    mockWorkspace = groupedWorkspace();
+    const screen = await renderDetail();
+    const main = mockWorkspace.layout.tabs[0];
+    const tests = mockWorkspace.layout.tabs[1];
+
+    expect(mockCaptured.tabGroupPicker?.["visible"]).toBe(false);
+    await act(async () => {
+      call("tabActions", "onPickGroup", main);
+    });
+    expect(mockCaptured.tabGroupPicker?.["visible"]).toBe(true);
+    expect(mockCaptured.tabGroupPicker?.["tab"]).toBe(main);
+
+    await act(async () => {
+      call("tabGroupPicker", "onPick", main, agents);
+    });
+    await waitFor(() =>
+      expect(mockWorkspaceActions.addToGroup).toHaveBeenCalledWith(mockWorkspace, "main", "agents"),
+    );
+    await act(async () => {
+      call("tabGroupPicker", "onNewGroup", main);
+    });
+    expect(mockWorkspaceActions.createGroup).toHaveBeenCalledWith(mockWorkspace, "main");
+
+    await act(async () => {
+      call("tabActions", "onRemoveFromGroup", tests);
+    });
+    await waitFor(() =>
+      expect(mockWorkspaceActions.removeFromGroup).toHaveBeenCalledWith(mockWorkspace, "tests"),
+    );
+    await screen.unmount();
+  });
+
+  it("moves a tab one visible place from its menu, past a collapsed group rather than into it", async () => {
+    mockWorkspace = groupedWorkspace({ ...agents, collapsed: true });
+    const screen = await renderDetail();
+    const docs = mockWorkspace.layout.tabs[3];
+
+    await act(async () => {
+      call("tabActions", "onReorder", docs, -1);
+    });
+    // main is selected, so the whole collapsed group stands in one place.
+    expect(mockWorkspaceActions.reorderTab).toHaveBeenCalledWith(mockWorkspace, "docs", 1);
     await screen.unmount();
   });
 });

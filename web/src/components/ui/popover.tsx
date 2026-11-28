@@ -63,7 +63,11 @@ export function Popover({
   }, []);
 
   useLayoutEffect(() => {
-    if (!open || !anchor) {
+    // Not before the portal is mounted: a box that is open from its very first
+    // render would otherwise be placed with nothing to measure — at the
+    // fallback width, flipped off its anchor — and, with no element yet for
+    // the ResizeObserver to watch, never placed again.
+    if (!mounted || !open || !anchor) {
       setCoords(null);
       return;
     }
@@ -97,7 +101,7 @@ export function Popover({
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
-  }, [open, anchor, side, align, flip]);
+  }, [mounted, open, anchor, side, align, flip]);
 
   if (!mounted || !open || !anchor) return null;
 

@@ -48,9 +48,30 @@ export const lightColors = {
   brandHairline: "#D7D7D7",
   brandAccent: "#E11E15",
   brandAccentSoft: "rgba(225,30,21,0.12)",
+  /**
+   * The nine tab group presets, in the order `data/layout/tab-groups.ts` lists
+   * them. A group stores the preset's name, never this value, so each theme
+   * sets it for its own ground.
+   */
+  tabGroup: {
+    blue: "#2563EB",
+    purple: "#7C3AED",
+    cyan: "#0891B2",
+    orange: "#EA580C",
+    yellow: "#CA8A04",
+    pink: "#DB2777",
+    green: "#16A34A",
+    gray: "#6B7280",
+    red: "#DC2626",
+  },
 } as const;
 
-export type ThemeColors = { readonly [Key in keyof typeof lightColors]: string };
+export type TabGroupPalette = { readonly [Preset in keyof typeof lightColors.tabGroup]: string };
+/** Every flat colour token: what a `color` prop names. */
+export type ColorToken = Exclude<keyof typeof lightColors, "tabGroup">;
+export type ThemeColors = { readonly [Key in ColorToken]: string } & {
+  readonly tabGroup: TabGroupPalette;
+};
 export type Colors = ThemeColors;
 
 export const darkColors = {
@@ -101,6 +122,17 @@ export const darkColors = {
   brandHairline: "#2B2B2B",
   brandAccent: "#FF453A",
   brandAccentSoft: "rgba(255,69,58,0.14)",
+  tabGroup: {
+    blue: "#60A5FA",
+    purple: "#A78BFA",
+    cyan: "#22D3EE",
+    orange: "#FB923C",
+    yellow: "#FACC15",
+    pink: "#F472B6",
+    green: "#4ADE80",
+    gray: "#9CA3AF",
+    red: "#F87171",
+  },
 } as const satisfies ThemeColors;
 
 export const pressroomColors = {

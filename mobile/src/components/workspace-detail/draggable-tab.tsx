@@ -7,10 +7,10 @@ import { attentionAccessibilityLabel } from "@/components/alerts/attention-badge
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { TabAttentionBadge } from "@/components/workspace-detail/tab-attention-badge";
-import { tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
+import { siblingShift, tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
 import type { AttentionSummary } from "@/data/queries/alerts";
 import type { WorkspaceTab } from "@/data/types/layout";
-import { duration, layer, shadow, spacing, useTheme } from "@/theme";
+import { borderWidth, duration, layer, shadow, spacing, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export const TAB_WIDTH = sizing.tab.minWidth;
@@ -42,6 +42,11 @@ interface DraggableTabProps {
   canClose: boolean;
   dragValues: TabDragValues;
   dragging: boolean;
+  /** The colour of the group this tab is in, or null for an ungrouped tab. */
+  groupColor: string | null;
+  /** The next visible tab is in the same group, so the group's rule runs on across the gap. */
+  groupContinues: boolean;
+  /** This tab's visible slot — a collapsed group's hidden tabs have none. */
   index: number;
   onAccessibleReorder: (toIndex: number) => void;
   onActions: () => void;
@@ -58,8 +63,11 @@ interface DraggableTabProps {
   onIndexChange: (index: number, count: number) => void;
   onSelect: () => void;
   reducedMotion: boolean;
+  /** Every visible slot's left edge: group labels share the row, so tabs are not evenly spaced. */
+  slotLefts: readonly number[];
   surfaces: { empty: string; focused: string; dimmed: string };
   tab: WorkspaceTab;
+  /** How many tabs the strip is showing. */
   tabCount: number;
 }
 
@@ -69,6 +77,8 @@ export function DraggableTab({
   canClose,
   dragValues,
   dragging,
+  groupColor,
+  groupContinues,
   index,
   onAccessibleReorder,
   onActions,
@@ -79,6 +89,7 @@ export function DraggableTab({
   onIndexChange,
   onSelect,
   reducedMotion,
+  slotLefts,
   surfaces,
   tab,
   tabCount,
@@ -86,6 +97,8 @@ export function DraggableTab({
   const theme = useTheme();
   const connected = active && tab.layout.tiles.length > 0;
   const dragEnabled = tabCount > 1;
+  const geometry = useMemo(() => ({ ...TAB_GEOMETRY, slotLefts }), [slotLefts]);
+  const sourceLeft = slotLefts[index] ?? index * TAB_STEP;
   const tabAccessibilityLabel = attention
     ? `${tab.name}, ${attentionAccessibilityLabel(attention)}`
     : tab.name;
@@ -104,7 +117,7 @@ export function DraggableTab({
           dragValues.pointerAbsoluteX.value = event.absoluteX;
           const contentPointer =
             event.absoluteX - dragValues.stripWindowLeft.value + dragValues.scrollX.value;
-          dragValues.pointerOffset.value = contentPointer - index * TAB_STEP;
+          dragValues.pointerOffset.value = contentPointer - sourceLeft;
           dragValues.translationX.value = 0;
           scheduleOnRN(onBeginDrag, tab.id, tab.name, index, tabCount);
         })
@@ -112,11 +125,10 @@ export function DraggableTab({
           dragValues.pointerAbsoluteX.value = event.absoluteX;
           const contentPointer =
             event.absoluteX - dragValues.stripWindowLeft.value + dragValues.scrollX.value;
-          const sourceLeft = index * TAB_STEP;
           const translation = contentPointer - dragValues.pointerOffset.value - sourceLeft;
           dragValues.translationX.value = translation;
           if (Math.abs(translation) >= spacing[1]) dragValues.dragMoved.value = true;
-          const destination = tabDestinationIndex(index, translation, tabCount, TAB_GEOMETRY);
+          const destination = tabDestinationIndex(index, translation, tabCount, geometry);
           if (destination !== dragValues.activeTo.value) {
             dragValues.activeTo.value = destination;
             scheduleOnRN(onIndexChange, destination, tabCount);
@@ -140,11 +152,13 @@ export function DraggableTab({
     [
       dragEnabled,
       dragValues,
+      geometry,
       index,
       onBeginDrag,
       onCancelDrag,
       onFinishDrag,
       onIndexChange,
+      sourceLeft,
       tab.id,
       tab.name,
       tabCount,
@@ -154,11 +168,7 @@ export function DraggableTab({
   const animatedStyle = useAnimatedStyle(() => {
     const from = dragValues.activeFrom.value;
     const to = dragValues.activeTo.value;
-    let siblingTranslation = 0;
-    if (from >= 0 && index !== from) {
-      if (from < to && index > from && index <= to) siblingTranslation = -TAB_STEP;
-      if (from > to && index >= to && index < from) siblingTranslation = TAB_STEP;
-    }
+    const siblingTranslation = siblingShift(index, from, to, geometry);
     const translateX =
       index === from
         ? dragValues.translationX.value
@@ -191,6 +201,20 @@ export function DraggableTab({
       ]}
       testID={`workspace-tab-${tab.id}`}
     >
+      {groupColor ? (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.groupLine,
+            {
+              backgroundColor: groupColor,
+              borderRadius: borderWidth.emphasis,
+              width: groupContinues ? TAB_STEP : TAB_WIDTH,
+            },
+          ]}
+          testID={`tab-group-line-${tab.id}`}
+        />
+      ) : null}
       {connected ? (
         <>
           <View
@@ -375,6 +399,12 @@ const styles = StyleSheet.create({
   },
   dragging: {
     boxShadow: shadow.sm,
+  },
+  groupLine: {
+    height: sizing.tab.groupLineHeight,
+    left: 0,
+    position: "absolute",
+    top: -sizing.tab.groupLineOffset,
   },
   restingTab: {
     height: TAB_VISUAL_HEIGHT,

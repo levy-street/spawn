@@ -222,7 +222,12 @@ def _append_tile(layout: dict, *, session_id: str, tile: schemas.TilePlacement |
         else item
         for item in layout["tabs"]
     ]
-    return {"version": 3, "active_tab": layout.get("active_tab"), "tabs": tabs}
+    return {
+        "version": 3,
+        "active_tab": layout.get("active_tab"),
+        "tabs": tabs,
+        "groups": layout.get("groups") or [],
+    }
 
 
 @router.get("", response_model=list[schemas.SessionOut])
